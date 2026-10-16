@@ -13,12 +13,12 @@
 [English](README.md) | 简体中文
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/8ba2efae-48ea-4981-82f4-e1c3120c34f8" width="85%" alt="FlashMask 总览"/>
+  <img src="docs/assets/flashmask_overview.png" width="85%" alt="FlashMask 总览"/>
 </p>
 <p><i>图 1：FlashMask 总览。(a) 支持的掩码类型；(b) 列式稀疏表示；(c) 高效实现</i></p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f623d2aa-b947-496b-95bc-d7e7fad92579" width="85%" alt="FlashMask-3 执行栈总览"/>
+  <img src="docs/assets/flashmask3_architecture.jpg" width="85%" alt="FlashMask-3 执行栈总览"/>
 </p>
 <p><i>图 2：FlashMask-3 在执行栈四个层次上的总览</i></p>
 
