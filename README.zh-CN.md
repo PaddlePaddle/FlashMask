@@ -34,6 +34,7 @@
 - [安装](#-安装)
 - [快速开始](#-快速开始)
 - [引用](#-引用)
+- [致谢](#-致谢)
 - [许可证](#-许可证)
 
 ---
@@ -153,21 +154,21 @@ Baseline 为 FlashAttention-4 `mask_mod`（commit `edb5c7`）。性能指标为 
 
 #### Hopper
 
-headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -1.8% ～ +50.0%。
+headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -13.1% ～ +49.0%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_128_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 128/128）"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod（d=128, dv=128）</sub>
 </div>
 
-headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -5.1% ～ +37.7%。
+headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -7.3% ～ +23.8%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_192_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 192/128）"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod（d=192, dv=128）</sub>
 </div>
 
-headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 +13.5% ～ +155.1%。
+headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 +3.1% ～ +155.8%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_256_256_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 256/256）"/>
@@ -342,6 +343,12 @@ cd tests/torch/distributed && bash run_cp_overlap_sweep.sh   # Overlap 通信计
   year      = {2026}
 }
 ```
+
+---
+
+## 🙏 致谢
+
+本仓库借鉴了 [FlashAttention](https://github.com/Dao-AILab/flash-attention) 的代码，感谢 [Tri Dao](https://github.com/tridao) 及其团队的出色工作。
 
 ---
 
