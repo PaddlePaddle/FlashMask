@@ -13,12 +13,12 @@
 English | [简体中文](README.zh-CN.md)
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/8ba2efae-48ea-4981-82f4-e1c3120c34f8" width="85%" alt="FlashMask overview"/>
+  <img src="docs/assets/flashmask_overview.png" width="85%" alt="FlashMask overview"/>
 </p>
 <p><i>Figure 1: FlashMask overview. (a) Supported mask types; (b) column-wise sparse representation; (c) efficient implementation</i></p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f623d2aa-b947-496b-95bc-d7e7fad92579" width="85%" alt="FlashMask-3 across the execution stack"/>
+  <img src="docs/assets/flashmask3_architecture.jpg" width="85%" alt="FlashMask-3 across the execution stack"/>
 </p>
 <p><i>Figure 2: FlashMask-3 across the four layers of the execution stack</i></p>
 
