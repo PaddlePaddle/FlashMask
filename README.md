@@ -34,6 +34,7 @@ English | [简体中文](README.zh-CN.md)
 - [Installation](#-installation)
 - [Quick Start](#-quick-start)
 - [Citation](#-citation)
+- [Acknowledgement](#-acknowledgement)
 - [License](#-license)
 
 ---
@@ -343,6 +344,12 @@ If FlashMask helps your research, please cite:
   year      = {2026}
 }
 ```
+
+---
+
+## 🙏 Acknowledgement
+
+This repo benefits from [FlashAttention](https://github.com/Dao-AILab/flash-attention). Thanks to [Tri Dao](https://github.com/tridao) and the team for their wonderful work.
 
 ---
 

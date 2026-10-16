@@ -34,6 +34,7 @@
 - [安装](#-安装)
 - [快速开始](#-快速开始)
 - [引用](#-引用)
+- [致谢](#-致谢)
 - [许可证](#-许可证)
 
 ---
@@ -342,6 +343,12 @@ cd tests/torch/distributed && bash run_cp_overlap_sweep.sh   # Overlap 通信计
   year      = {2026}
 }
 ```
+
+---
+
+## 🙏 致谢
+
+本仓库借鉴了 [FlashAttention](https://github.com/Dao-AILab/flash-attention) 的代码，感谢 [Tri Dao](https://github.com/tridao) 及其团队的出色工作。
 
 ---
 
