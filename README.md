@@ -153,21 +153,21 @@ How to read the radar charts: the three rows are forward (FWD), backward (BWD), 
 
 #### Hopper
 
-At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -1.8% to +50.0% relative to the baseline.
+At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -13.1% to +49.0% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_128_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 128/128)"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod (d=128, dv=128)</sub>
 </div>
 
-At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -5.1% to +37.7% relative to the baseline.
+At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -7.3% to +23.8% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_192_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 192/128)"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod (d=192, dv=128)</sub>
 </div>
 
-At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from +13.5% to +155.1% relative to the baseline.
+At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from +3.1% to +155.8% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_256_256_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 256/256)"/>
