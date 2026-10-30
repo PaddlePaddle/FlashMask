@@ -5,13 +5,9 @@
 /**
  * High-performance BSHD → BHSD transpose-copy kernel for bf16.
  *
- * Two variants:
- *   1. transpose_bshd_to_bhsd: equal-size, src (B,S,H,D) → dst (B,H,S,D)
- *   2. transpose_copy_to_sr:   local KV (B,S_local,H,D) → SR buffer (B,H,S_total,D) at offset
- *
- * The second is the overlap-ready version: places S_local rows at s_offset
- * within the larger S_total destination. FWD uses s_offset = S_total - S_local,
- * BWD uses s_offset = 0.
+ * transpose_copy_to_sr: local KV (B,S_local,H,D) → SR buffer (B,H,S_total,D), placing
+ * the S_local rows at s_offset within the larger S_total destination. FWD uses
+ * s_offset = S_total - S_local, BWD uses s_offset = 0.
  *
  * D is a runtime argument. It only feeds the TMA descriptors, the dynamic smem
  * size and the expect_tx byte count, so no code path specializes on it. TMA needs
@@ -218,14 +214,6 @@ inline void transpose_copy_to_sr(
     cudaStream_t stream = 0
 ) {
     launch_copy_tma(src, dst, B, S_local, H, D, S_dst, s_offset, stream);
-}
-
-/// Equal-size transpose (convenience wrapper): src (B,S,H,D) → dst (B,H,S,D)
-inline void transpose_bshd_to_bhsd(
-    const __nv_bfloat16* src, __nv_bfloat16* dst,
-    int B, int S, int H, int D, cudaStream_t stream = 0
-) {
-    transpose_copy_to_sr(src, dst, B, S, H, D, S, 0, stream);
 }
 
 }  // namespace layout

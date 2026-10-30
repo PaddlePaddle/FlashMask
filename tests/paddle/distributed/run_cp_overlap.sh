@@ -106,11 +106,6 @@ export FLAGS_use_cinn=True
 export FLAGS_cudnn_deterministic=1
 export FLAGS_call_stack_level=2
 
-# FlashMask runtime knobs (kept from the proven config). BHSD=1 for d<=256, 0 for
-# the big-headdim (d=512) kernel -- set from D below.
-export FLASHMASK_USE_HIERARCHICAL=1
-export FLASHMASK_PER_STAGE_BUFFER=1
-
 CP_SIZE=${CP_SIZE:-8}
 PY_BIN=${PY_BIN:-python}
 
@@ -141,10 +136,8 @@ else
     device_arg=""
 fi
 
-if [ "$D" -ge 512 ]; then export FLASHMASK_USE_BHSD_LAYOUT=0; else export FLASHMASK_USE_BHSD_LAYOUT=1; fi
-
 logdir="log_cp${CP_SIZE}-d${D}-${MASKS}-r$rank"
-echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=$S_LOCAL bs=$BS hq=$HQ hks=$HKS masks=$MASKS BHSD=$FLASHMASK_USE_BHSD_LAYOUT nnodes=$nnodes rank=$rank"
+echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=$S_LOCAL bs=$BS hq=$HQ hks=$HKS masks=$MASKS nnodes=$nnodes rank=$rank"
 
 $PY_BIN -m paddle.distributed.launch \
     --log_dir "$logdir" \

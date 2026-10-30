@@ -25,9 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("FM4_CP_LAYOUT", "dual_chunk")
-os.environ.setdefault("FM4_CP_LAYOUT_BASE", "dual_chunk")
-
 import numpy as np
 import paddle
 from paddle.distributed import fleet

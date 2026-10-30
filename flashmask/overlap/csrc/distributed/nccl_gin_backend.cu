@@ -56,7 +56,7 @@ public:
 
     ~Context() noexcept { destroy(); }
 
-    void initialize(const uint8_t* unique_id, int rank, int nranks, bool request_hierarchical) {
+    void initialize(const uint8_t* unique_id, int rank, int nranks) {
         if (unique_id == nullptr) {
             throw std::invalid_argument("NCCL unique ID must not be null");
         }
@@ -87,7 +87,7 @@ public:
             throw std::runtime_error("NCCL LSA topology does not match FlashMask rank layout");
         }
         rail_rank_ = rank_ / num_lsa_ranks_;
-        use_rail_ = request_hierarchical && nranks_ > num_lsa_ranks_;
+        use_rail_ = nranks_ > num_lsa_ranks_;
 
         ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
         FM_NCCL_CHECK(ncclCommQueryProperties(comm_, &props));
@@ -282,10 +282,9 @@ std::vector<uint8_t> get_unique_id() {
     return result;
 }
 
-ContextPtr create_context(
-    const uint8_t* unique_id, int rank, int nranks, bool request_hierarchical) {
+ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks) {
     ContextPtr context(new Context());
-    context->initialize(unique_id, rank, nranks, request_hierarchical);
+    context->initialize(unique_id, rank, nranks);
     return context;
 }
 
@@ -302,9 +301,6 @@ void* alloc(Context& context, size_t bytes) { return context.allocate(bytes); }
 void free(Context& context, void* ptr) { context.release(ptr); }
 void free_noexcept(Context& context, void* ptr) noexcept { context.release_noexcept(ptr); }
 void barrier(Context& context) { context.barrier(); }
-void barrier_on_stream(Context& context, cudaStream_t stream) {
-    context.barrier_on_stream(stream);
-}
 
 void wait_until_on_stream(
     int64_t* ptr, Compare compare, int64_t value, cudaStream_t stream) {

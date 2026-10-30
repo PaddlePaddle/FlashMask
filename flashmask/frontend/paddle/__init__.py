@@ -15,7 +15,7 @@ Kernel orchestration is shared with the torch frontend via `flashmask.cute.ops`.
 import paddle
 
 from flashmask.backend import get_backend
-from flashmask.cute.ops._common import _check_cutedsl_supported
+from flashmask.cute.ops._common import _check_cutedsl_supported, _dist_world_size
 from .autograd import FlashMaskFunc
 
 __all__ = [
@@ -44,7 +44,15 @@ def flashmask_attention(
     learnable_sink: paddle.Tensor | None = None,
     group=None,
 ):
-    _check_cutedsl_supported(query, key, value, get_backend(query, key, value))
+    """FlashMask attention.
+
+    group: context-parallel group; enables the FM-4 overlap path when its world size
+    is greater than 1. Then key/value are the local S_local shard and the mask key
+    axis has length S_local * group_size, in group-rank chunk order; the library
+    converts it to SR order, so callers must NOT pre-roll it.
+    """
+    be = get_backend(query, key, value)
+    _check_cutedsl_supported(query, key, value, be)
     assert dropout == 0.0, (
         "flashmask v4 does not support dropout"
     )
@@ -81,8 +89,11 @@ def flashmask_attention(
         assert startend_row_indices.shape[0] == key.shape[0], (
             f"startend_row_indices.shape[0] must be equal to batch_size, but got {startend_row_indices.shape[0]} and {key.shape[0]}"
         )
-        assert startend_row_indices.shape[2] == key.shape[1], (
-            f"startend_row_indices.shape[2] must be equal to seqlen_k, but got {startend_row_indices.shape[2]} and {key.shape[1]}"
+        # Overlap: the mask covers the full key length, group-rank chunk order.
+        group_size = _dist_world_size(be, group) if group is not None else 1
+        seqlen_k = key.shape[1] * group_size
+        assert startend_row_indices.shape[2] == seqlen_k, (
+            f"startend_row_indices.shape[2] must be equal to seqlen_k (S_local * group_size with a CP group), but got {startend_row_indices.shape[2]} and {seqlen_k}"
         )
         assert startend_row_indices.shape[1] in [
             1,

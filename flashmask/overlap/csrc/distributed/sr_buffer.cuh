@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #include "nccl_gin_backend.cuh"
 
@@ -43,6 +44,15 @@ public:
         const size_t total_bytes = kv_components * numel * sizeof(KVType) +
                                    semaphore_size * sizeof(SemaphoreType);
         _k_sr = static_cast<KVType*>(gin::alloc(_context, total_bytes));
+        // ncclMemAlloc returns uninitialized memory. The compute side can load rows of
+        // skipped (never fetched) works, e.g. the 2-CTA keep-alive tile, and 0 * NaN
+        // garbage would poison dQ/dK; zeroing also clears the semaphores.
+        const cudaError_t memset_result = cudaMemset(_k_sr, 0, total_bytes);
+        if (memset_result != cudaSuccess) {
+            gin::free_noexcept(_context, _k_sr);
+            throw std::runtime_error(
+                std::string("SRBuffer: zeroing failed: ") + cudaGetErrorString(memset_result));
+        }
         // Shared K/V has no V region; null so that a stray V access faults instead of
         // silently landing in the semaphores.
         _v_sr = kv_components == 2 ? _k_sr + numel : nullptr;
@@ -59,9 +69,6 @@ public:
     }
 
     void team_bar() const { gin::barrier(_context); }
-    void team_bar_on_stream(cudaStream_t stream) const {
-        gin::barrier_on_stream(_context, stream);
-    }
 
     void release() {
         if (_allocated && _k_sr != nullptr) {

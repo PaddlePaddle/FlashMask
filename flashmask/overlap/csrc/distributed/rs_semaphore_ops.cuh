@@ -11,52 +11,18 @@ namespace flashmask {
 namespace sema {
 namespace rs {
 
-// num thread: 1
-template <typename SemaphoreT>
-__global__ void SetValueKernel(
-    SemaphoreT* const __restrict__ semaphore,
-    const int value
-) {
-    *(semaphore + threadIdx.x) = static_cast<SemaphoreT>(value);
-#ifdef FLASHMASK_DEBUG
-    if (gridDim.x == 1) {
-        DEBUG_PRINT("Consumer sets self empty value: %d\n", value);
-    }
-#endif  // FLASHMASK_DEBUG
-}
-
-__global__ void ProducerNotifyFull(
-    int64_t* const __restrict__ semaphores,
-    int remote_consumer_start_rank,
-    int nranks,
-    int self_rank
-) {
-    const int target_rank = (remote_consumer_start_rank + threadIdx.x) % nranks;
-    // quiet make sure the previous put/get on this stream is done, then we can clear bit
-    if (self_rank == target_rank) return;
-    semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
-    const int64_t clear_mask = -(1LL << self_rank);
-#ifdef FLASHMASK_DEBUG
-    gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
-    DEBUG_PRINT("Producer %d notifies remote %d full\n", self_rank, target_rank);
-#else
-    gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
-#endif  // FLASHMASK_DEBUG
-}
-
 __global__ void FusedConsumerNotifyEmpty(
     int64_t* const __restrict__ semaphores,
     int remote_producer_end_rank,
     int nranks,
-    int64_t value,
     int self_rank
 ) {
     // for example: rank 3 local consumer needs the data from [12, 15] (remote producer) for seg 1
     // remote_producer_end_rank will be 15 (computed by mod_nranks(3 - 4 * seg_idx) --> (-1 % 16) --> 15)
     if (threadIdx.x == 0) {
-        semaphores[self_rank] = value;
-        DEBUG_PRINT("Consumer %d fused, sets self empty value: %lx, nranks: %d, end_rank: %d\n", 
-            self_rank, value, nranks, remote_producer_end_rank);
+        semaphores[self_rank] = 0;
+        DEBUG_PRINT("Consumer %d fused, resets self refcount, nranks: %d, end_rank: %d\n",
+            self_rank, nranks, remote_producer_end_rank);
     }
     // the following fence makes sure semaphore setting is visible across all CP ranks 
     __threadfence();
@@ -68,64 +34,21 @@ __global__ void FusedConsumerNotifyEmpty(
     DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
 }
 
-__global__ void DebugWaitAndResetKernel(
-    int64_t* const volatile semaphores,
-    const int64_t target_value
-) {
-    while (true) {
-        int64_t cur_val;
-        asm volatile("ld.volatile.global.s64 %0, [%1];" 
-             : "=l"(cur_val) 
-             : "l"(semaphores));
-        if (cur_val == target_value) break;
-        // printf("Current: %lx, while target: %lx\n", cur_val, target_value);
-        // __nanosleep(1000000);
-    }
-    *semaphores = 0;
-}
-
 // [local consumer (dk dv reducer and recv buffer)] sends out an empty
 // notifcation for [remote producer (put kernel)] to fill the buffer
 //
-// per_stage_buffer: when true, semaphores[self_rank] is a pure refcount (starts at 0,
-// producers atomicAdd +1, consumer waits for == K then CAS to 0). The local value
-// must remain 0 — only remote notifications are needed.
-// When false, semaphores[self_rank] is a bitmask (producers clear their bit via
-// atomicAdd(-(1<<rank)), consumer waits for == 0).
+// semaphores[self_rank] is a per-stage refcount: it starts at 0, each producer
+// adds +1, and the consumer waits for == K then CASes it back to 0.
 void notify_consumer_empty(
     int64_t* const semaphores,
     int remote_producer_end_rank,
     int seg_size,
     int nranks,
     int self_rank,
-    cudaStream_t comm_stream,
-    bool per_stage_buffer = false
-) {
-    int64_t local_flag = 0;
-    if (!per_stage_buffer) {
-        for (int i = 0; i < seg_size; i++) {
-            int target_rank = remote_producer_end_rank - i;
-            target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
-            local_flag |= target_rank == self_rank ? 0 : (1LL << target_rank);
-        }
-    }
-    FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
-                    remote_producer_end_rank, nranks, local_flag, self_rank);
-}
-
-// self rank notifies all remote consumers that needs dK, dV data 
-// from the local rank that the data is ready (sent).
-// Also, clear all the local status
-void producer_commit_all(
-    int64_t* const semaphores,
-    int remote_consumer_start_rank,
-    int nranks,
-    int self_rank,
-    int chunks_per_seg,
     cudaStream_t comm_stream
 ) {
-    ProducerNotifyFull<<<1, chunks_per_seg, 0, comm_stream>>>(
-        semaphores, remote_consumer_start_rank, nranks, self_rank);
+    FusedConsumerNotifyEmpty<<<1, seg_size, 0, comm_stream>>>(semaphores,
+                    remote_producer_end_rank, nranks, self_rank);
 }
 
 static __global__ void SpinWaitAndReplaceKernel(int64_t* ptr, int64_t target) {
@@ -150,31 +73,21 @@ static __global__ void SpinWaitAndReplaceKernel(int64_t* ptr, int64_t target) {
 }
 
 /**
- * @brief CPU wait until the semaphores[my_pe] reached 0
+ * @brief Wait (on stream) until all K producers of this stage committed, then reset the refcount.
  * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
  * @param my_pe the id of semaphore to wait for
- * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
+ * @param wait_value K, the number of remote producers of this stage
 */
 void consumer_wait_full(
     int64_t* const __restrict__ semaphores,
     int my_pe,
     int wait_value,
-    cudaStream_t comm_stream,
-    bool use_per_stage_buffer = false
+    cudaStream_t comm_stream
 ) {
     WARN_PRINT("Consumer wait full ...\n");
-    if (use_per_stage_buffer) {
-        SpinWaitAndReplaceKernel<<<1, 1, 0, comm_stream>>>(
-            semaphores + my_pe, wait_value
-        );
-    } else {
-        gin::wait_until_on_stream(
-            semaphores + my_pe,
-            gin::Compare::Equal,
-            0,
-            comm_stream
-        );
-    }
+    SpinWaitAndReplaceKernel<<<1, 1, 0, comm_stream>>>(
+        semaphores + my_pe, wait_value
+    );
     WARN_PRINT_SYNC(comm_stream, "Consumer wait full succeeded.\n");
 }
 
@@ -197,8 +110,8 @@ __device__ void producer_wait_empty(
  * In hierarchical mode, the producers for my_pe are NOT a contiguous rank range.
  * For segment [logical_pos_base, logical_pos_base+num_chunks), PE X sends chunk c
  * to my_pe iff X == hier_sender_at_pos(logical_pos_base+c, my_pe, ...).
- * This kernel sets semaphores[self_rank]=local_flag (pre-computed bitmask of senders),
- * then notifies each sender that the buffer slot is empty and ready to receive.
+ * This kernel resets semaphores[self_rank] (the per-stage refcount) to 0, then
+ * notifies each sender that the buffer slot is empty and ready to receive.
  *
  * Launch: <<<1, num_chunks>>>
  */
@@ -208,12 +121,11 @@ __global__ void HierFusedConsumerNotifyEmpty(
     int num_chunks,
     int total_n_pes,
     int gpus_per_node,
-    int64_t local_flag,
     int self_rank
 ) {
     if (threadIdx.x == 0) {
-        semaphores[self_rank] = local_flag;
-        DEBUG_PRINT("HierConsumer %d sets self flag: %lx\n", self_rank, local_flag);
+        semaphores[self_rank] = 0;
+        DEBUG_PRINT("HierConsumer %d resets self refcount\n", self_rank);
     }
     __threadfence();
     __syncthreads();
@@ -226,8 +138,7 @@ __global__ void HierFusedConsumerNotifyEmpty(
 }
 
 /**
- * Host wrapper: compute sender bitmask and launch HierFusedConsumerNotifyEmpty.
- * per_stage_buffer: same semantics as notify_consumer_empty — when true, local_flag = 0.
+ * Host wrapper: launch HierFusedConsumerNotifyEmpty.
  */
 void notify_consumer_empty_hier(
     int64_t* const semaphores,
@@ -236,19 +147,11 @@ void notify_consumer_empty_hier(
     int total_n_pes,
     int gpus_per_node,
     int self_rank,
-    cudaStream_t stream,
-    bool per_stage_buffer = false
+    cudaStream_t stream
 ) {
     const int logical_pos_base = segment_idx * num_chunks;
-    int64_t local_flag = 0;
-    if (!per_stage_buffer) {
-        for (int c = 0; c < num_chunks; c++) {
-            const int sender = hier::hier_sender_at_pos(logical_pos_base + c, self_rank, total_n_pes, gpus_per_node);
-            if (sender != self_rank) local_flag |= (1LL << sender);
-        }
-    }
     HierFusedConsumerNotifyEmpty<<<1, num_chunks, 0, stream>>>(
-        semaphores, logical_pos_base, num_chunks, total_n_pes, gpus_per_node, local_flag, self_rank
+        semaphores, logical_pos_base, num_chunks, total_n_pes, gpus_per_node, self_rank
     );
 }
 

@@ -123,6 +123,8 @@ Overlap uses the mask to identify KV blocks that do not need to be transferred, 
 
 The implementation lives in [`flashmask/overlap`](flashmask/overlap/). It communicates through **NCCL GIN**, is integrated with the CuTe DSL kernels, and **currently supports SM100 only**.
 
+Overlap is enabled by passing a CP `group` (world size > 1) to `flashmask_attention`. Key/value are then the local `S_local` shard, and the mask key axis has length `S_local * group_size` in group-rank chunk order. The library converts it to its internal order, so callers must not pre-roll it. Hierarchical (multi-node) communication is selected automatically when the group spans more than one node.
+
 <details>
 <summary>Using Overlap on SM90 (Hopper)</summary>
 

@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 
 from flashmask.backend import get_backend
-from flashmask.cute.ops._common import _check_cutedsl_supported
+from flashmask.cute.ops._common import _check_cutedsl_supported, _dist_world_size
 from .autograd import FlashMaskFunc
 
 __all__ = [
@@ -55,7 +55,10 @@ def flashmask_attention(
         learnable_sink: (num_heads,) additive sink logit per head.
         return_lse: also return the log-sum-exp, (batch, num_heads, seqlen_q).
         group: context-parallel process group; enables the FM-4 overlap path
-            when its world size is greater than 1.
+            when its world size is greater than 1. Then k/v are the local S_local
+            shard and the mask key axis has length S_local * group_size, in
+            group-rank chunk order; the library converts it to SR order, so
+            callers must NOT pre-roll it.
 
     Returns:
         ``out``, or ``(out, lse)`` when ``return_lse``.
@@ -74,9 +77,12 @@ def flashmask_attention(
             "startend_row_indices.shape[0] must equal batch_size, but got "
             f"{startend_row_indices.shape[0]} and {k.shape[0]}"
         )
-        assert startend_row_indices.shape[2] == k.shape[1], (
-            "startend_row_indices.shape[2] must equal seqlen_k, but got "
-            f"{startend_row_indices.shape[2]} and {k.shape[1]}"
+        # Overlap: the mask covers the full key length, group-rank chunk order.
+        group_size = _dist_world_size(be, group) if group is not None else 1
+        seqlen_k = k.shape[1] * group_size
+        assert startend_row_indices.shape[2] == seqlen_k, (
+            "startend_row_indices.shape[2] must equal seqlen_k (S_local * group_size "
+            f"with a CP group), but got {startend_row_indices.shape[2]} and {seqlen_k}"
         )
         assert startend_row_indices.shape[1] in (1, k.shape[2]), (
             "startend_row_indices head_num must equal 1 (broadcast) or head_num_k."

@@ -42,8 +42,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int S_stride,                 // H * D
     int64_t* const __restrict__ semaphores,
     const int num_segments = 4,
-    const int gpus_per_node = 1,        // hierarchical only
-    const bool per_stage_buffer = false
+    const int gpus_per_node = 1         // hierarchical only
 ) {
 #ifdef FLASHMASK_DEBUG
     if (threadIdx.x == 0) {
@@ -128,13 +127,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 // preceding put to target_rank (from ANY CTA, cross-node) before
                 // it lands -- replacing the old gin::fence() (a GPU-local
                 // __threadfence_system that gave no RDMA ordering).
-                // P2P notify: same semantics as ProducerNotifyFull but for one rank only
-                if (per_stage_buffer) {
-                    gin::remote_strong_add(semaphores + target_rank, int64_t(1), target_rank);
-                } else {
-                    const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
-                    gin::remote_strong_add(semaphores + target_rank, clear_mask, target_rank);
-                }
+                // P2P notify: +1 on the consumer's per-stage refcount
+                gin::remote_strong_add(semaphores + target_rank, int64_t(1), target_rank);
             }
         }
     };

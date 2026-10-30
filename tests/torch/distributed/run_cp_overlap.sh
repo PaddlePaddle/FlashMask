@@ -3,6 +3,7 @@
 #
 # Single-node torchrun launcher mirroring run_cp_overlap.sh. One config per
 # process because the overlap singleton must not carry state across configs.
+# Single-node launcher only: hierarchical (multi-node) overlap is not exercised here.
 #
 # Usage (single mask):
 #   CP_SIZE=4 D=128 MASKS=document bash run_cp_overlap.sh
@@ -62,13 +63,8 @@ else
     export CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((CP_SIZE - 1)))"
 fi
 
-# FlashMask runtime knobs. BHSD=1 for d<=256, 0 for the big-headdim (d=512) kernel.
-export FLASHMASK_USE_HIERARCHICAL=1
-export FLASHMASK_PER_STAGE_BUFFER=1
-if [ "$D" -ge 512 ]; then export FLASHMASK_USE_BHSD_LAYOUT=0; else export FLASHMASK_USE_BHSD_LAYOUT=1; fi
-
 logdir="log_cp${CP_SIZE}-d${D}-${MASKS}"
-echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=$S_LOCAL bs=$BS hq=$HQ hks=$HKS masks=$MASKS BHSD=$FLASHMASK_USE_BHSD_LAYOUT devices=$CUDA_VISIBLE_DEVICES"
+echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=$S_LOCAL bs=$BS hq=$HQ hks=$HKS masks=$MASKS devices=$CUDA_VISIBLE_DEVICES"
 
 $PY_BIN -m torch.distributed.run \
     --nnodes 1 \

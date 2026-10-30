@@ -6,13 +6,12 @@
 Mirrors `tests/paddle/distributed/overlap_flashmask.py`: local query + local K/V +
 the CP ``group`` are handed to the FA-v4 SM100 in-library kernel, which gathers
 remote K/V internally (sparse all-gather) while computing, overlapping comm with
-compute, and reduce-scatters dK/dV back to the local share (``USE_RS_OVERLAP``).
+compute, and reduce-scatters dK/dV back to the local share.
 
-Only the single-node dual_chunk overlap path is ported. Multi-node hierarchical
-overlap (cp_size > gpus_per_node) is out of scope here and raises.
+The mask is handed to both passes in group-rank KV-chunk order (chunk r = rank r's
+local K/V, i.e. dual-chunk preprocessed + ``rearrange_blocks``); the library
+permutes it into its own SRBuffer order (circular or hierarchical).
 """
-
-import os
 
 import torch
 import torch.distributed as dist
@@ -20,11 +19,6 @@ import torch.distributed as dist
 from cp_utils import preprocess_index_dual_chunks
 
 from flashmask.cute.interface import _flash_attn_fwd, _flash_attn_bwd
-
-# dK/dV are reduced-scattered to the local share inside the overlap kernel, so the
-# backward returns them as-is. Set False only for a build whose kernel emits
-# gathered (full-sequence) dK/dV.
-USE_RS_OVERLAP = True
 
 _REORDER_IDX_CACHE = {}
 
@@ -53,17 +47,6 @@ def rearrange_blocks(input_tensor, cp_size):
     return reordered.reshape([B, -1, S, 2])
 
 
-# Hierarchical (Rail + LSA) overlap only engages when cp_size spans more than one
-# node; single-node CP (<= gpus_per_node) never triggers it. Ported paths below
-# cover single-node only.
-_use_hierarchical_overlap = os.environ.get("FLASHMASK_USE_HIERARCHICAL", "0") in ("1", "false")
-_hierarchical_gpus_per_node = int(os.environ.get("HIERARCHICAL_GPUS_PER_NODE", "8"))
-
-
-def _hierarchical_active(cp_size):
-    return _use_hierarchical_overlap and cp_size > _hierarchical_gpus_per_node
-
-
 def _deterministic():
     return torch.are_deterministic_algorithms_enabled()
 
@@ -71,11 +54,6 @@ def _deterministic():
 def _forward(query, key, value, startend_row_indices, group, causal):
     rank = dist.get_rank(group=group)
     cp_size = dist.get_world_size(group=group)
-    if _hierarchical_active(cp_size):
-        raise NotImplementedError(
-            "torch CP-overlap test covers single-node dual_chunk only; "
-            f"hierarchical overlap (cp_size={cp_size} > gpus_per_node) is out of scope."
-        )
 
     seq_blocksize = query.shape[1] // 2
     startend_row_indices = preprocess_index_dual_chunks(
@@ -87,43 +65,34 @@ def _forward(query, key, value, startend_row_indices, group, causal):
     )
     startend_row_indices = rearrange_blocks(startend_row_indices, cp_size)
 
-    # cyclic left shift: align the mask with the circular-shift SR buffer order
-    processed_mask = torch.roll(startend_row_indices, shifts=-query.shape[1] * (rank + 1), dims=2)
-
     output, log_sum_exp = _flash_attn_fwd(
         query,
         key,
         value,
-        startend_row_indices=processed_mask,
+        startend_row_indices=startend_row_indices,
         causal=causal,
         return_lse=True,
         pack_gqa=False,
         group=group,
     )
-    # save the rearranged (pre-roll) mask; backward re-rolls it differently
     return output, log_sum_exp, startend_row_indices
 
 
 def _backward(query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal):
-    rank = dist.get_rank(group=group)
-
-    # re-roll the local chunk to the FRONT (backward SR order)
-    bwd_mask = torch.roll(startend_row_indices, shifts=-query.shape[1] * rank, dims=2)
-
-    query_grad, key_grad_gathered, value_grad_gathered, _ = _flash_attn_bwd(
+    # dK/dV come back already reduce-scattered to the local share.
+    query_grad, key_grad, value_grad, _ = _flash_attn_bwd(
         query,
         key,
         value,
         output,
         output_grad,
         log_sum_exp,
-        bwd_mask,
+        flashmask_info=startend_row_indices,
         causal=causal,
         group=group,
         deterministic=_deterministic(),
     )
-    # USE_RS_OVERLAP: the kernel already reduce-scattered dK/dV to the local share.
-    return query_grad, key_grad_gathered, value_grad_gathered
+    return query_grad, key_grad, value_grad
 
 
 class OverlappedFlashMaskFM4(torch.autograd.Function):

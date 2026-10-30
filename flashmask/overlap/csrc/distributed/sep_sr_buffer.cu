@@ -22,40 +22,38 @@ SepSRBuffer<KVType>::SepSRBuffer(
     size_t single_k_numel,
     int semaphore_size,
     int chunks_per_seg,
-    int buffer_capacity,
-    int team,
+    int num_segments,
     int kv_components
 ) :
     _context(context), _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr),
-    _allocated(false), _capacity(buffer_capacity), _team(team),
+    _allocated(false),
     _buf_offset(kv_components * chunks_per_seg * single_k_numel),
     _semaphore_size(semaphore_size),
-    _single_k_numel(single_k_numel),
-    _chunks_per_seg(chunks_per_seg)
+    _num_segments(num_segments)
 {
     if (single_k_numel & 31) {
         throw std::invalid_argument("SepSRBuffer: numel should be the positive multiple of 32");
     }
-    if (buffer_capacity <= 0) {
-        throw std::invalid_argument("SepSRBuffer: buffer_capacity must be > 0, got: " + std::to_string(buffer_capacity));
+    if (num_segments <= 0) {
+        throw std::invalid_argument("SepSRBuffer: num_segments must be > 0, got: " + std::to_string(num_segments));
     }
 
     // 2 = send + recv, kv_components = dK (+ dV unless K and V are shared)
     size_t total_elements = 2 * _buf_offset +
             semaphore_size * sizeof(SemaphoreType) / sizeof(KVType);
 
-    total_elements *= buffer_capacity;
-    _empty_states.resize(buffer_capacity);
+    total_elements *= num_segments;
+    _empty_states.resize(num_segments);
 
     const size_t total_bytes = total_elements * sizeof(KVType);
     _dk_data = static_cast<KVType*>(gin::alloc(_context, total_bytes));
     // Shared K/V has no dV slab; null so that a stray dV access faults instead of
     // silently landing in the dK slab.
     _dv_data = kv_components == 2 ? _dk_data + chunks_per_seg * single_k_numel : nullptr;
-    for (int i = 0; i < buffer_capacity; i++) {
+    for (int i = 0; i < num_segments; i++) {
         cudaEventCreateWithFlags(&_empty_states[i], cudaEventDisableTiming);
     }
-    _semaphores = reinterpret_cast<SemaphoreType*>(_dk_data + 2 * buffer_capacity * _buf_offset);
+    _semaphores = reinterpret_cast<SemaphoreType*>(_dk_data + 2 * num_segments * _buf_offset);
     _allocated = true;
 }
 
@@ -74,11 +72,8 @@ void SepSRBuffer<KVType>::release() {
     _dv_data = nullptr;
     _semaphores = nullptr;
     _allocated = false;
-    _team = -1;
     _buf_offset = 0;
     _semaphore_size = 0;
-    _single_k_numel = 0;
-    _chunks_per_seg = 0;
 }
 
 template <typename KVType>
@@ -94,7 +89,7 @@ SepSRBuffer<KVType>::~SepSRBuffer() noexcept {
 
 template <typename KVType>
 void SepSRBuffer<KVType>::zero_recv_buf(int seg_idx, cudaStream_t comm_stream) {
-    cudaMemsetAsync(_dk_data + _buf_offset * (1 + 2 * (seg_idx % _capacity)), 0, sizeof(KVType) * _buf_offset, comm_stream);
+    cudaMemsetAsync(_dk_data + _buf_offset * (1 + 2 * slot(seg_idx)), 0, sizeof(KVType) * _buf_offset, comm_stream);
 }
 
 template <typename KVType>
@@ -103,12 +98,12 @@ void SepSRBuffer<KVType>::initialize_buffer(int self_rank) {
     // start at zero, and zero_recv_buf only recycles a slot after its first use.
     // all the GPU ops uses the default blocking stream, since this is only called during initialization (one-off)
     size_t recv_buffer_sz = sizeof(KVType) * _buf_offset;
-    for (int stage = 0; stage < _capacity; stage++) {
+    for (int stage = 0; stage < _num_segments; stage++) {
         cudaMemset(_dk_data + _buf_offset * (1 + 2 * stage), 0, recv_buffer_sz);
     }
     size_t semaphore_bytes = _semaphore_size * sizeof(SemaphoreType);
     // set recv buffer and semaphores to be 0 all at once
-    cudaMemset(_semaphores, 0, semaphore_bytes * _capacity);
+    cudaMemset(_semaphores, 0, semaphore_bytes * _num_segments);
 }
 
 template class SepSRBuffer<cutlass::bfloat16_t>;

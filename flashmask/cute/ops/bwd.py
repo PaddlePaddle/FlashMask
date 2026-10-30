@@ -79,6 +79,13 @@ def _flash_attn_bwd(
     kv_postprocess_end: Optional[int] = None,
     group=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """Backward pass for FlashAttention.
+
+    group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
+    S_local shard, dk/dv come back reduce-scattered to S_local, and the mask key axis (dim 2)
+    has length S_local * group_size in group-rank chunk order. The library converts it to SR
+    order; do NOT pre-roll it.
+    """
     be = get_backend(q, k, v)
     compute_capability = be.device_capability()[0]
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
@@ -160,6 +167,36 @@ def _flash_attn_bwd(
             deterministic=deterministic,
         ).n_block_size
 
+    # FM-4 backward consumes one split-AG segment at a time and gates each KV tile
+    # on the producer's per-work completion bitmap.
+    # A paddle Group exposes .world_size, a torch ProcessGroup does not;
+    # ask the collective adapter instead of duck-typing the handle.
+    enable_overlap = group is not None and _dist_world_size(be, group) > 1
+    if enable_overlap:
+        if compute_capability != 10:
+            raise NotImplementedError("FM-4 overlap bwd is only supported on SM100")
+        overlap_runtime = _get_overlap_runtime()
+        assert flashmask_info is not None, (
+            "overlap bwd requires flashmask_info (group-rank KV-chunk order)"
+        )
+        assert kv_postprocess_start is None and kv_postprocess_end is None, (
+            "overlap bwd owns the KV segment postprocess range"
+        )
+        assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
+        assert head_dim_v == head_dim, (
+            "the SRBuffer is a single K/V pair of equal-width slabs, so the V view is "
+            "built from K's head_dim"
+        )
+        assert not causal, "overlap bwd does not support causal yet"
+        if isinstance(flashmask_info, FlashMaskInfoPaddle):
+            flashmask_info = flashmask_info.startend_row_indices
+        overlap_runtime.ensure_initialized(
+            k, v, group, mask_head=flashmask_info.shape[1], kv_shared=kv_shared
+        )
+        # Permute before the block max/min below: the chunk-skip mask and the kernel
+        # both index the gathered K/V in this rank's SRBuffer order.
+        flashmask_info = overlap_runtime.sr_order_mask(flashmask_info, fwd=False)
+
     cute_flashmask_info = None
     num_flashmask_tensors = 0
 
@@ -178,32 +215,11 @@ def _flash_attn_bwd(
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
 
-    # FM-4 backward consumes one split-AG segment at a time and gates each KV tile
-    # on the producer's per-work completion bitmap.
-    # A paddle Group exposes .world_size, a torch ProcessGroup does not;
-    # ask the collective adapter instead of duck-typing the handle.
-    enable_overlap = group is not None and _dist_world_size(be, group) > 1
     overlap_view_args = None
     overlap_bhsd_layout = None
     overlap_segment_idx = None
     if enable_overlap:
-        if compute_capability != 10:
-            raise NotImplementedError("FM-4 overlap bwd is only supported on SM100")
-        overlap_runtime = _get_overlap_runtime()
-        assert flashmask_info is not None, "overlap bwd requires flashmask_info (the post-AG mask)"
-        assert kv_postprocess_start is None and kv_postprocess_end is None, (
-            "overlap bwd owns the KV segment postprocess range"
-        )
-        assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
-        assert head_dim_v == head_dim, (
-            "the SRBuffer is a single K/V pair of equal-width slabs, so the V view is "
-            "built from K's head_dim"
-        )
-        assert not causal, "overlap bwd does not support causal yet"
         startend_row_indices = flashmask_info.startend_row_indices
-        overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1], kv_shared=kv_shared
-        )
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle(be)
         overlap_ag_args = overlap_runtime.start_backward_ag(
@@ -692,6 +708,10 @@ def _flash_attn_bwd(
                         else flashmask_info.startend_row_indices.shape[-1]
                     ),
                 )
+                assert not overlap_bhsd_layout, (
+                    "bigd bwd reads a BSHD SRBuffer; the communicator picks BHSD only for D <= 256"
+                )
+                layout_kwargs = {}
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(
                     head_dim,
@@ -704,6 +724,7 @@ def _flash_attn_bwd(
                     use_2cta_instrs=use_2cta_instrs,
                     deterministic=deterministic,
                 )
+                layout_kwargs = {"overlap_bhsd_layout": overlap_bhsd_layout}
             _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
                 fa_bwd_obj,
                 q_tensor,
@@ -731,7 +752,7 @@ def _flash_attn_bwd(
                 overlap_h=overlap_h,
                 overlap_d=overlap_d,
                 overlap_comm_rpb=overlap_comm_rpb,
-                overlap_bhsd_layout=overlap_bhsd_layout,
+                **layout_kwargs,
                 stream=current_stream,
             )
     if compute_capability == 9:
@@ -1061,7 +1082,7 @@ def _flash_attn_bwd(
                 )
                 if deterministic:
                     dQ_semaphore.zero_()
-                    if need_kv_accum:
+                    if dK_semaphore is not None:
                         dK_semaphore.zero_()
                         dV_semaphore.zero_()
         overlap_runtime.wait_backward_rs(overlap_stream)

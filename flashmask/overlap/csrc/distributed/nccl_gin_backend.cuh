@@ -65,8 +65,7 @@ struct ContextDeleter {
 using ContextPtr = std::unique_ptr<Context, ContextDeleter>;
 
 std::vector<uint8_t> get_unique_id();
-ContextPtr create_context(
-    const uint8_t* unique_id, int rank, int nranks, bool request_hierarchical);
+ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks);
 int rank(const Context& context);
 int nranks(const Context& context);
 int num_lsa_ranks(const Context& context);
@@ -77,7 +76,6 @@ void* alloc(Context& context, size_t bytes);
 void free(Context& context, void* ptr);
 void free_noexcept(Context& context, void* ptr) noexcept;
 void barrier(Context& context);
-void barrier_on_stream(Context& context, cudaStream_t stream);
 void wait_until_on_stream(int64_t* ptr, Compare compare, int64_t value, cudaStream_t stream);
 
 #if defined(FLASHMASK_GIN_DEVICE_API)

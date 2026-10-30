@@ -98,6 +98,9 @@ def _flash_attn_fwd(
             garbage; do not pass an uninitialized / reused buffer.
         block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
             the kernel's n_block_size. Ignored when block_logit is None.
+        group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
+            S_local shard and the mask key axis (dim 2) has length S_local * group_size, in
+            group-rank chunk order. The library converts it to SR order; do NOT pre-roll it.
     """
     be = get_backend(q, k, v)
 
@@ -233,7 +236,7 @@ def _flash_attn_fwd(
     if enable_overlap:
         overlap_runtime = _get_overlap_runtime()
         assert startend_row_indices is not None, (
-            "overlap mode requires startend_row_indices (the post-AG mask)"
+            "overlap mode requires startend_row_indices (group-rank KV-chunk order)"
         )
         assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
         # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
@@ -255,6 +258,9 @@ def _flash_attn_fwd(
             k, v, group, mask_head=startend_row_indices.shape[1],
             kv_shared=overlap_kv_shared,
         )
+        # Callers pass the mask in group-rank KV-chunk order; the chunk-skip mask and the
+        # kernel both index the gathered K/V in this rank's SRBuffer order.
+        startend_row_indices = overlap_runtime.sr_order_mask(startend_row_indices, fwd=True)
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle(be)
         # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
@@ -616,7 +622,7 @@ def _flash_attn_fwd(
         overlap_view = overlap_ag_args.view
         overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
         overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
-        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr.data_ptr())
+        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr_addr)
         _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)

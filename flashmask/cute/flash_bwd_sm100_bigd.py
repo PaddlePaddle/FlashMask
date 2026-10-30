@@ -1358,7 +1358,6 @@ class FlashAttentionBackwardSm100BigD:
         overlap_h=None,
         overlap_d=None,
         overlap_comm_rpb: cutlass.Constexpr = None,
-        overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter.
         stream=None,
     ):
@@ -1398,15 +1397,10 @@ class FlashAttentionBackwardSm100BigD:
         # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
         # capsule, so rebuild the views from the raw segment addresses. The dims must
         # stay runtime Int32 -- a static layout specializes the TMA descriptor
-        # differently and reads the wrong bytes.
-        self.overlap_bhsd_layout = cutlass.const_expr(overlap_bhsd_layout)
+        # differently and reads the wrong bytes. head_dim > 256 here, so the
+        # communicator's SRBuffer is always BSHD (its BHSD transpose caps D at 256).
         if cutlass.const_expr(overlap_k_addr is not None):
-            from_addr = (
-                utils.make_bhsd_storage_bshd_from_addr
-                if cutlass.const_expr(overlap_bhsd_layout)
-                else utils.make_contiguous_bshd_from_addr
-            )
-            mK = from_addr(
+            mK = utils.make_contiguous_bshd_from_addr(
                 overlap_k_addr,
                 overlap_b,
                 overlap_s,
@@ -1415,7 +1409,7 @@ class FlashAttentionBackwardSm100BigD:
                 mQ.element_type,
                 align=16,
             )
-            mV = from_addr(
+            mV = utils.make_contiguous_bshd_from_addr(
                 overlap_v_addr,
                 overlap_b,
                 overlap_s,
@@ -2140,14 +2134,11 @@ class FlashAttentionBackwardSm100BigD:
             # ahead of the K prologue covers the whole CTA. There is no tile scheduler
             # here: a CTA owns one n block for its lifetime.
             if cutlass.const_expr(overlap_work_done_addr is not None):
-                gate_batch_idx = batch_idx
-                if cutlass.const_expr(self.overlap_bhsd_layout):
-                    gate_batch_idx = batch_idx * cute.size(mK.shape[2]) + head_idx_kv
                 _overlap_gate_bwd(
                     n_block,
                     tidx % cute.arch.WARP_SIZE,
                     seqlen_k,
-                    gate_batch_idx,
+                    batch_idx,
                     cute.make_ptr(
                         Int32,
                         overlap_work_done_addr,

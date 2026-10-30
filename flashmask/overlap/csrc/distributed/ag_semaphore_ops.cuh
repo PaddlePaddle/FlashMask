@@ -154,33 +154,6 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
     }
 }
 
-// A debug kernel for `wait_self_empty`. Spins until the max-cycles or predicate is true.
-// If max-cycles is reached, skip this kernel and report status with print
-__global__ void DebugWaitOnStreamLocalKernel(
-    int64_t* const __restrict__ semaphore,
-    const int64_t target_val
-) {
-    static constexpr int64_t max_allowed_wait_cycles = 100000000000; 
-    int64_t start_cycles = clock64();
-    int64_t current_val = 0;
-
-    while (true) {
-        asm volatile("ld.volatile.global.s64 %0, [%1];" 
-                     : "=l"(current_val) : "l"(semaphore) : "memory");
-
-        if (current_val == target_val) {
-            printf("Semaphore is already empty, quit waiting\n");
-            return;
-        }
-
-        if (clock64() - start_cycles > max_allowed_wait_cycles) {
-            printf("[WaitOnStreamKernel TimeOut] Wait for %ld, but still got: %ld\n", 
-                target_val, current_val);
-            start_cycles = clock64();
-        } 
-    }
-}
-
 __global__ void SetFullKernel(
     int64_t* const __restrict__ semaphores,
     int64_t value,
@@ -207,20 +180,12 @@ void wait_self_empty(
     int my_pe,
     cudaStream_t stream
 ) {
-    static constexpr bool IS_DEBUG = false;
-    if constexpr (IS_DEBUG) {
-        DebugWaitOnStreamLocalKernel<<<1, 1, 0, stream>>>(
-            semaphores + my_pe,
-            0
-        );
-    } else {
-        gin::wait_until_on_stream(
-            semaphores + my_pe,
-            gin::Compare::Equal,
-            0,
-            stream
-        );
-    }
+    gin::wait_until_on_stream(
+        semaphores + my_pe,
+        gin::Compare::Equal,
+        0,
+        stream
+    );
 }
 
 /**
