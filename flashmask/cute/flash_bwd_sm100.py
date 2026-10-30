@@ -854,6 +854,14 @@ class FlashAttentionBackwardSm100:
                 overlap_dv_addr, overlap_b, overlap_s, overlap_h, overlap_d,
                 mQ.element_type, align=16,
             )
+        # 1-CTA skips the dKV epilogue of a key block with no unmasked query block.
+        # Plain dK/dV is allocated zeroed; the reused NCCL send slot is not, and the
+        # reduce-scatter sums every row of it, so those rows must be stored as zero.
+        self.zero_skipped_dKV = const_expr(
+            overlap_dk_addr is not None
+            and not self.use_2cta_instrs
+            and not self.dKV_postprocess
+        )
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -4397,6 +4405,29 @@ class FlashAttentionBackwardSm100:
                         mdK_semaphore,
                         "K",
                     )
+                if const_expr(self.zero_skipped_dKV):
+                    if zero_block:
+                        self.store_zero_dK_or_dV(
+                            tidx, batch_idx, head_idx, n_block, seqlen.seqlen_k, mdV, "V"
+                        )
+                        self.store_zero_dK_or_dV(
+                            tidx, batch_idx, head_idx, n_block, seqlen.seqlen_k, mdK, "K"
+                        )
+                if const_expr(
+                    self.deterministic
+                    and self.dKV_postprocess
+                    and self.enable_flashmask
+                    and not self.use_2cta_instrs
+                ):
+                    # A per-q-head mask can skip this tile for one q-head of a KV group
+                    # only; it must still take its turn in the dK/dV accumulate order.
+                    if zero_block:
+                        self.pass_dKV_semaphore(
+                            dp_idx, wg_idx, batch_idx, head_idx, n_block, mdV_semaphore
+                        )
+                        self.pass_dKV_semaphore(
+                            dp_idx, wg_idx, batch_idx, head_idx, n_block, mdK_semaphore
+                        )
                 if const_expr(self.enable_flashmask):
                     flashmask_phase ^= 1
 
@@ -5085,6 +5116,79 @@ class FlashAttentionBackwardSm100:
             )
 
         return dQ_consumer_state, dQ_tma_store_producer_state
+
+    @cute.jit
+    def store_zero_dK_or_dV(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        seqlen_k: Int32,
+        mdKV: cute.Tensor,
+        K_or_V: cutlass.Constexpr[str],
+    ):
+        """FM-3 store_zero: write zeros to this key block's dK or dV rows (MHA, 1-CTA).
+
+        Plain 128-bit stores from all compute threads, bounded by seqlen_k and the
+        real head_dim like the TMA epilogue it replaces.
+        """
+        assert K_or_V in ("K", "V")
+        if const_expr(K_or_V == "K"):
+            tile_hdim, check_hdim_oob = self.tile_hdim, self.check_hdim_oob
+        else:
+            tile_hdim, check_hdim_oob = self.tile_hdimv, self.check_hdim_v_oob
+        dtype = mdKV.element_type
+        num_copy_elems = 128 // dtype.width
+        gmem_tiled_copy = copy_utils.tiled_copy_2d(
+            dtype,
+            tile_hdim // num_copy_elems,
+            cute.arch.WARP_SIZE * len(self.compute_warp_ids),
+            num_copy_elems,
+        )
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        gdKV = cute.local_tile(
+            mdKV[None, None, head_idx, batch_idx], (self.tile_n, tile_hdim), (n_block, 0)
+        )
+        cdKV = cute.make_identity_tensor((self.tile_n, tile_hdim))
+        tdKVgdKV = gmem_thr_copy.partition_D(gdKV)
+        tdKVcdKV = gmem_thr_copy.partition_S(cdKV)
+        t0dKVcdKV = gmem_tiled_copy.get_slice(0).partition_S(cdKV)
+        tdKVpdKV = utils.predicate_k(tdKVcdKV, limit=mdKV.shape[1])
+        tdKVrdKV = cute.make_rmem_tensor_like(tdKVgdKV)
+        tdKVrdKV.fill(0.0)
+        for rest_m in cutlass.range_constexpr(cute.size(tdKVrdKV.shape[1])):
+            if t0dKVcdKV[0, rest_m, 0][0] < seqlen_k - n_block * self.tile_n - tdKVcdKV[0][0]:
+                cute.copy(
+                    gmem_tiled_copy,
+                    tdKVrdKV[None, rest_m, None],
+                    tdKVgdKV[None, rest_m, None],
+                    pred=tdKVpdKV[None, rest_m, None] if const_expr(check_hdim_oob) else None,
+                )
+
+    @cute.jit
+    def pass_dKV_semaphore(
+        self,
+        tidx: Int32,
+        wg_idx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        mdKV_semaphore: cute.Tensor,
+    ):
+        """The deterministic dKV epilogue's semaphore handshake without the accumulate.
+
+        Same flag and turn as epilogue_dK_or_dV_tma: one thread per warpgroup waits
+        for this q-head's turn and passes it on. The acquire -> release on one thread
+        keeps the previous q-heads' accumulates ordered before the next q-head.
+        """
+        mdKV_semaphore_cur = mdKV_semaphore[
+            n_block, None, head_idx // self.qhead_per_kvhead, batch_idx
+        ]
+        barrier.wait_eq(
+            mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
+        )
+        barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
     @cute.jit
     def epilogue_dKV(
