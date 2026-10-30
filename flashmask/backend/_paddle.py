@@ -113,6 +113,9 @@ class PaddleBackend(BackendBase):
     def repeat_interleave(self, x, repeats, axis=None):
         return paddle.repeat_interleave(x, repeats, axis)
 
+    def roll(self, x, shifts, axis):
+        return paddle.roll(x, shifts, axis)
+
     def split(self, x, num_or_sections, axis=0):
         return paddle.split(x, num_or_sections, axis)
 

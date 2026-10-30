@@ -220,6 +220,9 @@ public:
     bool use_bhsd_layout() const {
         return _config.use_bhsd;
     }
+    bool kv_shared() const {
+        return _kv_shared;
+    }
 
     int num_segments() const;
     // for RS overlap, returns number of chunks per segment
@@ -391,6 +394,11 @@ OverlapCommunicator<cutlass::bfloat16_t>& singleton();
 
 // check whether the singleton unique_ptr is nullptr
 bool is_singleton_null();
+
+// Bumped on every create, rebuild or reconfigure of the singleton, and whenever kv_shared
+// flips (it changes v_data / dv_send). Every value a getter returns (sizes, topology,
+// window addresses) stays fixed while the generation is unchanged. Never 0 once created.
+uint64_t config_generation();
 
 // Destroy the singleton for topology refresh.
 // After calling this, the next init_singleton_instance() will re-create from scratch.

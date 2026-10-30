@@ -908,6 +908,7 @@ template class OverlapCommunicator<cutlass::bfloat16_t>;
 static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> overlap_comm = nullptr;
 // UID of the live communicator's generation; a different UID means a different group.
 static ncclUniqueId overlap_comm_uid;
+static uint64_t overlap_comm_generation = 0;
 
 namespace comm {
 
@@ -945,8 +946,11 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
         && std::memcmp(&overlap_comm_uid, unique_id_ptr, sizeof(ncclUniqueId)) == 0;
     if (same_generation) {
         // Shape changes reuse the existing communicator and rebuild only regions.
-        overlap_comm->reconfigure_if_needed(
-            b_kv, s_kv, h_kv, d_kv, nranks, kv_shared);
+        const bool was_kv_shared = overlap_comm->kv_shared();
+        if (overlap_comm->reconfigure_if_needed(b_kv, s_kv, h_kv, d_kv, nranks, kv_shared)
+            || overlap_comm->kv_shared() != was_kv_shared) {
+            ++overlap_comm_generation;
+        }
         return *overlap_comm;
     }
     // New UID = new group generation (same size or not): rebuild. The teardown barrier
@@ -960,6 +964,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
         unique_id_ptr, kv_shared
     );
     std::memcpy(&overlap_comm_uid, unique_id_ptr, sizeof(ncclUniqueId));
+    ++overlap_comm_generation;
     return *overlap_comm;
 }
 
@@ -969,6 +974,10 @@ OverlapCommunicator<cutlass::bfloat16_t>& singleton() {
 
 bool is_singleton_null() {
     return overlap_comm == nullptr;
+}
+
+uint64_t config_generation() {
+    return overlap_comm_generation;
 }
 
 void destroy_singleton() {

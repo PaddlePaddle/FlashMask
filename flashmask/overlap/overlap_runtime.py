@@ -76,9 +76,9 @@ def _load():
     lib.fm4_overlap_get_unique_id.argtypes = [ctypes.c_char_p]
     lib.fm4_overlap_get_unique_id.restype = ctypes.c_int
 
-    # (b, s, h, d, rank, nranks) ints, uid bytes, kv_shared int.
+    # (b, s, h, d, rank, nranks) ints, uid bytes, kv_shared int -> config generation.
     lib.fm4_overlap_init.argtypes = [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int]
-    lib.fm4_overlap_init.restype = ctypes.c_int
+    lib.fm4_overlap_init.restype = ctypes.c_uint64
 
     for name in (
         "fm4_overlap_k_data",
@@ -113,32 +113,18 @@ def _load():
         fn.argtypes = [ctypes.c_int]
         fn.restype = ctypes.c_uint64
 
-    lib.fm4_overlap_update_kv.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-    lib.fm4_overlap_update_kv.restype = None
-
-    lib.fm4_overlap_run_ag.argtypes = []
-    lib.fm4_overlap_run_ag.restype = None
-
-    # (mask_ptr) uint64, num_heads int, (batch_stride, head_stride) int64, compute_stream
-    # uint64, fwd int.
-    lib.fm4_overlap_compute_chunk_mask.argtypes = [
-        ctypes.c_uint64, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint64, ctypes.c_int,
+    # (mask_ptr) uint64, num_heads int, (batch_stride, head_stride) int64, (k_ptr, v_ptr,
+    # compute_stream) uint64, fwd int.
+    lib.fm4_overlap_start_ag.argtypes = [
+        ctypes.c_uint64, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int,
     ]
-    lib.fm4_overlap_compute_chunk_mask.restype = None
+    lib.fm4_overlap_start_ag.restype = None
     lib.fm4_overlap_symmetric_buffer_bytes.argtypes = []
     lib.fm4_overlap_symmetric_buffer_bytes.restype = ctypes.c_uint64
 
-    for name in (
-        "fm4_overlap_wait_sr_buffer_empty",
-        "fm4_overlap_wait_reset_stream_coordinator",
-        "fm4_overlap_wait_reduce_done",
-    ):
-        fn = getattr(lib, name)
-        fn.argtypes = [ctypes.c_uint64]
-        fn.restype = None
-    lib.fm4_overlap_reset_ag_counter.argtypes = [ctypes.c_uint64]
-    lib.fm4_overlap_reset_ag_counter.restype = None
-
+    lib.fm4_overlap_wait_reduce_done.argtypes = [ctypes.c_uint64]
+    lib.fm4_overlap_wait_reduce_done.restype = None
     lib.fm4_overlap_start_bwd_segment.argtypes = [ctypes.c_int, ctypes.c_uint64]
     lib.fm4_overlap_start_bwd_segment.restype = None
     lib.fm4_overlap_wait_dkv_buffer.argtypes = [ctypes.c_int, ctypes.c_uint64]
@@ -151,15 +137,12 @@ def _load():
     ]
     lib.fm4_overlap_run_rs.restype = None
 
-    lib.fm4_overlap_wait_wptr_init.argtypes = []
-    lib.fm4_overlap_wait_wptr_init.restype = None
-
     _LIB = lib
     return lib
 
 
-# B/H/D are Python-side (from the K/V shape); stashed to rebuild the gathered view.
-_KV_SHAPE = None   # (B, H, D); S_total = s_local() * nranks()
+# Communicator values of the current config generation (_CommLayout); see init_overlap.
+_LAYOUT = None
 
 # Cache one NCCL UID per Python process/group generation.
 _UID = None
@@ -206,16 +189,19 @@ def bootstrap_unique_id(rank, group=None, *, be=None, dist=None):
 
 def init_overlap(k, v, rank, nranks, uid_bytes, kv_shared=False):
     """Create or reconfigure the C++ singleton from k/v shape + topology (only
-    k.shape is read; the local-KV copy into the SRBuffer happens in update_kv).
+    k.shape is read; the local-KV copy into the SRBuffer happens in start_*_ag).
     kv_shared: K and V alias one storage, so only K is transported."""
-    global _KV_SHAPE
+    global _LAYOUT
     lib = _load()
     b, s_local, h, d = (int(x) for x in k.shape)
-    _KV_SHAPE = (b, h, d)
-    rc = lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes,
-                              int(kv_shared))
-    if rc != 1:
+    generation = int(lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes,
+                                          int(kv_shared)))
+    if generation == 0:
         raise RuntimeError("fm4_overlap_init failed")
+    # The generation moves on every rebuild, reconfigure (B/S/H/D) or kv_shared flip, so
+    # an unchanged one guarantees every queried size and address is still current.
+    if _LAYOUT is None or _LAYOUT.generation != generation:
+        _LAYOUT = _query_layout(lib, generation, b, h, d)
 
 
 def ensure_initialized(k, v, group, kv_shared=False):
@@ -234,14 +220,20 @@ def ensure_initialized(k, v, group, kv_shared=False):
     init_overlap(k, v, rank, dist.world_size(group), uid, kv_shared=kv_shared)
 
 
+def _layout():
+    if _LAYOUT is None:
+        raise RuntimeError("ensure_initialized must be called first")
+    return _LAYOUT
+
+
 def use_bhsd_layout():
     """Return the communicator's effective SRBuffer layout after initialization."""
-    return bool(_load().fm4_overlap_use_bhsd_layout())
+    return _layout().bhsd
 
 
 def use_hierarchical():
     """Return whether the communicator's effective topology is hierarchical."""
-    return bool(_load().fm4_overlap_use_hierarchical())
+    return _layout().hierarchical
 
 
 def _hier_map_chunk(logical_pos, my_pe, total_n_pes, gpus_per_node):
@@ -281,68 +273,28 @@ def _sr_chunk_order(rank, nranks, gpus_per_node, hierarchical, fwd):
 
 def sr_order_mask(mask, fwd):
     """Reorder a full mask from group-rank KV-chunk order into this rank's SR-buffer order."""
-    if _KV_SHAPE is None:
-        raise RuntimeError("ensure_initialized must be called before sr_order_mask")
-    lib = _load()
-    nranks = int(lib.fm4_overlap_nranks())
-    s_local = int(lib.fm4_overlap_s_local())
+    layout = _layout()
+    nranks, s_local = layout.nranks, layout.s_local
     assert mask.shape[2] == s_local * nranks, (
         f"mask key length {mask.shape[2]} != S_local {s_local} * group size {nranks}"
     )
     order = _sr_chunk_order(
-        int(lib.fm4_overlap_rank()), nranks, int(lib.fm4_overlap_gpus_per_node()),
-        use_hierarchical(), fwd,
+        layout.rank, nranks, layout.gpus_per_node, layout.hierarchical, fwd,
     )
     if order == tuple(range(nranks)):
         return mask
     from flashmask.backend import get_backend
 
     be = get_backend(mask)
+    if not layout.hierarchical:
+        # SR position j holds chunk (order[0] + j) % nranks: one roll by order[0] chunks.
+        return be.roll(mask, -order[0] * s_local, axis=2)
     chunks = be.split(mask, nranks, axis=2)
     return be.concat([chunks[c] for c in order], axis=2)
 
 
 def _data_ptr(t):
     return int(t.data_ptr())
-
-
-def _s_total():
-    """Total gathered seqlen after the all-gather: S_local * nranks."""
-    lib = _load()
-    return lib.fm4_overlap_s_local() * lib.fm4_overlap_nranks()
-
-
-def update_kv(k, v, fwd=True):
-    """Copy local K/V into the SRBuffer (cudaMemcpyAsync on comm_stream)."""
-    _load().fm4_overlap_update_kv(_data_ptr(k), _data_ptr(v), 1 if fwd else 0)
-
-
-def run_ag():
-    """Launch the forward AG remote-get kernel; it advances fm4_overlap_fwd_write_ptr."""
-    _load().fm4_overlap_run_ag()
-
-
-def wait_sr_buffer_empty(compute_stream):
-    """Stream-order compute_stream behind the prior step draining the SRBuffer, so the
-    next update_kv waits for the prior AG's consumers without blocking overlap."""
-    _load().fm4_overlap_wait_sr_buffer_empty(int(compute_stream))
-
-
-def wait_reset_stream_coordinator(compute_stream):
-    """Hold compute_stream until the comm kernel has occupied its SMs (deadlock guard if
-    compute grabbed every SM first)."""
-    _load().fm4_overlap_wait_reset_stream_coordinator(int(compute_stream))
-
-
-def reset_ag_counter(compute_stream):
-    """Reset the persistent AG scheduler counter before each gather."""
-    _load().fm4_overlap_reset_ag_counter(int(compute_stream))
-
-
-def wait_wptr_init():
-    """comm_stream waits for the counter reset (wptr_init event) to land before the
-    remote-get kernel reads block_cnt_semaphore. Pairs with reset_ag_counter."""
-    _load().fm4_overlap_wait_wptr_init()
 
 
 def symmetric_buffer_bytes():
@@ -365,18 +317,6 @@ def _chunk_mask_pairs(startend_row_indices):
     assert be.data_ptr(mask) % 16 == 0, "overlap mask must be 16-byte aligned"
     batch_stride, head_stride = be.strides(mask)[:2]
     return mask, batch_stride, head_stride
-
-
-def compute_chunk_mask_sparse(startend_row_indices, compute_stream, fwd=True):
-    """Drive copy_chunk_mask so the AG kernel skips fully-masked KV chunks. The check
-    runs async on compute_stream reading the mask in place (or a contiguous copy), which
-    MUST outlive run_ag's launch -- returned for keepalive."""
-    mask, batch_stride, head_stride = _chunk_mask_pairs(startend_row_indices)
-    _load().fm4_overlap_compute_chunk_mask(
-        _data_ptr(mask), int(mask.shape[1]), batch_stride, head_stride,
-        int(compute_stream), 1 if fwd else 0,
-    )
-    return mask
 
 
 def current_stream_handle(be):
@@ -405,76 +345,102 @@ class BackwardAgArgs(NamedTuple):
     work_done_addr: int  # device int* base of the per-work done bitmap
     comm_rpb: int
     shape: tuple  # logical (B, S_segment, H, D) view of one segment
+    segment_addrs: tuple  # per segment: (k_addr, v_addr, dk_send_addr, dv_send_addr)
     mask_keepalive: object  # lifetime ownership only; not read by the CuTe kernel
 
     def kv_view(self, segment_idx):
-        lib = _load()
-        return SrKvView(
-            k_addr=lib.fm4_overlap_segment_k_data(int(segment_idx)),
-            v_addr=lib.fm4_overlap_segment_v_data(int(segment_idx)),
-            shape=self.shape,
-        )
+        k_addr, v_addr, _, _ = self.segment_addrs[segment_idx]
+        return SrKvView(k_addr=k_addr, v_addr=v_addr, shape=self.shape)
 
     def dkv_send_addrs(self, segment_idx):
-        lib = _load()
-        return (
-            lib.fm4_overlap_dk_send(int(segment_idx)),
-            lib.fm4_overlap_dv_send(int(segment_idx)),
-        )
+        return self.segment_addrs[segment_idx][2:]
 
 
-def sr_kv_view_args():
-    """SrKvView for the gathered SRBuffer K/V (post all-gather). SRBuffer is bf16."""
-    if _KV_SHAPE is None:
-        raise RuntimeError("init_overlap must be called before sr_kv_view_args")
-    lib = _load()
-    b, h, d = _KV_SHAPE
-    return SrKvView(
-        k_addr=lib.fm4_overlap_k_data(),
-        v_addr=lib.fm4_overlap_v_data(),
-        shape=(b, _s_total(), h, d),
-    )
+class _CommLayout(NamedTuple):
+    """Communicator values of one config generation (the fm4_overlap_init return)."""
+    generation: int
+    nranks: int
+    s_local: int
+    rank: int
+    gpus_per_node: int
+    hierarchical: bool
+    bhsd: bool
+    fwd: ForwardAgArgs
+    bwd: BackwardAgArgs  # mask_keepalive is None; start_backward_ag fills it per call
 
 
-def start_forward_ag(k, v, startend_row_indices, compute_stream):
-    """Launch forward sparse AG asynchronously for cumulative-frontier gating."""
-    wait_sr_buffer_empty(compute_stream)
-    compute_chunk_mask_sparse(startend_row_indices, compute_stream, fwd=True)
-    update_kv(k, v, fwd=True)
-    reset_ag_counter(compute_stream)
-    wait_wptr_init()
-    run_ag()
-    wait_reset_stream_coordinator(compute_stream)
-    write_ptr_addr = int(_load().fm4_overlap_fwd_write_ptr())
-    return ForwardAgArgs(sr_kv_view_args(), write_ptr_addr, int(k.shape[1]))
-
-
-def start_backward_ag(k, v, startend_row_indices, compute_stream):
-    """Prepare multi-stage backward AG/RS and launch split AG segment 0."""
-    lib = _load()
-    mask_keepalive = compute_chunk_mask_sparse(
-        startend_row_indices, compute_stream, fwd=False
-    )
-    wait_sr_buffer_empty(compute_stream)
-    update_kv(k, v, fwd=False)
-
+def _query_layout(lib, generation, b, h, d):
+    """Read every per-generation value once. b/h/d are the K shape the config was built
+    from (the config generation changes with them); the SRBuffer is bf16."""
+    nranks = int(lib.fm4_overlap_nranks())
+    s_local = int(lib.fm4_overlap_s_local())
     num_segments = int(lib.fm4_overlap_num_segments())
     segment_seqlen = int(lib.fm4_overlap_segment_seqlen())
     comm_rpb = int(lib.fm4_overlap_comm_rpb())
     work_done_addr = int(lib.fm4_overlap_work_done())
     if segment_seqlen <= 0 or comm_rpb <= 0 or work_done_addr == 0:
         raise RuntimeError("invalid FM-4 backward overlap metadata")
-
-    b, h, d = _KV_SHAPE
-    lib.fm4_overlap_start_bwd_segment(0, int(compute_stream))
-    return BackwardAgArgs(
+    fwd = ForwardAgArgs(
+        view=SrKvView(
+            k_addr=int(lib.fm4_overlap_k_data()),
+            v_addr=int(lib.fm4_overlap_v_data()),
+            shape=(b, s_local * nranks, h, d),
+        ),
+        write_ptr_addr=int(lib.fm4_overlap_fwd_write_ptr()),
+        kv_chunk_size=s_local,
+    )
+    bwd = BackwardAgArgs(
         num_segments=num_segments,
         segment_seqlen=segment_seqlen,
         work_done_addr=work_done_addr,
         comm_rpb=comm_rpb,
         shape=(b, segment_seqlen, h, d),
-        mask_keepalive=mask_keepalive,
+        segment_addrs=tuple(
+            (
+                int(lib.fm4_overlap_segment_k_data(i)),
+                int(lib.fm4_overlap_segment_v_data(i)),
+                int(lib.fm4_overlap_dk_send(i)),
+                int(lib.fm4_overlap_dv_send(i)),
+            )
+            for i in range(num_segments)
+        ),
+        mask_keepalive=None,
     )
+    return _CommLayout(
+        generation=generation,
+        nranks=nranks,
+        s_local=s_local,
+        rank=int(lib.fm4_overlap_rank()),
+        gpus_per_node=int(lib.fm4_overlap_gpus_per_node()),
+        hierarchical=bool(lib.fm4_overlap_use_hierarchical()),
+        bhsd=bool(lib.fm4_overlap_use_bhsd_layout()),
+        fwd=fwd,
+        bwd=bwd,
+    )
+
+
+def _start_ag(k, v, startend_row_indices, compute_stream, fwd):
+    """fm4_overlap_start_ag: chunk-skip mask, local K/V staging, the (segment-0) AG launch
+    and the stream coordinator. The check reads the mask in place (or a contiguous copy),
+    returned for keepalive."""
+    mask, batch_stride, head_stride = _chunk_mask_pairs(startend_row_indices)
+    _load().fm4_overlap_start_ag(
+        _data_ptr(mask), int(mask.shape[1]), batch_stride, head_stride,
+        _data_ptr(k), _data_ptr(v), int(compute_stream), 1 if fwd else 0,
+    )
+    return mask
+
+
+def start_forward_ag(k, v, startend_row_indices, compute_stream):
+    """Launch forward sparse AG asynchronously for cumulative-frontier gating."""
+    _start_ag(k, v, startend_row_indices, compute_stream, fwd=True)
+    return _layout().fwd
+
+
+def start_backward_ag(k, v, startend_row_indices, compute_stream):
+    """Prepare multi-stage backward AG/RS and launch split AG segment 0."""
+    mask = _start_ag(k, v, startend_row_indices, compute_stream, fwd=False)
+    return _layout().bwd._replace(mask_keepalive=mask)
 
 
 def start_backward_segment(segment_idx, compute_stream):

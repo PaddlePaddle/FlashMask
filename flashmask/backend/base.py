@@ -79,6 +79,7 @@ REQUIRED_ATTRS = (
     "minimum",
     "put_along_axis",
     "repeat_interleave",
+    "roll",
     "split",
     "sum",
     "where",

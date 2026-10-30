@@ -136,6 +136,9 @@ class TorchBackend(BackendBase):
     def repeat_interleave(self, x, repeats, axis=None):
         return torch.repeat_interleave(x, repeats, dim=axis)
 
+    def roll(self, x, shifts, axis):
+        return torch.roll(x, shifts, dims=axis)
+
     def split(self, x, num_or_sections, axis=0):
         if isinstance(num_or_sections, int):
             return list(torch.chunk(x, num_or_sections, dim=axis))

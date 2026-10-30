@@ -232,9 +232,8 @@ def _flash_attn_bwd(
         assert segment_nblocks % 4 == 0, (
             "FM-3 segment mask metadata requires a 4-block-aligned segment"
         )
-        # Keep the full mask tensors. The SM100 loader applies the segment offset
-        # while indexing, preserving the original batch/head stride without copies.
-        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
+        # cute_flashmask_info keeps the full mask tensors. The SM100 loader applies the
+        # segment offset while indexing, preserving the original batch/head stride.
         # All segment-local scheduler and semaphore shapes use this length. The
         # original local length is retained by k/v and by the final dK/dV outputs.
         seqlen_k = segment_seqlen
@@ -1039,6 +1038,7 @@ def _flash_attn_bwd(
                 )
 
         for segment_idx in range(overlap_ag_args.num_segments):
+            has_next = segment_idx + 1 < overlap_ag_args.num_segments
             segment_view = overlap_ag_args.kv_view(segment_idx)
             segment_dk_send_addr, segment_dv_send_addr = (
                 overlap_ag_args.dkv_send_addrs(segment_idx)
@@ -1067,28 +1067,33 @@ def _flash_attn_bwd(
                 segment_idx=segment_idx,
             )
             if need_kv_accum:
+                # AG(s+1) goes ahead of post(s): AG(s+1) and its reset (SR K/V, work_done
+                # bitmap, scheduler counters) follow main(s), their only compute reader,
+                # and post(s) reads only dk_accum / dv_accum and writes only send slot s.
+                if has_next:
+                    overlap_runtime.start_backward_segment(
+                        segment_idx + 1, overlap_stream
+                    )
                 overlap_runtime.wait_dkv_buffer(segment_idx, overlap_stream)
                 _run_overlap_dkv_postprocess(
                     segment_dk_send_addr, segment_dv_send_addr
                 )
             overlap_runtime.run_backward_rs(dk, dv, segment_idx, overlap_stream)
 
-            if segment_idx + 1 < overlap_ag_args.num_segments:
+            if has_next:
                 if need_kv_accum:
-                    dk_accum.zero_()
-                    # kv_shared aliases dv_accum onto dk_accum, so zeroing it again
-                    # would only undo the line above.
-                    if not kv_shared:
-                        dv_accum.zero_()
-                overlap_runtime.start_backward_segment(
-                    segment_idx + 1, overlap_stream
-                )
+                    # dk_accum / dv_accum are the two halves of _zero_big (under
+                    # kv_shared dv_accum aliases a standalone dk_accum): one fill.
+                    (dk_accum if kv_shared else _zero_big).zero_()
+                else:
+                    overlap_runtime.start_backward_segment(
+                        segment_idx + 1, overlap_stream
+                    )
                 if deterministic:
                     dQ_semaphore.zero_()
                     if dK_semaphore is not None:
                         dK_semaphore.zero_()
                         dV_semaphore.zero_()
-        overlap_runtime.wait_backward_rs(overlap_stream)
 
     if enable_overlap:
         if is_bigd_bwd:
@@ -1104,6 +1109,9 @@ def _flash_attn_bwd(
                 head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
                 use_2cta_instrs, 1, "ovl_dq",
             )
+        # The dq postprocess reads dq_accum and writes dq only, none of which the RS chain
+        # (send / recv slots, the reduce into dk / dv) touches, so it runs before the join.
+        overlap_runtime.wait_backward_rs(overlap_stream)
     elif is_bigd_bwd:
         for accum, out, scale, hd, hd_slice, block, seq_rounded, tag in (
             (dq_accum, dq, bigd_scale, head_dim_rounded, slice_d,
