@@ -100,7 +100,8 @@ def _flash_attn_fwd(
             the kernel's n_block_size. Ignored when block_logit is None.
         group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
             S_local shard and the mask key axis (dim 2) has length S_local * group_size, in
-            group-rank chunk order. The library converts it to SR order; do NOT pre-roll it.
+            group-rank chunk order (chunk r is rank r's local K/V). The library reorders it
+            internally; pass it unshifted.
     """
     be = get_backend(q, k, v)
 

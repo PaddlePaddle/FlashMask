@@ -83,8 +83,8 @@ def _flash_attn_bwd(
 
     group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
     S_local shard, dk/dv come back reduce-scattered to S_local, and the mask key axis (dim 2)
-    has length S_local * group_size in group-rank chunk order. The library converts it to SR
-    order; do NOT pre-roll it.
+    has length S_local * group_size in group-rank chunk order (chunk r is rank r's local
+    K/V). The library reorders it internally; pass it unshifted.
     """
     be = get_backend(q, k, v)
     compute_capability = be.device_capability()[0]

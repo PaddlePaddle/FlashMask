@@ -70,8 +70,6 @@ ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks);
 int rank(const Context& context);
 int nranks(const Context& context);
 int num_lsa_ranks(const Context& context);
-int lsa_rank(const Context& context);
-bool use_rail(const Context& context);
 
 // Signal windows hold VA signals, which NCCL requires to be registered with
 // NCCL_WIN_STRICT_ORDERING once they are reached through GIN (cross-node meshes);
@@ -345,7 +343,7 @@ __device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* sit
     }
 }
 
-// Flag wait. Out of line so the watchdog state stays out of the 32-register comm
+// Flag wait. Out of line so the watchdog state stays out of the register-capped comm
 // kernel frames (see network_get_two_buffers in gin_copy_utils.cuh).
 static __device__ __noinline__ void wait_until(
         const int64_t* ptr, Compare compare, int64_t value, const char* site) {

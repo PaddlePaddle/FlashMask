@@ -291,7 +291,7 @@ def sr_order_mask(mask, fwd):
     )
     order = _sr_chunk_order(
         int(lib.fm4_overlap_rank()), nranks, int(lib.fm4_overlap_gpus_per_node()),
-        bool(lib.fm4_overlap_use_hierarchical()), fwd,
+        use_hierarchical(), fwd,
     )
     if order == tuple(range(nranks)):
         return mask
@@ -351,9 +351,9 @@ def symmetric_buffer_bytes():
 
 
 def _chunk_mask_pairs(startend_row_indices):
-    """The (B, H_mask, S_total, 2) [lt_start, ut_end] mask in the layout the chunk-mask
-    kernel reads in place: contiguous pairs, 16-byte aligned base, batch / head strides
-    that are multiples of 4 int32. Returns (mask, batch_stride, head_stride)."""
+    """The (B, H_mask, S_total, 2) [lt_start, ut_end] mask as the chunk-mask kernel reads
+    it in place: contiguous, 16-byte aligned (S_total is even, so the batch / head strides
+    are multiples of 4 int32). Returns (mask, batch_stride, head_stride)."""
     # 4-vec is rejected: lt_end / ut_start are not plumbed through the bridge, so the skip
     # bitmap would over-report fully-masked chunks and silently drop their contribution.
     num_vecs = startend_row_indices.shape[-1]
@@ -361,22 +361,9 @@ def _chunk_mask_pairs(startend_row_indices):
     from flashmask.backend import get_backend
 
     be = get_backend(startend_row_indices)
-
-    def layout(mask):
-        # A size-1 dim is never stepped over, so its stride is irrelevant.
-        b, h = mask.shape[0], mask.shape[1]
-        sb, sh, ss, sv = be.strides(mask)
-        return (sb if b > 1 else 0, sh if h > 1 else 0), (ss, sv) == (2, 1)
-
-    def readable(mask):
-        (sb, sh), pairs = layout(mask)
-        return pairs and sb % 4 == 0 and sh % 4 == 0 and be.data_ptr(mask) % 16 == 0
-
-    mask = startend_row_indices
-    if not readable(mask):
-        mask = be.contiguous(mask)
-        assert readable(mask), "overlap mask: cannot obtain a 16-byte aligned (B, H, S, 2) layout"
-    (batch_stride, head_stride), _ = layout(mask)
+    mask = be.contiguous(startend_row_indices)
+    assert be.data_ptr(mask) % 16 == 0, "overlap mask must be 16-byte aligned"
+    batch_stride, head_stride = be.strides(mask)[:2]
     return mask, batch_stride, head_stride
 
 

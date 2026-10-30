@@ -54,22 +54,14 @@ def _overlap_gate(
     n_block_size: cutlass.Constexpr[int],
     kv_chunk_size: cutlass.Constexpr[int],
 ):
-    """FM-4 overlap gate: spin the elected load-warp thread until the comm side has
-    gathered the remote KV rows for the tile at ``nblk``.
+    """FM-4 overlap gate: spin until the comm side has gathered the KV rows of tile ``nblk``.
 
-    ``write_ptr`` is a per-batch ROW index advanced by atomicMax on the comm side; the
-    reverse-row math mirrors the comm kernel's reversed traversal (seqlen_offset =
-    s_total - s_local). A negative ``reverse_row`` means the tile is in the local chunk
-    (last ``kv_chunk_size`` rows of SRBuffer), which is never remote-fetched, so no wait
-    and no fence: comm_stream writes it before the AG kernel, and that reaches this
-    kernel through the stream-coordinator release/acquire plus the kernel boundary, which
-    is proxy-preserving (PTX ISA 8.9.4).
-    Only ``tidx == 0`` spins. Every lane of the (single) load warp must call this, with
-    warp-uniform arguments: after the warp sync every lane, including the ``elect.sync``
-    lane that issues the K/V TMA loads, runs the generic -> async proxy fence itself.
-
-    At module scope (not a nested closure) so its ``__closure__`` is empty and the DSL
-    ``closure_check`` accepts it inside dynamic control flow.
+    ``write_ptr`` is a per-batch row frontier (atomicMax, right-to-left traversal). A
+    negative ``reverse_row`` is the local chunk, written before the AG kernel and ordered
+    by the stream coordinator plus the kernel boundary, so no wait and no fence. Every lane
+    of the load warp calls this with warp-uniform arguments; ``tidx == 0`` spins, then all
+    lanes run the generic -> async proxy fence. Module scope keeps ``__closure__`` empty for
+    the DSL ``closure_check``.
     """
     reverse_row = s_total - nblk * n_block_size - kv_chunk_size
     if reverse_row >= 0:

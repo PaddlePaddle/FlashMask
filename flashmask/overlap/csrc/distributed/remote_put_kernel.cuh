@@ -26,7 +26,7 @@ namespace flashmask {
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
     int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
+__global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
     const T* const __restrict__ v_send,                 // V src addr (local)
     T* const __restrict__ k_recv,                       // K dst addr (remote)

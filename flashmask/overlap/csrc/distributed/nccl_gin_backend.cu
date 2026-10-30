@@ -137,7 +137,7 @@ public:
         FM_NCCL_CHECK(ncclCommQueryProperties(comm_, &props));
 
         ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        const bool needs_network = nranks_ > num_lsa_ranks_;
+        const bool needs_network = use_rail_;
         if (needs_network) {
             // Cross-node transport always uses full-mesh GIN so the World team can
             // reach every peer (same-node included) on a single coherence domain.
@@ -174,7 +174,7 @@ public:
 
         // STRICT_ORDERING only orders NIC (IB Verbs) traffic; single node has no GIN and
         // reaches signals with LSA atomics only.
-        const bool strict = kind == WindowKind::Signal && nranks_ > num_lsa_ranks_;
+        const bool strict = kind == WindowKind::Signal && use_rail_;
         const ncclResult_t register_result = ncclCommWindowRegister(
             comm_, region.raw_ptr, bytes, &region.window,
             strict ? NCCL_WIN_STRICT_ORDERING : NCCL_WIN_DEFAULT);
@@ -251,8 +251,6 @@ public:
     int rank() const { return rank_; }
     int nranks() const { return nranks_; }
     int num_lsa_ranks() const { return num_lsa_ranks_; }
-    int lsa_rank() const { return lsa_rank_; }
-    bool use_rail() const { return use_rail_; }
     size_t window_bytes() const {
         size_t total = 0;
         for (const HostRegion& region : regions_) total += region.bytes;
@@ -356,8 +354,6 @@ void ContextDeleter::operator()(Context* context) const noexcept {
 int rank(const Context& context) { return context.rank(); }
 int nranks(const Context& context) { return context.nranks(); }
 int num_lsa_ranks(const Context& context) { return context.num_lsa_ranks(); }
-int lsa_rank(const Context& context) { return context.lsa_rank(); }
-bool use_rail(const Context& context) { return context.use_rail(); }
 void* alloc(Context& context, size_t bytes, WindowKind kind) { return context.allocate(bytes, kind); }
 void free(Context& context, void* ptr) { context.release(ptr); }
 void free_noexcept(Context& context, void* ptr) noexcept { context.release_noexcept(ptr); }

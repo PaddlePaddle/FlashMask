@@ -9,6 +9,25 @@
 
 namespace flashmask::shmem {
 
+// Register budget per thread of the comm kernels (AG get, RS put); the kernels derive
+// their __launch_bounds__ min-blocks from it via comm_min_blocks_per_sm. Comm CTAs never
+// share an SM with FM-4 compute CTAs, which allocate the whole register file through
+// setmaxnreg, so the budget only decides how many comm CTAs fit on one SM: 64 at 512
+// threads gives 2 (an AG and an RS CTA can still pair up) and leaves room for
+// lsa_copy_block's FM4_LSA_COPY_UNROLL staged int4 loads. The old budget of 32 capped
+// the copy at one load in flight per thread.
+#ifndef FM4_COMM_REGS_PER_THREAD
+#define FM4_COMM_REGS_PER_THREAD 64
+#endif
+// 16 B loads each thread keeps in flight per main-loop iteration of lsa_copy_block.
+#ifndef FM4_LSA_COPY_UNROLL
+#define FM4_LSA_COPY_UNROLL 8
+#endif
+
+__host__ __device__ constexpr int comm_min_blocks_per_sm(int num_warps) {
+    return 65536 / (num_warps * 32 * FM4_COMM_REGS_PER_THREAD);
+}
+
 // A null dst2 means the caller has a single component to move (shared K/V); src2 is then
 // unused. Offsetting keeps it null, so callers need no branch of their own.
 template <typename T>
@@ -16,38 +35,66 @@ __device__ __forceinline__ T* offset_or_null(T* base, int64_t offset) {
     return base != nullptr ? base + offset : nullptr;
 }
 
-// Branching once beats branching per element, but holding both loops inside the callers
-// costs more registers than they have (see network_get_two_buffers below for the budget
-// and for why `static` is mandatory). Measured on sm_100a: out of line, every comm entry
-// drops to 0 spill bytes and both loops keep an unbroken LD/ST.E.128 run; inlined, they
-// spill more than the single-loop baseline did.
-static __device__ __noinline__ void copy_two_buffers_block(
-    void* dst1, void* dst2, const void* src1, const void* src2, int bytes) {
-    auto* dst1_vec = static_cast<int4*>(dst1);
-    const auto* src1_vec = static_cast<const int4*>(src1);
-    const int count = bytes / sizeof(int4);
-    if (dst2 == nullptr) {
-        for (int i = threadIdx.x; i < count; i += blockDim.x) {
-            dst1_vec[i] = src1_vec[i];
+// Block-wide copy of `count` int4s. One NVLink peer access costs microseconds, so the
+// per-SM bandwidth is the bytes each thread keeps in flight divided by that latency:
+// the main loop stages `unroll` independent loads before any store. Source order alone
+// does this -- dst and src may alias as far as the compiler knows, so it keeps every
+// load of an iteration ahead of that iteration's stores but never hoists the next
+// iteration's loads. __restrict__ is deliberately absent: it lets nvcc emit
+// ld.global.nc, which is illegal here because hierarchical Phase 2 reads a peer slot
+// that the peer's NIC fills while this kernel runs, and the RS send buffers have no
+// kernel-lifetime read-only guarantee either. Element i is moved by the same thread
+// with the same data as the plain strided loop; the tail (count % (unroll * blockDim))
+// runs that loop.
+template <int unroll>
+__device__ __forceinline__ void lsa_copy_block(int4* dst, const int4* src, int count) {
+    const int stride = blockDim.x;
+    const int tile = unroll * stride;
+    const int full = count - count % tile;
+    int i = threadIdx.x;
+    for (; i < full; i += tile) {
+        int4 staged[unroll];
+#pragma unroll
+        for (int u = 0; u < unroll; ++u) {
+            staged[u] = src[i + u * stride];
         }
-        return;
+#pragma unroll
+        for (int u = 0; u < unroll; ++u) {
+            dst[i + u * stride] = staged[u];
+        }
     }
-    auto* dst2_vec = static_cast<int4*>(dst2);
-    const auto* src2_vec = static_cast<const int4*>(src2);
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
-        dst1_vec[i] = src1_vec[i];
-        dst2_vec[i] = src2_vec[i];
+    for (; i < count; i += stride) {
+        dst[i] = src[i];
     }
 }
 
-// Building a GIN work request needs far more live state than the bulk copy
-// above. The comm kernels run at 512 threads with 4 CTAs per SM, i.e. a hard
-// 32-register budget, so inlining this into them makes ptxas spill the copy
-// loop -- a cost every chunk pays, including the intra-node ones that never
-// reach here. Keeping it out of line confines that pressure to its own frame.
+// Out of line, as for network_get_two_buffers below (which explains why `static` is
+// mandatory). Measured on sm_103a at 64 registers: inlined, the RS put entries spill
+// 72 B and the AG entries up to 44 B; out of line, every comm entry has 0 spill bytes
+// and this frame only saves its callee-saved registers once per call, outside the
+// loops. The two components are copied one after the other: each pass already has
+// FM4_LSA_COPY_UNROLL loads in flight, and interleaving them would double the staged
+// registers. A trailing bytes % 16 is not copied, as before; callers move whole rows
+// of D * 2 bytes.
+static __device__ __noinline__ void copy_two_buffers_block(
+    void* dst1, void* dst2, const void* src1, const void* src2, int bytes) {
+    const int count = bytes / sizeof(int4);
+    lsa_copy_block<FM4_LSA_COPY_UNROLL>(
+        static_cast<int4*>(dst1), static_cast<const int4*>(src1), count);
+    if (dst2 != nullptr) {
+        lsa_copy_block<FM4_LSA_COPY_UNROLL>(
+            static_cast<int4*>(dst2), static_cast<const int4*>(src2), count);
+    }
+}
+
+// Building a GIN work request needs far more live state than the bulk copy above
+// (about 126 registers unconstrained), so inlining it into the comm kernels makes
+// ptxas spill around the copy loop under FM4_COMM_REGS_PER_THREAD -- a cost every
+// chunk pays, including the intra-node ones that never reach here. Keeping it out of
+// line confines that pressure to its own frame.
 // `static` is required: with external linkage the ABI register count is fixed
 // before ptxas sees the caller, and separable compilation then rejects a
-// 32-register entry calling a 126-register function.
+// budget-capped entry calling a 126-register function.
 static __device__ __noinline__ void network_get_two_buffers(
     void* dst1, void* dst2, const void* src1, const void* src2,
     int bytes, int world_peer) {

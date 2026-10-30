@@ -11,11 +11,9 @@ from cutlass._mlir.dialects import llvm
 
 @dsl_user_op
 def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
-    """``ld.global.acquire.gpu``: synchronizes with a gpu-or-wider-scope release of the
-    word by any thread on this GPU, including other kernel grids (PTX ISA 8.5). Data the
-    releaser acquired from peers or the NIC reaches the caller by causality transitivity
-    (8.9.5), so the flag writer, not the data writer, must be on this GPU. The ordering
-    is generic-proxy only; async-proxy (TMA) readers need ``fence.proxy.async`` (8.6).
+    """``ld.global.acquire.gpu``: pairs with a gpu-scope release by any grid on this GPU;
+    data the releaser acquired from peers or the NIC follows by causality, so the flag
+    writer must be on this GPU. Generic proxy only: TMA readers also need ``fence.proxy.async``.
     """
     lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
     state = llvm.inline_asm(

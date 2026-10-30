@@ -19,7 +19,11 @@ struct OverlapConfig {
     int H = 0;
     int D = 0;
     int nranks = 0;        // communicator size; changes require a rebuild
-    bool use_bhsd = false;     // SR buffer uses (B,H,S,D); derived from D (<= 256) per config
+    bool use_bhsd = false;     // SR buffer uses (B,H,S,D); bhsd_for(D) per config
+
+    // The BHSD transpose puts D in a TMA box dimension, which caps at 256 elements.
+    static constexpr int kMaxBhsdHeadDim = 256;
+    static bool bhsd_for(int d) { return d <= kMaxBhsdHeadDim; }
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
@@ -230,7 +234,7 @@ public:
     //  ─────────────  ───────────────────────────────  ──────────────────────────────────────
     //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
     //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
-    //  ag_done        comm_stream → comp_stream        AG kernel finished; it no longer reads copy_chunk_mask nor writes block_cnt_semaphore / fwd_write_ptr
+    //  ag_done        comm_stream → comp_stream        AG kernel done reading copy_chunk_mask and writing block_cnt_semaphore / fwd_write_ptr
     //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready
     //  local_moved    put_streams[0] → aux_c_stream    Segment-0 local dKV memcpy d2d completed
     //
@@ -284,6 +288,10 @@ private:
     void size_block_work_ids();
     // Create or recreate the dkv_buffer (and its per-segment streams) for the current shape
     void setup_dkv_buffer();
+    // dK/dV slots too small or laid out for another num_chunks
+    bool dkv_needs_recreate() const {
+        return B * _local_batch_stride > _dkv_single_k_numel_capacity || num_chunks != _dkv_num_chunks;
+    }
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
     // Zero recv(segment_idx) and tell its producers it is empty, on aux_c_stream.
@@ -295,7 +303,7 @@ private:
     std::unique_ptr<SignalBuffer> sig_buffer;
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
-    cudaStream_t aux_c_stream;      // RS-overlap: consumer (reduce) stream
+    cudaStream_t aux_c_stream;      // RS consumer (reduce) stream
 
     // Shape parameters (non-const to allow dynamic reconfiguration)
     int B;
@@ -325,8 +333,8 @@ private:
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;
     size_t _sr_buffer_capacity;             // allocated SRBuffer numel capacity
-    size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
-    int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
+    size_t _dkv_single_k_numel_capacity = 0;    // allocated SepSRBuffer single_k_numel capacity
+    int _dkv_num_chunks = 0;                    // SepSRBuffer's chunks_per_seg (layout-defining)
 
     int _bitmap_region_size;                // bitmap entries the current shape uses (work_done + frontier)
     int _bwi_head_capacity = 0;             // allocated head region (>= num_blocks and the bitmap)

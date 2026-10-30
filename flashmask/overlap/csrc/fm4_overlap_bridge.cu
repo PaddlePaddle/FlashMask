@@ -19,8 +19,7 @@ inline cudaStream_t as_stream(uint64_t handle) {
 }
 
 // FM-4 does not run prepare_flashmask_kernel, so reset the persistent AG scheduler
-// counter and the forward frontier here before every gather. Wait for the prior AG
-// before resetting the scheduler/frontier; the next AG waits on wptr_init.
+// counter and the forward frontier here before every gather.
 __global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore, int* const write_ptr) {
     if (threadIdx.x == 0) {
         *block_cnt_semaphore = 1;
@@ -28,6 +27,7 @@ __global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore, int*
     }
 }
 
+// Wait for the prior AG before resetting the scheduler/frontier; the next AG waits on wptr_init.
 void reset_ag_counter(flashmask::OverlapCommunicator<bf16>& c, cudaStream_t stream) {
     c.ensure_ag_done(stream);
     fm4_reset_ag_counter_kernel<<<1, 32, 0, stream>>>(

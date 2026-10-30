@@ -33,36 +33,30 @@ __device__ __forceinline__ bf16x4 to_bf16x4(float4 in) {
 
 // One component (dK or dV) of a reduce step. All pointers address (B, nc * S_chunk, H, D)
 // recv-slot layouts except out, which is (B, S_chunk, H, D).
-//   slot0     recv(0); read by the first step (fold_slot0)
-//   home_lo   recv(0) chunk 0: low 8 bytes of every fp32 quad of the running sum
+//   home      recv(0): read by the first step (fold_slot0); chunk 0 holds the low 8 bytes
+//             of every fp32 quad of the running sum
 //   home_hi   high 8 bytes: recv(0) chunk 1 when nc >= 2, recv(1) chunk 0 when nc == 1
-//   recv      recv(s) of this step
-// Not __restrict__: home_lo/home_hi alias slot0 (and recv when nc == 1).
+//   recv      recv(s) of this step; null for an absent component (kv_shared dV)
+// Not __restrict__: home_hi aliases home (and recv when nc == 1).
 struct ReduceOperand {
-    const bf16* slot0;
-    bf16* home_lo;
+    bf16* home;
     bf16* home_hi;
     const bf16* recv;
     bf16* out;
 };
 
 /**
- * fp32 reduce of the RS recv slots without a separate scratch. Segment 0 launches nothing;
- * segment 1 (fold_slot0) sums recv(0) and recv(1), later segments add recv(s) to the
- * running sum, and the last segment (is_last) rounds once to bf16 into out. The running
- * sum lives in the home bytes of recv(0) (and recv(1) when nc == 1): the 4 fp32 of a quad
- * take the 16 bf16 bytes that hold this quad in chunk 0 and chunk 1 (resp. in slot 0 and
- * 1). The grid-stride loop gives each (b, quad) to one thread, which loads those home
- * bytes (as its own bf16 inputs or as the previous sum) before storing them, and no other
- * thread touches them, so the fp32 add sequence equals that of a separate scratch:
- * 0 + recv(0) chunks + recv(1) chunks + ... in slot and chunk order.
+ * fp32 reduce of the RS recv slots without a separate scratch: segment 1 (fold_slot0) sums
+ * recv(0) and recv(1), later segments add recv(s), the last (is_last) rounds once into out.
+ * The fp32 running sum lives in the home bytes of recv(0) (and recv(1) when nc == 1). Each
+ * (b, quad) belongs to one thread, which loads its home bytes before storing them, so the
+ * add order equals a separate scratch's: 0 + recv(0) chunks + recv(1) chunks + ...
 */
 template <int num_chunks = 4, bool fold_slot0 = true, bool is_last = true>
 __global__ __launch_bounds__(128, 8)
 void ReducedKdVKernel(
     const ReduceOperand dk,
     const ReduceOperand dv,
-    const bool has_dv,
     const int num_tasks_per_batch       // S_chunk * H * D / 512
 ) {
     static constexpr int elem_per_block = 512;
@@ -88,11 +82,11 @@ void ReducedKdVKernel(
     // task offset is small_chunk offset + thread offset
     auto reduce_op = [&](const ReduceOperand& op, int64_t task_offset) {
         const int64_t base_offset = b_offset_sr + task_offset;
-        uint2* const lo = reinterpret_cast<uint2*>(op.home_lo + base_offset);
+        uint2* const lo = reinterpret_cast<uint2*>(op.home + base_offset);
         uint2* const hi = reinterpret_cast<uint2*>(op.home_hi + base_offset);
         float4 acc = make_float4(0, 0, 0, 0);
         if constexpr (fold_slot0) {
-            add_chunks(acc, op.slot0, base_offset);
+            add_chunks(acc, op.home, base_offset);
         } else {
             const uint2 l = *lo, h = *hi;
             acc = make_float4(__uint_as_float(l.x), __uint_as_float(l.y),
@@ -112,13 +106,13 @@ void ReducedKdVKernel(
         const int64_t task_offset = int64_t(task_idx) * elem_per_block + 4 * threadIdx.x;
 
         reduce_op(dk, task_offset);
-        if (has_dv) reduce_op(dv, task_offset);
+        if (dv.recv) reduce_op(dv, task_offset);
     }
 }
 
 #define ReduceKernelLaunch(_num_chunk, _fold_slot0, _is_last)                            \
     ReducedKdVKernel<_num_chunk, _fold_slot0, _is_last><<<grid, 128, 0, stream>>>(       \
-        dk, dv, has_dv, num_tasks_per_chunk)
+        dk, dv, num_tasks_per_chunk)
 
 #define ChunkDipatchKernelLaunch(num_chunk, fold_slot0, is_last)                         \
     switch (num_chunk) {                                                                \
@@ -134,12 +128,11 @@ void ReducedKdVKernel(
 
 /**
  * Reduce step of segment `segment_idx` >= 1 (see ReducedKdVKernel).
- * @param has_dv false skips the dV operand entirely (kv_shared merges dV into dK).
+ * A null dv.recv skips the dV operand entirely (kv_shared merges dV into dK).
 */
 void launch_dk_dv_reduce(
     const ReduceOperand& dk,
     const ReduceOperand& dv,
-    bool has_dv,
     int B, int S_chunk, int H, int D,
     int num_chunks, int segment_idx, int num_segments, cudaStream_t stream
 ) {

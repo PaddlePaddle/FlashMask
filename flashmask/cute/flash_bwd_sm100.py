@@ -5137,10 +5137,10 @@ class FlashAttentionBackwardSm100:
         mdKV: cute.Tensor,
         K_or_V: cutlass.Constexpr[str],
     ):
-        """FM-3 store_zero: write zeros to this key block's dK or dV rows (MHA, 1-CTA).
+        """Zero this key block's dK or dV rows (MHA, 1-CTA).
 
         Plain 128-bit stores from all compute threads, bounded by seqlen_k and the
-        real head_dim like the TMA epilogue it replaces.
+        real head_dim like the TMA epilogue.
         """
         assert K_or_V in ("K", "V")
         if const_expr(K_or_V == "K"):

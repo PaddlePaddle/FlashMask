@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
 template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_hierarchical=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemoteGetKernel(
+__global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     int* const __restrict__ wptr,
@@ -286,7 +286,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             target_rank = info.target_rank;  // Data owner (semaphore wait target)
             remote_pe = info.src_pe;         // PE to fetch from (Phase 1: = target_rank; Phase 2: = same-node rank)
             is_phase1 = info.is_phase1;
-            seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk, false);
+            seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk);
 
             // mask_index: seqlen_id to copy_chunk_mask entry (mask laid out in SR buffer order from seqlen 0)
             mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + seqlen_id / row_per_block;
@@ -296,7 +296,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, false);
             src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
-            // Original circular shift traversal, reversed
+            // Circular-shift traversal, right to left
             seqlen_id = seqlen_offset - seq_work_id * row_per_block;
             const int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
             remote_pe = my_pe - cp_chunk_id;
@@ -370,7 +370,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 //                          to a unique [segment_idx * num_chunks * S_chunk, (segment_idx+1) * ...) region so that
 //                          later segments' Phase-2 consumers can still read Phase-1 data fetched in earlier segments.
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_hierarchical=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkSplittedRemoteGetKernel(
+__global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
     const T* const __restrict__ local_k,
@@ -471,12 +471,12 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     // Phase 1 per-batch congruence_notify (hierarchical only).
-    // Same logic as in the forward kernel — see comments there.
+    // Same logic as in the forward kernel; see the comments there.
     auto try_congruence_notify = [&](int chunk_id, int target_rank_val, bool is_phase1_val, int batch_id) {
         if constexpr (use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {
                 const int counter_idx = (chunk_id - chunk_offset) + num_chunks * batch_id;
-                // acq_rel: see the non-split kernel.
+                // acq_rel: see the forward kernel.
                 int prev = cuda::atomic_ref<int, cuda::thread_scope_device>(rank_empty_counters[counter_idx])
                     .fetch_add(1, cuda::memory_order_acq_rel);
                 if (prev + 1 == work_per_chunk) {

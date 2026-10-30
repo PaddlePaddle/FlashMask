@@ -15,17 +15,13 @@ namespace flashmask {
 
 using SemaphoreType = int64_t;
 
-// Communicator-owned VA-signal words, in one signal window (gin::WindowKind::Signal):
-//   ag_refcnt[N]  index = data owner X. On X: consumers of X's KV chunk. On the relay
-//                 holder H (hierarchical): H's same-node readers of X's relayed chunk.
-//   rs_full[N]    index = RS segment; on the consumer, one add per producer.
+// Communicator-owned VA-signal words in one signal window:
+//   ag_refcnt[N]  index = data owner X: X's consumers (or a relay holder's same-node readers).
+//   rs_full[N]    index = RS segment; one add per producer on the consumer.
 //   drain         gin::quiesce only.
-// Producers only ever add 1; nothing resets a word after the constructor's zeroing,
-// which the first team barrier orders before any traffic. Each waiter compares
-// against an expected counter in plain device memory, bumped in-stream by the kernel
-// that issues the matching notifications, so replays of a captured graph stay exact.
-// World size is fixed per communicator, so this is allocated once and never resized;
-// adds still in flight across a reconfigure land in a live window.
+// Words are only ever +1'd after the constructor zeroing (ordered by the first team barrier);
+// waiters compare with in-stream bumped expected counters, so graph replays stay exact.
+// Allocated once (fixed world size), so adds in flight across a reconfigure land in a live window.
 class SignalBuffer {
 private:
     gin::Context& _context;

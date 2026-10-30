@@ -140,21 +140,16 @@ __device__ __host__ inline int hier_position_in_src_pe(
 }
 
 /**
- * Compute seqlen_id for a given logical chunk position and direction.
+ * Forward seqlen_id for a given logical chunk position (the SR buffer is filled right to left).
  */
 __device__ __host__ inline int hier_seqlen_id(
     int logical_pos,
     int row_within_chunk,
     int row_per_block,
     int nranks,
-    int S_chunk,
-    bool bwd
+    int S_chunk
 ) {
-    if (bwd) {
-        return logical_pos * S_chunk + row_within_chunk * row_per_block;
-    } else {
-        return (nranks - 1 - logical_pos) * S_chunk + row_within_chunk * row_per_block;
-    }
+    return (nranks - 1 - logical_pos) * S_chunk + row_within_chunk * row_per_block;
 }
 
 /**

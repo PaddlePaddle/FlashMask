@@ -48,8 +48,8 @@ def flashmask_attention(
 
     group: context-parallel group; enables the FM-4 overlap path when its world size
     is greater than 1. Then key/value are the local S_local shard and the mask key
-    axis has length S_local * group_size, in group-rank chunk order; the library
-    converts it to SR order, so callers must NOT pre-roll it.
+    axis has length S_local * group_size, in group-rank chunk order (chunk r is rank
+    r's local K/V). The library reorders it internally; pass it unshifted.
     """
     be = get_backend(query, key, value)
     _check_cutedsl_supported(query, key, value, be)
