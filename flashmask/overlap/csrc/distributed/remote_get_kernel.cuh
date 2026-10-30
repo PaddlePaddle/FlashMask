@@ -38,13 +38,15 @@ __global__ void InitBitmapForLocalSkip(
 // Supports mask_head >= 1. When mask_head > 1, AND-reduces across all mask heads
 // so that a chunk is skippable only when ALL heads agree it is fully masked.
 // When mask_head == 1, the head loop runs once with negligible overhead.
-template <int S_chunk, int num_warps = 8, int row_per_warp = 32, bool skip_local=false>
+// mask: (B, num_head, S_k, 2) int32 [lt_start, ut_end] pairs with row stride 2; each thread
+// checks 4 rows with two aligned int4 loads.
+template <int num_warps = 8, int row_per_warp = 32>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
-    const int* const __restrict__ lt_start_ptr,
-    const int* const __restrict__ ut_end_ptr,
+    const int* const __restrict__ mask,
     int* const __restrict__ copy_chunk_mask,
     const int num_head,                         // mask head count (H_mask)
-    const int head_stride
+    const int64_t batch_stride,                 // int32 elements, multiple of 4
+    const int64_t head_stride                   // int32 elements, multiple of 4
 ) {
     static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
     static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
@@ -52,16 +54,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
     static constexpr int rows_per_cta = row_per_warp * num_warps;
     __shared__ int warps_masked[num_warps];
     __shared__ int temp_result[4];              // cross-head AND-reduction buffer
-    // mask layout: (B, H_mask, S_k), batch stride = num_head * head_stride
-    const int batch_offset = blockIdx.y * num_head * head_stride;
-    const int seq_offset = skip_local ? S_chunk : 0;
     const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
-    const int* mask_lts = lt_start_ptr + batch_offset + seq_offset + load_index * 4;
-    const int* mask_ute = ut_end_ptr + batch_offset + seq_offset + load_index * 4;
-    for (int head_id = 0, head_offset = 0; head_id < num_head; head_id++, head_offset += head_stride) {
-        const int4 lts = *(reinterpret_cast<const int4*>(mask_lts + head_offset));
-        const int4 ute = *(reinterpret_cast<const int4*>(mask_ute + head_offset));
-        int is_masked = (lts.x <= ute.x) && (lts.y <= ute.y) && (lts.z <= ute.z) && (lts.w <= ute.w);
+    const int* const rows = mask + blockIdx.y * batch_stride + int64_t(load_index) * 8;
+    for (int head_id = 0; head_id < num_head; head_id++) {
+        const int4* const pairs = reinterpret_cast<const int4*>(rows + head_id * head_stride);
+        const int4 p01 = pairs[0];
+        const int4 p23 = pairs[1];
+        int is_masked = (p01.x <= p01.y) && (p01.z <= p01.w) && (p23.x <= p23.y) && (p23.z <= p23.w);
         int current_warp_masked = __all_sync(0xffffffff, is_masked);
         if ((threadIdx.x % 32) == 0) {
             warps_masked[threadIdx.x / 32] = current_warp_masked;
@@ -156,7 +155,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityC
  *  load-imbalance for this communication kernel (which is crucial to overlap performance), a chunk-cnt semaphore
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
-template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool bwd=false, bool use_hierarchical=false>
+template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -187,7 +186,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
     announce_comm_cta(stream_coordinator);
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
-    constexpr int seqlen_offset = bwd ? 0 : (S - S_chunk);
+    constexpr int seqlen_offset = S - S_chunk;
     constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
     constexpr int work_per_chunk = S_chunk / row_per_block;
     const int total_chunks = num_batch * chunk_per_batch;
@@ -279,44 +278,32 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         if constexpr (use_hierarchical) {
             // Hierarchical traversal: congruence group first, intra-node second
             const int logical_pos = (seq_work_id - 1) / work_per_chunk + 1;  // 1-based remote chunk: skip local
-            // FWD: reverse chunk-internal row order so that high-seqlen (rightmost) rows are
+            // Reverse chunk-internal row order so that high-seqlen (rightmost) rows are
             // fetched first (low work_id), matching wptr's right-to-left contiguous frontier semantic.
-            // BWD: keep original left-to-right order (BWD compute scans left-to-right).
-            const int raw_row = (seq_work_id - 1) % work_per_chunk;
-            const int row_within_chunk = bwd ? raw_row : (work_per_chunk - 1 - raw_row);
+            const int row_within_chunk = work_per_chunk - 1 - (seq_work_id - 1) % work_per_chunk;
             auto info = hier::hier_map_chunk(logical_pos, my_pe, total_n_pes, gpus_per_node);
 
             target_rank = info.target_rank;  // Data owner (semaphore wait target)
             remote_pe = info.src_pe;         // PE to fetch from (Phase 1: = target_rank; Phase 2: = same-node rank)
             is_phase1 = info.is_phase1;
-            seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk, bwd);
+            seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk, false);
 
-            // mask_index: seqlen_id to copy_chunk_mask entry
-            // copy_chunk_mask computed from processed_mask (rearranged to match SR buffer layout)
-            // BWD: skip_local=true to mask starts at seqlen S_chunk; FWD: skip_local=false to at seqlen 0
-            mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + (seqlen_id - (bwd ? S_chunk : 0)) / row_per_block;
+            // mask_index: seqlen_id to copy_chunk_mask entry (mask laid out in SR buffer order from seqlen 0)
+            mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + seqlen_id / row_per_block;
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
-                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, bwd);
+                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, false);
             src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
-            // Original circular shift traversal
-            if constexpr (bwd) {        // bwd is forward traversal
-                seqlen_id = S_chunk + (seq_work_id - 1) * row_per_block;
-                remote_pe = my_pe + seqlen_id / S_chunk;
-                remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
-            } else {                    // fwd is reversed traversal
-                seqlen_id = seqlen_offset - seq_work_id * row_per_block;
-                int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
-                remote_pe = my_pe - cp_chunk_id;
-                remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes;
-            }
+            // Original circular shift traversal, reversed
+            seqlen_id = seqlen_offset - seq_work_id * row_per_block;
+            const int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
+            remote_pe = my_pe - cp_chunk_id;
+            remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes;
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
             src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * row_stride;
-            mask_index = bwd
-                ? ((batch_id / num_heads_per_batch) * chunk_per_batch + (seq_work_id - 1))
-                : (chunk_per_batch * (batch_id / num_heads_per_batch + 1) - seq_work_id);
+            mask_index = chunk_per_batch * (batch_id / num_heads_per_batch + 1) - seq_work_id;
         }
 
         bool should_skip = false;
@@ -373,12 +360,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     }
 }
 
-// remote get kernel (multi-stage remote_get overlapped gather), can only be called in the BWD when RS-overlap is ON.
-// Current BWD write_ptr wait logic: absolute offset (not relative offset), meaning that the bwd won't skip
-// the first chunk itself and make no assumption on the validity of the data. All it does now is to check whether
-// the local read ptr is exceeded by the write ptr and load KV can procede if true. Therefore, we can choose to
-// start the AG-overlap kernel (non-splitted version) just once at the beginning of the BWD kernel. We only need to
-// inform the bwd kernel one more thing: what is the current segment ID? For now, use the splitted version.
+// Backward remote get kernel: gathers one segment (num_chunks chunks) of the split AG.
+// The bwd compute kernel gates each KV tile on the per-work work_done flag.
 //
 // @param num_chunks  total chunks per segment (always the real count, e.g. 4 for CP16)
 // @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
@@ -488,7 +471,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     // Phase 1 per-batch congruence_notify (hierarchical only).
-    // Same logic as in non-splitted kernel — see comments there.
+    // Same logic as in the forward kernel — see comments there.
     auto try_congruence_notify = [&](int chunk_id, int target_rank_val, bool is_phase1_val, int batch_id) {
         if constexpr (use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {

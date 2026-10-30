@@ -65,10 +65,10 @@ size_t fm4_overlap_unique_id_size() noexcept {
 // kv_shared: K and V alias one tensor, so only K is transported.
 int fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
                      int rank, int nranks,
-                     const uint8_t* unique_id, int mask_head,
+                     const uint8_t* unique_id,
                      int kv_shared) noexcept {
     flashmask::comm::init_singleton_instance(
-        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, mask_head, kv_shared != 0);
+        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, kv_shared != 0);
     return 1;
 }
 
@@ -134,23 +134,24 @@ void fm4_overlap_update_kv(uint64_t k_ptr, uint64_t v_ptr, int fwd) noexcept {
 
 // Compute the per-chunk sparsity mask (copy_chunk_mask) so the AG kernel can skip
 // fully-masked chunks. MUST precede fm4_overlap_run_ag (the AG and RS kernels read
-// the mask; it is uninitialized otherwise). lt_start/ut_end
-// are device int32 (B, H_mask, S_total); lt_end/ut_start are null (non-causal).
+// the mask; it is uninitialized otherwise). mask is device int32 (B, H_mask, S_total, 2)
+// [lt_start, ut_end] pairs (non-causal), each pair contiguous and the base 16-byte
+// aligned; batch_stride / head_stride are its strides in int32 elements, multiples of 4.
 // Pass the compute stream so the write is ordered before the AG kernel picks it
 // up via the wait_sr_buffer_empty handshake.
-void fm4_overlap_compute_chunk_mask(uint64_t lt_start_ptr, uint64_t ut_end_ptr,
+void fm4_overlap_compute_chunk_mask(uint64_t mask_ptr, int num_heads,
+                                    int64_t batch_stride, int64_t head_stride,
                                     uint64_t stream, int fwd) noexcept {
     flashmask::comm::singleton().compute_chunk_mask(
-        reinterpret_cast<const int*>(static_cast<uintptr_t>(lt_start_ptr)),
-        nullptr, nullptr,
-        reinterpret_cast<const int*>(static_cast<uintptr_t>(ut_end_ptr)),
+        reinterpret_cast<const int*>(static_cast<uintptr_t>(mask_ptr)),
+        num_heads, batch_stride, head_stride,
         as_stream(stream), fwd != 0);
 }
 
-// Launch the all-gather remote-get kernel on the internal comm_stream. The forward
+// Launch the forward all-gather remote-get kernel on the internal comm_stream. The forward
 // gate spins on fm4_overlap_fwd_write_ptr.
-void fm4_overlap_run_ag(int fwd) noexcept {
-    flashmask::comm::singleton().run_overlap_ag_kernel(fwd != 0);
+void fm4_overlap_run_ag() noexcept {
+    flashmask::comm::singleton().run_overlap_ag_kernel();
 }
 
 // compute_stream notifies comm_stream that the local SRBuffer chunk may be reused.
@@ -158,8 +159,9 @@ void fm4_overlap_wait_sr_buffer_empty(uint64_t compute_stream) noexcept {
     flashmask::comm::singleton().wait_sr_buffer_empty(as_stream(compute_stream));
 }
 
-void fm4_overlap_prepare_dkv_buffer() noexcept {
-    flashmask::comm::singleton().prepare_dkv_buffer();
+// Total bytes of the registered symmetric windows (for memory accounting).
+uint64_t fm4_overlap_symmetric_buffer_bytes() noexcept {
+    return flashmask::comm::singleton().symmetric_buffer_bytes();
 }
 
 void fm4_overlap_start_bwd_segment(int segment_idx, uint64_t compute_stream) noexcept {

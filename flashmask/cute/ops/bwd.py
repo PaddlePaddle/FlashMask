@@ -190,9 +190,7 @@ def _flash_attn_bwd(
         assert not causal, "overlap bwd does not support causal yet"
         if isinstance(flashmask_info, FlashMaskInfoPaddle):
             flashmask_info = flashmask_info.startend_row_indices
-        overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=flashmask_info.shape[1], kv_shared=kv_shared
-        )
+        overlap_runtime.ensure_initialized(k, v, group, kv_shared=kv_shared)
         # Permute before the block max/min below: the chunk-skip mask and the kernel
         # both index the gathered K/V in this rank's SRBuffer order.
         flashmask_info = overlap_runtime.sr_order_mask(flashmask_info, fwd=False)
@@ -519,6 +517,11 @@ def _flash_attn_bwd(
         overlap_d = cutlass.Int32(_od)
         overlap_segment_idx = cutlass.Int32(0)
         overlap_comm_rpb = overlap_ag_args.comm_rpb
+        # The bwd gate waits only on the work item holding a cluster tile's last row.
+        assert overlap_comm_rpb % (cluster_size * n_block_size) == 0, (
+            f"comm_rpb {overlap_comm_rpb} must be a multiple of cluster_size * n_block_size "
+            f"({cluster_size} * {n_block_size})"
+        )
         overlap_dk_send_addr, overlap_dv_send_addr = overlap_ag_args.dkv_send_addrs(0)
         overlap_dk_addr = (
             None if need_kv_accum else cutlass.Int64(overlap_dk_send_addr)

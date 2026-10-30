@@ -90,6 +90,8 @@ void barrier(Context& context);
 // `drain_signal` is a VA-signal word reserved for this call and `drained` its current
 // cumulative count; returns the new count.
 uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained);
+// Sum of the requested sizes of every registered window.
+size_t window_bytes(const Context& context);
 
 #if defined(FLASHMASK_GIN_DEVICE_API)
 

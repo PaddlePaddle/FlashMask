@@ -17,16 +17,13 @@ struct OverlapConfig {
     int B = 0;
     int S_local = 0;       // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
     int H = 0;
-    int H_mask = 0;
     int D = 0;
     int nranks = 0;        // communicator size; changes require a rebuild
-    bool overlap_rs = false;
     bool use_bhsd = false;     // SR buffer uses (B,H,S,D); derived from D (<= 256) per config
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
-            && H_mask == other.H_mask && D == other.D && nranks == other.nranks
-            && overlap_rs == other.overlap_rs && use_bhsd == other.use_bhsd;
+            && D == other.D && nranks == other.nranks && use_bhsd == other.use_bhsd;
     }
     bool operator!=(const OverlapConfig& other) const { return !(*this == other); }
 
@@ -42,9 +39,8 @@ struct OverlapConfig {
 
     std::string to_string() const {
         return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
-            + ", H=" + std::to_string(H) + ", H_mask=" + std::to_string(H_mask)
+            + ", H=" + std::to_string(H)
             + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
-            + ", overlap_rs=" + std::to_string(int(overlap_rs))
             + ", use_bhsd=" + std::to_string(int(use_bhsd));
     }
 };
@@ -58,10 +54,10 @@ struct OverlapConfig {
  * the main attention kernel, make sure the lifetime of the instance outlast the main kernel
  * Then you should be able to get async remote get, costing only 4 SMs.
  *
- * Dynamic reconfiguration: when B/H/D/mask_head/S_local change between calls,
+ * Dynamic reconfiguration: when B/H/D/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
  * S_local is dispatched at compile time: supported values are {4096, 8192, 16384, 32768, 65536, 131072}.
- * RS-overlap is automatically enabled when H_k >= rs_overlap_min_h_k and nranks > 1.
+ * Backward always runs the split AG plus the dK/dV RS overlap (nranks > 1).
 */
 template <typename KVType>
 class OverlapCommunicator {
@@ -78,8 +74,6 @@ public:
         int rank,
         int nranks,
         const uint8_t* unique_id_ptr,
-        int mask_head = 0,
-        bool overlap_rs = false,
         bool kv_shared = false
     );
 
@@ -93,14 +87,14 @@ public:
     */
     bool reconfigure_if_needed(
         int new_b, int new_s_local, int new_h, int new_d,
-        int nranks, int new_mask_head, bool new_overlap_rs, bool kv_shared
+        int nranks, bool kv_shared
     );
 
-    // Launch the forward (fwd=true) or non-split AG kernel on comm_stream; gathers
-    // S_local * nranks rows. Forward progress is published through fwd_write_ptr.
-    void run_overlap_ag_kernel(const bool fwd = true);
+    // Launch the forward AG kernel on comm_stream; gathers S_local * nranks rows.
+    // Forward progress is published through fwd_write_ptr.
+    void run_overlap_ag_kernel();
 
-    // only used when use_rs_overlap and in the bwd
+    // Launch the backward AG kernel of one segment on comm_stream.
     void run_overlap_splitted_ag_kernel(int segment_idx);
 
     void run_overlap_rs_kernel(
@@ -132,7 +126,6 @@ public:
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
-    // DO NOT call the following methods, if overlap_rs = false
     void* dk_send(int seg_idx) const { return dkv_buffer->k_send(seg_idx); }
     void* dv_send(int seg_idx) const { return _kv_shared ? nullptr : dkv_buffer->v_send(seg_idx); }
 
@@ -145,9 +138,9 @@ public:
         const bool fwd = true
     );
 
-    // A send slot is read by its put kernel on p_stream and reused across passes, so
-    // comp_stream must not run the dK/dV epilogue into it before release_buffer's event.
-    // On the first pass the events are unrecorded, which makes cudaStreamWaitEvent a no-op.
+    // A send slot (ring of min(ns, 2)) is read by its put kernel on p_stream and reused by
+    // segment s + 2 and across passes, so comp_stream must not run the dK/dV epilogue into
+    // it before release_buffer's event. Unrecorded events make cudaStreamWaitEvent a no-op.
     void wait_dkv_buffer(int segment_idx, cudaStream_t stream) const {
         dkv_buffer->wait_buffer(segment_idx, stream);
     }
@@ -157,11 +150,13 @@ public:
         cudaStreamWaitEvent(stream, reduce_done);
     }
 
+    // mask: int32 (B, num_heads, S_total, 2) pairs [lt_start, ut_end], each pair contiguous
+    // and 16-byte aligned; batch_stride / head_stride in int32 elements, multiples of 4.
     void compute_chunk_mask(
-        const int* const lt_start_ptr,
-        const int* const lt_end_ptr,
-        const int* const ut_start_ptr,
-        const int* const ut_end_ptr,
+        const int* const mask,
+        const int num_heads,
+        const int64_t batch_stride,
+        const int64_t head_stride,
         cudaStream_t stream,
         const bool fwd = true
     );
@@ -225,7 +220,9 @@ public:
     int num_segments() const;
     // for RS overlap, returns number of chunks per segment
     int chunk_per_seg() const;
-    void prepare_dkv_buffer();
+
+    // Bytes of every registered symmetric window (data, dK/dV and signal windows).
+    size_t symmetric_buffer_bytes() const { return gin::window_bytes(*gin_context_); }
 
     // ── Cross-stream synchronization events ──────────────────────────────
     //
@@ -234,17 +231,17 @@ public:
     //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
     //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
     //  ag_done        comm_stream → comp_stream        AG kernel finished; it no longer reads copy_chunk_mask nor writes block_cnt_semaphore / fwd_write_ptr
-    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready          (RS-overlap only)
-    //  local_moved    put_streams[0] → aux_c_stream    Segment-0 local dKV memcpy d2d completed       (RS-overlap only)
+    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready
+    //  local_moved    put_streams[0] → aux_c_stream    Segment-0 local dKV memcpy d2d completed
     //
     cudaEvent_t wptr_init;
     cudaEvent_t sr_usable;
     cudaEvent_t ag_done;
-    cudaEvent_t reduce_done;    // RS-overlap only
-    cudaEvent_t local_moved;    // RS-overlap only
+    cudaEvent_t reduce_done;
+    cudaEvent_t local_moved;
     /**
-     * If overlap_rs is set, dkv_buffer will be populated.
-     * and since the fwd AG buffer is always bigger than bwd AG
+     * dK/dV send/recv slots of the backward RS overlap; always allocated (nranks > 1).
+     * Since the fwd AG buffer is always bigger than bwd AG
      * (due to the fact that bwd AG is splitted), fwd kv_buffer
      * can be reused (carefully).
     */
@@ -282,12 +279,16 @@ private:
     // BHSD folds heads into the batch dimension: every (b,h) pair is an independent batch.
     inline int num_effective_batch() const { return _config.use_bhsd ? B * H : B; }
 
-    // Helper to (re)allocate block_work_ids and derived pointers
-    void reallocate_block_work_ids();
-    // Helper to create or recreate the dkv_buffer for RS-overlap
-    void setup_dkv_buffer(bool need_rs);
+    // Grow-only block_work_ids sizing; the capacities fix the offsets, so they move only
+    // on growth, which device-syncs first.
+    void size_block_work_ids();
+    // Create or recreate the dkv_buffer (and its per-segment streams) for the current shape
+    void setup_dkv_buffer();
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
+    // Zero recv(segment_idx) and tell its producers it is empty, on aux_c_stream.
+    void recycle_recv_slot(int segment_idx);
+    void notify_recv_empty(int segment_idx);
 
 private:
     // Allocated once, before the data windows; never reallocated (world size is fixed).
@@ -300,7 +301,6 @@ private:
     int B;
     int S_local;            // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
     int H;
-    int H_mask;             // mask head
     int D;
     int num_chunks;
 
@@ -319,7 +319,8 @@ private:
     bool _kv_alloc_v = true;
     int kv_components() const { return _kv_alloc_v ? 2 : 1; }
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
-    int _sema_count;        // allocated int64 semaphore slots
+    int _sema_count;        // int64 semaphore slots of the current layout
+    int _sema_capacity;     // allocated int64 semaphore slots (grow-only)
 
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;
@@ -327,26 +328,17 @@ private:
     size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
     int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
 
-    // RS-overlap: fp32 scratch holding the cross-segment dK/dV sum (dK half | dV half),
-    // so the only bf16 rounding is the last segment's store into dk_ptr / dv_ptr.
-    // Allocated lazily (grow-only) in prepare_dkv_buffer, and only when num_segments > 1.
-    float* dkv_f32_accum;
-    size_t _dkv_f32_numel;                  // allocated float count of dkv_f32_accum (0 when unallocated)
-
-    // dV half of the scratch; null when K/V are shared, which drops the dV half entirely.
-    float* dkv_f32_dv() const {
-        return _kv_shared ? nullptr : dkv_f32_accum + _dkv_f32_numel / 2;
-    }
-
-    int _num_copy_chunks;                   // block_work_ids array size tracking
-    int _bitmap_region_size;                // bitmap region size (work_done + frontier)
+    int _bitmap_region_size;                // bitmap entries the current shape uses (work_done + frontier)
+    int _bwi_head_capacity = 0;             // allocated head region (>= num_blocks and the bitmap)
+    int _bwi_copy_capacity = 0;             // allocated copy_chunk_mask entries
+    int _bwi_batch_capacity = 0;            // allocated effective batches of rank_empty_counters
 
     // ── Compound device allocation (single cudaMalloc) ───────────────────
     //
     //  Offset (int elements)                       Field
     //  ──────────────────────────────────────────   ──────────────────────────────
     //  [0 .. head_region)                          block_work_ids  (fwd: per-CTA work ids, bwd: work_done bitmap)
-    //  [head_region .. +N)                         copy_chunk_mask  (N = _num_copy_chunks)
+    //  [head_region .. +N)                         copy_chunk_mask  (N = _bwi_copy_capacity)
     //  [+N .. +N+4)                                block_cnt_semaphore, fwd_write_ptr, stream_coordinator, pad
     //  [+N+4 .. +N+4+nranks)                       rank_commit_counters
     //  [.. + effective_batch * nranks)             rank_empty_counters
@@ -383,7 +375,6 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int rank,
     int nranks,
     const uint8_t* unique_id_ptr,
-    int mask_head = 1,
     bool kv_shared = false
 );
 

@@ -240,9 +240,9 @@ def _flash_attn_fwd(
         )
         assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
         # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
-        # the comm-side compute_chunk_mask requires a non-null ut_end; FM-3 overlap
+        # the comm-side compute_chunk_mask reads col1 as ut_end; FM-3 overlap
         # forbids causal for the same reason. Guarding here keeps the col mapping in
-        # _sparse_chunk_mask_cols exact.
+        # _chunk_mask_pairs exact.
         assert not causal, "overlap mode does not support causal yet"
         # One storage for K and V makes the gathered V region a bit-for-bit copy of the
         # gathered K region, so the comm layer transports K only and hands out the K region
@@ -254,10 +254,7 @@ def _flash_attn_fwd(
             and tuple(be.strides(k)) == tuple(be.strides(v))
             and _same_storage(k, v)
         )
-        overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1],
-            kv_shared=overlap_kv_shared,
-        )
+        overlap_runtime.ensure_initialized(k, v, group, kv_shared=overlap_kv_shared)
         # Callers pass the mask in group-rank KV-chunk order; the chunk-skip mask and the
         # kernel both index the gathered K/V in this rank's SRBuffer order.
         startend_row_indices = overlap_runtime.sr_order_mask(startend_row_indices, fwd=True)

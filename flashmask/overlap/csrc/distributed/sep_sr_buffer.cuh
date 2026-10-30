@@ -14,7 +14,14 @@
 
 namespace flashmask {
 
-// RAII object of separate send/recv buffer: one send/recv slot per backward segment.
+// RAII object of separate send/recv buffers. Window layout, each slot _buf_offset elements
+// ([dK nc chunks][dV nc chunks], dV absent when K/V are shared):
+//   [send 0 .. K_s-1][recv 0 .. ns-1][semaphores ns x semaphore_size]
+// Send is a ring of K_s = min(ns, 2) slots: segment s writes send(s % K_s), and the slot's
+// event, recorded after the reads of segment s, gates the compute writes of segment s + K_s.
+// Each read of a slot follows (via done_event) a compute write that waited on the slot's
+// previous record, so the latest record covers every earlier read of that slot.
+// Recv, semaphores and signals stay per segment: peers address them by segment index.
 template <typename KVType>
 class SepSRBuffer {
 using SemaphoreType = int64_t;
@@ -26,12 +33,13 @@ private:
     SemaphoreType* _semaphores;
     bool _allocated;
 
-    // offset to the recv buffer (2 * chunks_per_seg * k_numel)
-    size_t _buf_offset;
+    size_t _buf_offset;     // slot size: kv_components * chunks_per_seg * single_k_numel
     int _semaphore_size;
 
+    const int _chunks_per_seg;
     const int _num_segments;
-    std::vector<cudaEvent_t> _empty_states; 
+    const int _num_send_slots;
+    std::vector<cudaEvent_t> _empty_states;     // one per send slot
 
     // this object cannot be moved or copied
     SepSRBuffer(const SepSRBuffer&) = delete;
@@ -39,9 +47,13 @@ private:
     SepSRBuffer& operator=(const SepSRBuffer&) = delete;
     SepSRBuffer& operator=(SepSRBuffer&&) = delete;
 
-    inline int slot(int seg_idx) const {
+    inline size_t send_slot(int seg_idx) const {
         assert(seg_idx >= 0 && seg_idx < _num_segments);
-        return seg_idx;
+        return seg_idx % _num_send_slots;
+    }
+    inline size_t recv_slot(int seg_idx) const {
+        assert(seg_idx >= 0 && seg_idx < _num_segments);
+        return _num_send_slots + seg_idx;
     }
 public:
     explicit SepSRBuffer(
@@ -62,27 +74,35 @@ public:
 
     ~SepSRBuffer() noexcept;
 
-    // [K_send, V_send] --> buf_offset size, therefore 2 * buf_offset is the double buffer offset
-    // (shared K/V drops the V halves, so buf_offset is then just the dK slab)
-    inline KVType* k_send(int seg_idx) const { return _dk_data + slot(seg_idx) * 2 * _buf_offset; }
-    inline KVType* v_send(int seg_idx) const { return _dv_data + slot(seg_idx) * 2 * _buf_offset; }
-    inline KVType* k_recv(int seg_idx) const { return _dk_data + (slot(seg_idx) * 2 + 1) * _buf_offset; }
-    inline KVType* v_recv(int seg_idx) const { return _dv_data + (slot(seg_idx) * 2 + 1) * _buf_offset; }
-    inline SemaphoreType* semaphores(int seg_idx) const { return _semaphores + slot(seg_idx) * _semaphore_size; }
+    inline KVType* k_send(int seg_idx) const { return _dk_data + send_slot(seg_idx) * _buf_offset; }
+    inline KVType* v_send(int seg_idx) const { return _dv_data + send_slot(seg_idx) * _buf_offset; }
+    inline KVType* k_recv(int seg_idx) const { return _dk_data + recv_slot(seg_idx) * _buf_offset; }
+    inline KVType* v_recv(int seg_idx) const { return _dv_data + recv_slot(seg_idx) * _buf_offset; }
+    inline SemaphoreType* semaphores(int seg_idx) const {
+        assert(seg_idx >= 0 && seg_idx < _num_segments);
+        return _semaphores + seg_idx * _semaphore_size;
+    }
 
     // Zero every recv slot; the sparse RS puts leave holes the reduce would otherwise read.
     void initialize_buffer(int self_rank);
 
+    // Orders `stream` after every read of send(seg)'s slot issued so far.
     void wait_buffer(int seg_idx, cudaStream_t stream) {
-        cudaStreamWaitEvent(stream, _empty_states[slot(seg_idx)]);
+        cudaStreamWaitEvent(stream, _empty_states[send_slot(seg_idx)]);
+    }
+
+    // Orders `stream` after every read of every send slot issued so far.
+    void wait_all_send_slots(cudaStream_t stream) {
+        for (cudaEvent_t event : _empty_states) cudaStreamWaitEvent(stream, event);
     }
 
     void release_buffer(int seg_idx, cudaStream_t stream) {
-        cudaEventRecord(_empty_states[slot(seg_idx)], stream);
+        cudaEventRecord(_empty_states[send_slot(seg_idx)], stream);
     }
 
-    // clear recv buffer (so that reduce won't op on dirty data)
-    void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
+    // Re-zero the extent of recv(seg) one pass used: single_k_numel elements per chunk of
+    // dK, and of dV when with_v. The rest of the slot is never written, so stays zero.
+    void zero_recv_buf(int seg_idx, size_t single_k_numel, bool with_v, cudaStream_t comm_stream);
 };
 
 }   // namespace flashmask

@@ -253,6 +253,11 @@ public:
     int num_lsa_ranks() const { return num_lsa_ranks_; }
     int lsa_rank() const { return lsa_rank_; }
     bool use_rail() const { return use_rail_; }
+    size_t window_bytes() const {
+        size_t total = 0;
+        for (const HostRegion& region : regions_) total += region.bytes;
+        return total;
+    }
 
     void destroy() noexcept {
         if (comm_ == nullptr) {
@@ -360,5 +365,6 @@ void barrier(Context& context) { context.barrier(); }
 uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained) {
     return context.quiesce(drain_signal, drained);
 }
+size_t window_bytes(const Context& context) { return context.window_bytes(); }
 
 }  // namespace flashmask::gin
