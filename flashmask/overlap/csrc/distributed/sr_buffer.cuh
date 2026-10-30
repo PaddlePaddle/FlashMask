@@ -15,6 +15,61 @@ namespace flashmask {
 
 using SemaphoreType = int64_t;
 
+// Communicator-owned VA-signal words, in one signal window (gin::WindowKind::Signal):
+//   ag_refcnt[N]  index = data owner X. On X: consumers of X's KV chunk. On the relay
+//                 holder H (hierarchical): H's same-node readers of X's relayed chunk.
+//   rs_full[N]    index = RS segment; on the consumer, one add per producer.
+//   drain         gin::quiesce only.
+// Producers only ever add 1; nothing resets a word after the constructor's zeroing,
+// which the first team barrier orders before any traffic. Each waiter compares
+// against an expected counter in plain device memory, bumped in-stream by the kernel
+// that issues the matching notifications, so replays of a captured graph stay exact.
+// World size is fixed per communicator, so this is allocated once and never resized;
+// adds still in flight across a reconfigure land in a live window.
+class SignalBuffer {
+private:
+    gin::Context& _context;
+    const int _nranks;
+    uint64_t* _signals = nullptr;    // window: [ag_refcnt N][rs_full N][drain]
+    uint64_t* _expected = nullptr;   // device: [ag_issued N][rs_expected N]
+    uint64_t _drained = 0;           // host: cumulative count of the drain word
+
+    SignalBuffer(const SignalBuffer&) = delete;
+    SignalBuffer& operator=(const SignalBuffer&) = delete;
+    SignalBuffer(SignalBuffer&&) = delete;
+    SignalBuffer& operator=(SignalBuffer&&) = delete;
+
+public:
+    SignalBuffer(gin::Context& context, int nranks) : _context(context), _nranks(nranks) {
+        const size_t signal_bytes = (2 * static_cast<size_t>(nranks) + 1) * sizeof(uint64_t);
+        const size_t expected_bytes = 2 * static_cast<size_t>(nranks) * sizeof(uint64_t);
+        _signals = static_cast<uint64_t*>(
+            gin::alloc(_context, signal_bytes, gin::WindowKind::Signal));
+        cudaError_t result = cudaMalloc(&_expected, expected_bytes);
+        if (result == cudaSuccess) result = cudaMemset(_signals, 0, signal_bytes);
+        if (result == cudaSuccess) result = cudaMemset(_expected, 0, expected_bytes);
+        if (result != cudaSuccess) {
+            cudaFree(_expected);
+            gin::free_noexcept(_context, _signals);
+            throw std::runtime_error(
+                std::string("SignalBuffer: allocation failed: ") + cudaGetErrorString(result));
+        }
+    }
+
+    ~SignalBuffer() noexcept {
+        gin::free_noexcept(_context, _signals);
+        cudaFree(_expected);
+    }
+
+    uint64_t* ag_refcnt() const noexcept { return _signals; }
+    uint64_t* rs_full(int seg) const noexcept { return _signals + _nranks + seg; }
+    uint64_t* ag_issued() const noexcept { return _expected; }
+    uint64_t* rs_expected(int seg) const noexcept { return _expected + _nranks + seg; }
+
+    // Collective: settles all GIN traffic issued so far (see gin::quiesce).
+    void quiesce() { _drained = gin::quiesce(_context, _signals + 2 * _nranks, _drained); }
+};
+
 template <typename KVType>
 class SRBuffer {
 private:

@@ -60,17 +60,26 @@ def _overlap_gate(
     ``write_ptr`` is a per-batch ROW index advanced by atomicMax on the comm side; the
     reverse-row math mirrors the comm kernel's reversed traversal (seqlen_offset =
     s_total - s_local). A negative ``reverse_row`` means the tile is in the local chunk
-    (last ``kv_chunk_size`` rows of SRBuffer), which is never remote-fetched, so no wait.
-    Only ``tidx == 0`` spins, the same one-thread convention as the bwd dQ/dKV semaphores.
+    (last ``kv_chunk_size`` rows of SRBuffer), which is never remote-fetched, so no wait
+    and no fence: comm_stream writes it before the AG kernel, and that reaches this
+    kernel through the stream-coordinator release/acquire plus the kernel boundary, which
+    is proxy-preserving (PTX ISA 8.9.4).
+    Only ``tidx == 0`` spins. Every lane of the (single) load warp must call this, with
+    warp-uniform arguments: after the warp sync every lane, including the ``elect.sync``
+    lane that issues the K/V TMA loads, runs the generic -> async proxy fence itself.
 
     At module scope (not a nested closure) so its ``__closure__`` is empty and the DSL
     ``closure_check`` accepts it inside dynamic control flow.
     """
-    if tidx == 0:
-        reverse_row = s_total - nblk * n_block_size - kv_chunk_size
-        if reverse_row >= 0:
+    reverse_row = s_total - nblk * n_block_size - kv_chunk_size
+    if reverse_row >= 0:
+        if tidx == 0:
             target = batch_idx * (s_total - kv_chunk_size) + reverse_row
             wait_write_ptr_ge(write_ptr, 0, Int32(target))
+        # Carries lane 0's acquire to every lane of the load warp.
+        cute.arch.sync_warp()
+        # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
+        cute.arch.fence_proxy("async.global")
 
 
 class NamedBarrierFwd(enum.IntEnum):
@@ -2411,6 +2420,8 @@ class FlashAttentionForwardSm100:
             # FM-4 overlap gate: bound via partial (NOT a nested closure) so it has no
             # __closure__ and passes the DSL closure_check inside the dynamic load loop.
             if const_expr(self.enable_overlap):
+                # The gate's warp sync orders the TMA issuer only within one load warp.
+                assert len(self.load_warp_ids) == 1
                 gate_batch_idx = batch_idx
                 if const_expr(self.overlap_bhsd_layout):
                     gate_batch_idx = (

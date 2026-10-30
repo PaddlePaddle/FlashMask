@@ -125,6 +125,8 @@ The implementation lives in [`flashmask/overlap`](flashmask/overlap/). It commun
 
 Overlap is enabled by passing a CP `group` (world size > 1) to `flashmask_attention`. Key/value are then the local `S_local` shard, and the mask key axis has length `S_local * group_size` in group-rank chunk order. The library converts it to its internal order, so callers must not pre-roll it. Hierarchical (multi-node) communication is selected automatically when the group spans more than one node.
 
+`FLASHMASK_SPIN_TIMEOUT_S` (default `1800`, `0` disables) bounds how long an Overlap communication kernel waits for a peer before it prints a diagnostic and traps, like NCCL's collective timeout.
+
 <details>
 <summary>Using Overlap on SM90 (Hopper)</summary>
 

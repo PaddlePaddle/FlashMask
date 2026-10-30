@@ -111,7 +111,8 @@ public:
     );
 
     void wait_wptr_init();
-    void barrier() { gin::barrier(*gin_context_); }
+    // Collective; call before freeing or rezeroing any window (see gin::quiesce).
+    void quiesce() { sig_buffer->quiesce(); }
 
     void* k_data() const { return kv_buffer->k_data(); }
     // Shared K/V leaves the V region ungathered, so consumers must read K instead.
@@ -269,10 +270,11 @@ private:
         return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
 
-    // Semaphore accessors for hierarchical dual-array protocol:
+    // Semaphore accessors for hierarchical dual-array protocol (putValue / LSA flags only;
+    // the refcounts are VA signals in sig_buffer):
     //   sema_inter [0..num_nodes-1]: cross-node data-ready flags (0/1)
-    //   sema_intra [total_n_pes ranks x batch_ready_words(B*H) words]: word 0 is the refcount,
-    //     all words carry the per-batch intra-node consumption signals
+    //   sema_intra [total_n_pes ranks x batch_ready_words(B*H) words]: per-batch intra-node
+    //     readiness bits
     // Non-hierarchical: sema_inter_size=0, sema_intra() == semaphores()
     inline int64_t* sema_inter() const { return kv_buffer->semaphores(); }
     inline int64_t* sema_intra() const { return kv_buffer->semaphores() + _sema_inter_size; }
@@ -288,6 +290,8 @@ private:
     void prime_rs_semaphores();
 
 private:
+    // Allocated once, before the data windows; never reallocated (world size is fixed).
+    std::unique_ptr<SignalBuffer> sig_buffer;
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
     cudaStream_t aux_c_stream;      // RS-overlap: consumer (reduce) stream

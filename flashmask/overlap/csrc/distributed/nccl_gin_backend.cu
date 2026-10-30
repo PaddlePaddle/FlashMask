@@ -6,7 +6,9 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -48,6 +50,47 @@ struct HostRegion {
     ncclWindow_t window = nullptr;
 };
 
+// FLASHMASK_SPIN_TIMEOUT_S: device spin budget in whole seconds, 0 disables the
+// time-based trap. The default matches Paddle's collective timeout.
+unsigned long long spin_timeout_ns_from_env() {
+    constexpr unsigned long long kDefaultSeconds = 1800;
+    constexpr unsigned long long kNsPerSecond = 1000ull * 1000ull * 1000ull;
+    const char* text = std::getenv("FLASHMASK_SPIN_TIMEOUT_S");
+    if (text == nullptr || *text == '\0') {
+        return kDefaultSeconds * kNsPerSecond;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long seconds = std::strtoull(text, &end, 10);
+    if (*text == '-' || *end != '\0' || errno != 0 || seconds > ~0ull / kNsPerSecond) {
+        throw std::invalid_argument(
+            std::string("FLASHMASK_SPIN_TIMEOUT_S must be a non-negative integer number of "
+                        "seconds, got: ") + text);
+    }
+    return seconds * kNsPerSecond;
+}
+
+// Each block drives one GIN context, each thread one peer. A strong signal is visible
+// only after every earlier put on its context to that peer has settled, so once a
+// rank has counted one from every (context, peer) pair, nothing issued to it before
+// the drain can still land.
+__global__ void DrainSendKernel(uint64_t* drain_signal) {
+    if (static_cast<int>(threadIdx.x) == g_device_state.world_rank) {
+        return;
+    }
+    const auto& region = find_region(drain_signal);
+    ncclGin(g_device_state.dev_comm, static_cast<int>(blockIdx.x), NCCL_GIN_RESOURCE_SHARING_GPU)
+        .signal(network_team(), team_peer(static_cast<int>(threadIdx.x)),
+                ncclGin_StrongVASignalAdd{region.window, region_offset(region, drain_signal), 1},
+                ncclCoopThread(), ncclGin_None(),
+                cuda::thread_scope_thread, cuda::thread_scope_device,
+                ncclGinOptFlagsDefault);
+}
+
+__global__ void DrainWaitKernel(const uint64_t* drain_signal, uint64_t want) {
+    signal_wait_exact(drain_signal, want, "drain");
+}
+
 }  // namespace
 
 class Context {
@@ -63,6 +106,7 @@ public:
         rank_ = rank;
         nranks_ = nranks;
         regions_.reserve(kMaxRegions);
+        spin_timeout_ns_ = spin_timeout_ns_from_env();
 
         int runtime_version = 0;
         FM_NCCL_CHECK(ncclGetVersion(&runtime_version));
@@ -119,7 +163,7 @@ public:
         publish_device_state();
     }
 
-    void* allocate(size_t bytes) {
+    void* allocate(size_t bytes, WindowKind kind) {
         if (bytes == 0 || regions_.size() >= kMaxRegions) {
             throw std::invalid_argument("Invalid FlashMask NCCL symmetric allocation");
         }
@@ -128,8 +172,12 @@ public:
         region.bytes = bytes;
         FM_NCCL_CHECK(ncclMemAlloc(&region.raw_ptr, bytes));
 
+        // STRICT_ORDERING only orders NIC (IB Verbs) traffic; single node has no GIN and
+        // reaches signals with LSA atomics only.
+        const bool strict = kind == WindowKind::Signal && nranks_ > num_lsa_ranks_;
         const ncclResult_t register_result = ncclCommWindowRegister(
-            comm_, region.raw_ptr, bytes, &region.window, NCCL_WIN_DEFAULT);
+            comm_, region.raw_ptr, bytes, &region.window,
+            strict ? NCCL_WIN_STRICT_ORDERING : NCCL_WIN_DEFAULT);
         if (register_result != ncclSuccess) {
             ncclMemFree(region.raw_ptr);
             throw std::runtime_error(
@@ -182,6 +230,22 @@ public:
     void barrier() {
         barrier_on_stream(nullptr);
         FM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+
+    // Single node has no GIN contexts: every remote access was an LSA load/store or
+    // atomic of a kernel that has completed, so synchronizing the device suffices.
+    uint64_t quiesce(uint64_t* drain_signal, uint64_t drained) {
+        FM_CUDA_CHECK(cudaDeviceSynchronize());
+        if (num_qps_ > 0) {
+            DrainSendKernel<<<num_qps_, nranks_>>>(drain_signal);
+            FM_CUDA_CHECK(cudaGetLastError());
+            drained += static_cast<uint64_t>(num_qps_) * static_cast<uint64_t>(nranks_ - 1);
+            DrainWaitKernel<<<1, 1>>>(drain_signal, drained);
+            FM_CUDA_CHECK(cudaGetLastError());
+            FM_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        barrier();
+        return drained;
     }
 
     int rank() const { return rank_; }
@@ -240,6 +304,7 @@ private:
         state.rail_rank = rail_rank_;
         state.num_qps = num_qps_;
         state.use_rail = use_rail_;
+        state.spin_timeout_ns = spin_timeout_ns_;
         for (int i = 0; i < state.num_regions; ++i) {
             state.regions[i] = {
                 reinterpret_cast<uintptr_t>(regions_[i].mapped_ptr),
@@ -261,18 +326,9 @@ private:
     int rail_rank_ = 0;
     int num_qps_ = 0;
     bool use_rail_ = false;
+    unsigned long long spin_timeout_ns_ = 0;
     std::vector<HostRegion> regions_;
 };
-
-namespace {
-
-__global__ void WaitUntilKernel(int64_t* ptr, Compare compare, int64_t value) {
-    if (threadIdx.x == 0) {
-        wait_until(ptr, compare, value);
-    }
-}
-
-}  // namespace
 
 std::vector<uint8_t> get_unique_id() {
     ncclUniqueId id;
@@ -297,15 +353,12 @@ int nranks(const Context& context) { return context.nranks(); }
 int num_lsa_ranks(const Context& context) { return context.num_lsa_ranks(); }
 int lsa_rank(const Context& context) { return context.lsa_rank(); }
 bool use_rail(const Context& context) { return context.use_rail(); }
-void* alloc(Context& context, size_t bytes) { return context.allocate(bytes); }
+void* alloc(Context& context, size_t bytes, WindowKind kind) { return context.allocate(bytes, kind); }
 void free(Context& context, void* ptr) { context.release(ptr); }
 void free_noexcept(Context& context, void* ptr) noexcept { context.release_noexcept(ptr); }
 void barrier(Context& context) { context.barrier(); }
-
-void wait_until_on_stream(
-    int64_t* ptr, Compare compare, int64_t value, cudaStream_t stream) {
-    WaitUntilKernel<<<1, 1, 0, stream>>>(ptr, compare, value);
-    FM_CUDA_CHECK(cudaGetLastError());
+uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained) {
+    return context.quiesce(drain_signal, drained);
 }
 
 }  // namespace flashmask::gin

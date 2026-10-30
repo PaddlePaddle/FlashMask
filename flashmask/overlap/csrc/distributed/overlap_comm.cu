@@ -23,6 +23,8 @@ static constexpr int RDMA_ROW_PER_WARP = 32;
 // allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
 static constexpr int num_warps = 16;    // making the grid larger is generally better
 static constexpr int num_blocks = 32;   // 32 reg, 256 thread, one SM of H800 can hold 8 blocks, we use 4 SM
+static_assert(num_blocks == 32,
+    "fwd frontier publish: lane j of every AG CTA reads block_work_idx[j], one slot per CTA");
 
 // RS-overlap is enabled when H_k >= rs_overlap_min_h_k and nranks > 1.
 static constexpr int rs_overlap_min_h_k = 1;
@@ -124,6 +126,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         _use_hierarchical, _num_nodes, _total_n_pes, num_effective_batch());
     _sema_inter_size = _use_hierarchical ? _num_nodes : 0;
 
+    sig_buffer = std::make_unique<SignalBuffer>(*gin_context_, _total_n_pes);
     kv_buffer = std::make_unique<SRBuffer<KVType>>(
         *gin_context_, _total_numel, _sema_count, kv_components());
     const int num_copy_chunks = b_kv * s_kv * nranks / (RDMA_ROW_PER_WARP * num_warps);
@@ -229,6 +232,7 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
         dkv_buffer.reset();
     }
     kv_buffer.reset();
+    sig_buffer.reset();
     WARN_PRINT("[FlashMask Overlap] Finalizing NCCL GIN...\n");
     gin_context_.reset();
 }
@@ -238,17 +242,20 @@ void OverlapCommunicator<KVType>::wait_wptr_init() {
     cudaStreamWaitEvent(comm_stream, wptr_init);
 }
 
-// Every comm CTA sets bit blockIdx.x; spins until all num_blocks bits are set.
+// Every comm CTA release-ORs bit blockIdx.x at kernel start; spins until all num_blocks
+// bits are set. The acquire makes comm_stream work ordered before the AG kernel (local
+// chunk copy/transpose, work_done memset, InitBitmapForLocalSkip) visible to the
+// compute kernel launched after this one; no event carries that edge.
 __global__ void WaitAndResetStreamCoordKernel(
     int* const stream_coordinator,
     const unsigned full_mask
 ) {
-    do {
-        int old_wptr_val = 0;
-        asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(old_wptr_val) : "l"(stream_coordinator));
-        if (static_cast<unsigned>(old_wptr_val) == full_mask) break;
+    cuda::atomic_ref<int, cuda::thread_scope_device> coordinator(*stream_coordinator);
+    gin::SpinWatchdog watchdog;
+    for (int seen; static_cast<unsigned>(seen = coordinator.load(cuda::memory_order_acquire)) != full_mask;) {
         __nanosleep(10);
-    } while (true);
+        watchdog.tick("stream_coordinator", stream_coordinator, full_mask, static_cast<unsigned>(seen));
+    }
     *stream_coordinator = 0;
     __threadfence();
 }
@@ -274,16 +281,17 @@ void OverlapCommunicator<KVType>::wait_sr_buffer_empty(cudaStream_t stream) {
     // so that we won't corrupt the local buffer being used
     if (_use_hierarchical) {
         sema::ag::wait_self_empty_hier(
-            sema_intra(),
+            sig_buffer->ag_refcnt(),
+            sig_buffer->ag_issued(),
             _my_pe,
             _gpus_per_node,
             _num_nodes,
-            num_effective_batch(),
             comm_stream
         );
     } else {
         sema::ag::wait_self_empty(
-            sema_intra(),
+            sig_buffer->ag_refcnt(),
+            sig_buffer->ag_issued(),
             _my_pe,
             comm_stream
         );
@@ -362,12 +370,13 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                                     comm_stream));
         }
     }
-    // notify all other PEs that the local data is ready (1. set self to be `total_pes - 1`. 2. broadcast to other PEs)
+    // notify all other PEs that the local data is ready (1. book the expected consumer adds. 2. broadcast to other PEs)
     const int effective_batch = num_effective_batch();
     if (_use_hierarchical) {
         sema::ag::notify_full_hier(
             sema_inter(),
             sema_intra(),
+            sig_buffer->ag_issued(),
             _my_pe, _total_n_pes,
             _gpus_per_node, _num_nodes,
             effective_batch, comm_stream
@@ -375,6 +384,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     } else {
         sema::ag::notify_full(
             kv_buffer->semaphores(),
+            sig_buffer->ag_issued(),
             _my_pe, _total_n_pes,
             comm_stream
         );
@@ -530,7 +540,7 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(const bool fwd) {
     // This replaces the old inline try_release_rank in the get kernel.
     if (_use_hierarchical) {
         sema::ag::notify_all_empty_hier(
-            sema_inter(), sema_intra(),
+            sema_inter(), sema_intra(), sig_buffer->ag_refcnt(),
             _my_pe, _total_n_pes,
             _gpus_per_node, _num_nodes,
             effective_batch,
@@ -539,6 +549,7 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel(const bool fwd) {
     } else {
         sema::ag::notify_all_empty(
             kv_buffer->semaphores(),
+            sig_buffer->ag_refcnt(),
             _my_pe, _total_n_pes,
             comm_stream
         );
@@ -650,7 +661,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(int segment_idx
     // Post-AG cleanup: notify producers we finished consuming their data in this segment.
     if (_use_hierarchical) {
         sema::ag::notify_segment_empty_hier(
-            sema_inter(), sema_intra(),
+            sema_inter(), sema_intra(), sig_buffer->ag_refcnt(),
             _my_pe, segment_idx, num_chunks,
             _total_n_pes, _gpus_per_node,
             effective_batch,
@@ -659,6 +670,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(int segment_idx
     } else {
         sema::ag::notify_segment_empty(
             kv_buffer->semaphores(),
+            sig_buffer->ag_refcnt(),
             _my_pe, start_pe, num_chunks,
             _total_n_pes,
             comm_stream
@@ -688,6 +700,7 @@ SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,                   
         B,                                                                          \
         H * D,                                                                      \
         dkv_buffer->semaphores(seg_idx),                                            \
+        sig_buffer->rs_full(seg_idx),                                               \
         num_segments(),                                                             \
         _gpus_per_node                                                              \
     )
@@ -753,8 +766,9 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         dkv_buffer->release_buffer(segment_idx, p_stream);                                              \
         /* consumer wait full + reduce */                                                               \
         sema::rs::consumer_wait_full(                                                                   \
-            dkv_buffer->semaphores(segment_idx),                                                        \
-            _my_pe, segment_idx == 0 ? (num_chunks - 1) : num_chunks, aux_c_stream                      \
+            sig_buffer->rs_full(segment_idx),                                                           \
+            sig_buffer->rs_expected(segment_idx),                                                       \
+            segment_idx == 0 ? (num_chunks - 1) : num_chunks, aux_c_stream                              \
         );                                                                                              \
         launch_dk_dv_reduce(                                                                            \
             dkv_buffer->k_recv(segment_idx),                                                            \
@@ -1028,9 +1042,9 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     WARN_PRINT("[FlashMask Overlap] Reconfiguring: old=[%s], new=[%s]\n",
         _config.to_string().c_str(), new_config.to_string().c_str());
 
-    // Synchronize all work before reconfiguring — no kernel should be using old buffers
-    CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
-    gin::barrier(*gin_context_);
+    // No kernel may still use the old buffers, and no GIN write may still be in flight to
+    // a window freed below (e.g. the last BWD's RS empty flags, consumed only next BWD).
+    quiesce();
 
     // Bitmap and rank_counters are sized by effective_batch of the old layout
     const int old_effective_batch = _config.use_bhsd ? _config.B * _config.H : _config.B;
@@ -1136,8 +1150,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     // New UID = new group generation (same size or not): rebuild. The teardown barrier
     // is collective on the old communicator, so all its ranks must switch at the same call.
     if (overlap_comm) {
-        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
-        overlap_comm->barrier();
+        overlap_comm->quiesce();
         overlap_comm.reset();
     }
     overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
@@ -1159,8 +1172,7 @@ bool is_singleton_null() {
 void destroy_singleton() {
     if (overlap_comm) {
         // Ensure all async work is complete before destroying
-        CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
-        overlap_comm->barrier();
+        overlap_comm->quiesce();
         overlap_comm.reset();   // triggers the communicator and window cleanup
         WARN_PRINT("[FlashMask Overlap] Singleton destroyed for topology refresh.\n");
     }

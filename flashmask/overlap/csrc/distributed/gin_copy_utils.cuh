@@ -137,6 +137,8 @@ __device__ __forceinline__ void two_buffers_putmem_block(
     if (auto* peer_dst1 = gin::get_lsa_ptr(dst1, world_peer); peer_dst1 != nullptr) {
         auto* peer_dst2 = dst2 != nullptr ? gin::get_lsa_ptr(dst2, world_peer) : nullptr;
         copy_two_buffers_block(peer_dst1, peer_dst2, src1, src2, bytes);
+        // System scope, in every storing thread: cross-node, the commit signal for these
+        // NVLink stores travels through the NIC, and GIN only releases at device scope.
         __threadfence_system();
         __syncthreads();
         return;

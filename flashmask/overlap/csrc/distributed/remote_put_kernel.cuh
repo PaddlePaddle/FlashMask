@@ -21,8 +21,8 @@ namespace flashmask {
  * actually an all-gather op implemented by an A2A op, the buffer cannot be reused the same way as the
  * all-gather overlap.
  *
- * P2P commit: when the last CTA finishes all puts to a given rank, it fences and signals
- * to notify that specific remote consumer immediately — no blocking quiet or group commit needed.
+ * P2P commit: when the last CTA finishes all puts to a given rank, it signals that specific
+ * remote consumer immediately (strong add on SignalBuffer::rs_full) — no blocking quiet or group commit needed.
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
     int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
@@ -40,7 +40,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int segment_idx,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    int64_t* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,          // empty flags, written by the consumers
+    uint64_t* const __restrict__ rs_full_seg,        // SignalBuffer::rs_full(segment_idx)
     const int num_segments = 4,
     const int gpus_per_node = 1         // hierarchical only
 ) {
@@ -111,24 +112,24 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     // P2P commit: after completing a work, check if all works for that rank are done.
-    // If so, fence + signal that specific consumer rank.
+    // If so, signal that specific consumer rank.
     // target_rank is passed in to avoid recomputing it (already computed at loop top).
     auto try_commit_rank = [&](int seg_chunk_id, int target_rank) {
         if (threadIdx.x == 0) {
             // chunk_offset maps seg_chunk_id back to the counter index for remote chunks
             int counter_idx = seg_chunk_id - chunk_offset;
-            int prev = atomicAdd(&rank_commit_counters[counter_idx], 1);
+            // acq_rel: the winner acquires every CTA's puts (their release half) before
+            // its own release add below; a relaxed RMW would give it no acquire.
+            int prev = cuda::atomic_ref<int, cuda::thread_scope_device>(rank_commit_counters[counter_idx])
+                .fetch_add(1, cuda::memory_order_acq_rel);
             if (prev + 1 == works_per_rank) {
                 // wait before reset, in-case all chunks are skipped and we reset before remote put
                 sema::rs::producer_wait_empty(semaphores, target_rank);
-                // Last CTA to finish work for this rank.
+                // Last CTA to finish work for this rank: consume the empty flag.
                 semaphores[target_rank] = 0;
                 // Strong VA signal on the shared ordered context settles every
-                // preceding put to target_rank (from ANY CTA, cross-node) before
-                // it lands -- replacing the old gin::fence() (a GPU-local
-                // __threadfence_system that gave no RDMA ordering).
-                // P2P notify: +1 on the consumer's per-stage refcount
-                gin::remote_strong_add(semaphores + target_rank, int64_t(1), target_rank);
+                // preceding put to target_rank (from ANY CTA, cross-node) before it lands.
+                gin::remote_strong_add(rs_full_seg, 1, target_rank);
             }
         }
     };

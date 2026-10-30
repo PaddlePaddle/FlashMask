@@ -52,12 +52,21 @@ def _overlap_gate_bwd(
     cta_group_size: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
 ):
-    """Wait for the split-AG work item covering this cluster-wide KV tile."""
+    """Wait for the split-AG work item covering this cluster-wide KV tile.
+
+    Only ``tidx == 0`` spins. Every lane of the (single) load warp must call this: after
+    the warp sync every lane, including the ``elect.sync`` lane that issues the K/V TMA
+    loads, runs the generic -> async proxy fence itself.
+    """
     if tidx == 0:
         right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
         work_per_batch = seqlen_k // comm_rpb
         work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
         wait_flag_eq(work_done, Int32(work_id), Int32(1))
+    # Carries lane 0's acquire to every lane of the load warp.
+    cute.arch.sync_warp()
+    # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
+    cute.arch.fence_proxy("async.global")
 
 
 class FlashAttentionBackwardSm100:

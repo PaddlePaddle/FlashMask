@@ -10,10 +10,9 @@ namespace flashmask {
 namespace sema {
 namespace ag {
 
-// sema_intra holds `batch_ready_words(num_batch)` int64 words per rank; word w carries the
+// sema_intra holds `batch_ready_words(num_batch)` int64 flag words per rank; word w carries the
 // per-batch readiness bits of batches [64w, 64w+64). This lifts the old single-word cap of
-// 64 effective batches (BHSD: B*H). Word 0 doubles as the refcount slot on the rank that
-// owns or relays the data, exactly as before -- a slot is never both at once.
+// 64 effective batches (BHSD: B*H). Refcounts are VA signals in SignalBuffer::ag_refcnt.
 __host__ __device__ __forceinline__ int batch_ready_words(int num_batch) {
     return num_batch <= 0 ? 1 : ((num_batch + 63) >> 6);
 }
@@ -43,15 +42,18 @@ __device__ __forceinline__ void wait_full(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    gin::wait_until(const_cast<int64_t*>(semaphores) + target_pe, gin::Compare::GreaterThan, 0);
+    gin::wait_until(semaphores + target_pe, gin::Compare::GreaterThan, 0, "ag_full");
 }
 
 
 /**
  * @brief (Device Function) Wait until semaphores' batch_idx readiness bit is set for target_pe.
- *   Used in hierarchical Phase 2 to wait for per-batch relay data readiness.
+ *   Used in hierarchical Phase 2 to wait for per-batch relay data readiness. The acquire
+ *   pairs with the relay holder's release fetch_or; the caller's bar.sync extends it to the
+ *   CTA's NVLink loads of the relay data.
+ *   Out of line: see gin::wait_until.
  */
-__device__ __forceinline__ void wait_full_one_batch(
+static __device__ __noinline__ void wait_full_one_batch(
     const int64_t* const __restrict__ semaphores,
     const int batch_idx,
     const int target_pe,
@@ -60,18 +62,14 @@ __device__ __forceinline__ void wait_full_one_batch(
     const int64_t batch_bit = static_cast<int64_t>(1ULL << (batch_idx & 63));
     const int64_t* const word =
         semaphores + target_pe * batch_ready_words(num_batch) + (batch_idx >> 6);
-    int64_t current_val;
-    do {
-        asm volatile("ld.volatile.global.s64 %0, [%1];"
-            : "=l"(current_val) : "l"(word) : "memory");
-    } while (!(current_val & batch_bit));
+    gin::spin_until(word, [=](int64_t current) { return (current & batch_bit) != 0; },
+                    "ag_batch_ready", batch_bit);
 }
 
 /**
  * @brief (Device Function) Publish "batch_idx of target_pe's data is readable" to the other
- *   ranks of this node. The leading fence pairs with the release fence the producing CTAs
- *   issue before their relaxed counter increment, so their SR buffer stores are ordered
- *   before this announcement.
+ *   ranks of this node. The caller acquired every producing CTA's counter increment
+ *   (acq_rel), so the release fetch_or orders all of their SR buffer writes before the bit.
  */
 __device__ __forceinline__ void notify_batch_ready_to_same_node(
     int64_t* const __restrict__ semaphores,
@@ -86,7 +84,6 @@ __device__ __forceinline__ void notify_batch_ready_to_same_node(
     const int64_t ready_bit = static_cast<int64_t>(1ULL << (batch_idx & 63));
     const int my_pe_node = my_pe % gpus_per_node;
     const int my_node_id = my_pe / gpus_per_node;
-    __threadfence();
     for (int slot = 1; slot < gpus_per_node; slot++) {
         const int base = (my_pe_node + slot) % gpus_per_node;
         gin::remote_or(word, ready_bit, base + my_node_id * gpus_per_node);
@@ -96,8 +93,9 @@ __device__ __forceinline__ void notify_batch_ready_to_same_node(
 /**
  * @brief (Device Function) Wait until all batch bits are set for target_pe.
  *   Used in HierNotifyEmpty to drain per-batch relay signals before clearing.
+ *   Out of line: see gin::wait_until.
  */
-__device__ __forceinline__ void wait_full_all_batch(
+static __device__ __noinline__ void wait_full_all_batch(
     const int64_t* const __restrict__ semaphores,
     const int num_batch,
     const int target_pe
@@ -106,11 +104,8 @@ __device__ __forceinline__ void wait_full_all_batch(
     const int64_t* const base = semaphores + target_pe * words;
     for (int w = 0; w < words; w++) {
         const int64_t expected = batch_ready_bits(num_batch, w);
-        int64_t current_val;
-        do {
-            asm volatile("ld.volatile.global.s64 %0, [%1];"
-                : "=l"(current_val) : "l"(base + w) : "memory");
-        } while (current_val != expected);
+        gin::spin_until(base + w, [=](int64_t current) { return current == expected; },
+                        "ag_all_batch_ready", expected);
     }
 }
 
@@ -122,17 +117,15 @@ __device__ __forceinline__ void wait_full_all_batch(
 // num thread: total_pes
 __global__ void NotifySemaphoreEmptyKernel(
     int64_t* const __restrict__ semaphores,
+    uint64_t* const __restrict__ ag_refcnt,
     const int my_pe
 ) {
     if (threadIdx.x != my_pe) {
         // the other PE will not notify us before we reset
         wait_full(semaphores, threadIdx.x);
         semaphores[threadIdx.x] = 0;
-        // Note(heqianyue): bitwise op is generally safer than add, if we are using only 1 node
-        // we can opt for the following atomic_and approach
-        // clear bit representing the current PE on the all other target PE
-        const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
-        gin::remote_add(semaphores + threadIdx.x, clear_mask, threadIdx.x);
+        // one consumer of threadIdx.x's chunk is done
+        gin::remote_add(ag_refcnt + threadIdx.x, 1, threadIdx.x);
     }
 }
 
@@ -140,6 +133,7 @@ __global__ void NotifySemaphoreEmptyKernel(
 // using the data of yours. Used in RS-overlap splitted AG
 __global__ void NotifySegmentSemaphoreEmptyKernel(
     int64_t* const __restrict__ semaphores,
+    uint64_t* const __restrict__ ag_refcnt,
     const int my_pe,
     const int start_rank,
     const int total_pes
@@ -149,99 +143,100 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
         // the other PE will not notify us before we reset
         wait_full(semaphores, target_rank);
         semaphores[target_rank] = 0;
-        const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
-        gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
+        gin::remote_add(ag_refcnt + target_rank, 1, target_rank);
     }
 }
 
+// num thread: total_pes. The self thread books the total_pes - 1 consumer adds this
+// round will bring; every other thread raises the data-ready flag on its consumer.
 __global__ void SetFullKernel(
     int64_t* const __restrict__ semaphores,
-    int64_t value,
+    uint64_t* const __restrict__ ag_issued,
     int self_rank
 ) {
-    if (threadIdx.x == 0) {
-        semaphores[self_rank] = value;
+    if (threadIdx.x == self_rank) {
+        ag_issued[self_rank] += blockDim.x - 1;
+        return;
     }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == self_rank) return;
-    // set the semaphores[self_rank] = 1 for all remote ranks
     gin::remote_store(semaphores + self_rank, int64_t(1), threadIdx.x);
 }
 
-/**
- * @brief CPU wait until the semaphores[my_pe] reached 0
- * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
- * @param my_pe the id of semaphore to wait for
- * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
-*/
-void wait_self_empty(
-    int64_t* const __restrict__ semaphores,
-    int my_pe,
-    cudaStream_t stream
+// Waits until every consumer of the previous round has released our chunk.
+__global__ void AgWaitConsumedKernel(
+    const uint64_t* const __restrict__ ag_refcnt,
+    const uint64_t* const __restrict__ ag_issued,
+    int my_pe
 ) {
-    gin::wait_until_on_stream(
-        semaphores + my_pe,
-        gin::Compare::Equal,
-        0,
-        stream
-    );
+    gin::signal_wait_exact(ag_refcnt + my_pe, ag_issued[my_pe], "ag_refcnt");
 }
 
 /**
- * @brief Tell all other PEs that the local PE has finished using their data
-    so that the semaphore value on the specific PE is decreased by 1. 
+ * @brief Stream-ordered wait until every consumer of the previous round released our chunk.
+ *   Exactly one call per notify_full, before it on the same stream.
+ */
+void wait_self_empty(
+    const uint64_t* const __restrict__ ag_refcnt,
+    const uint64_t* const __restrict__ ag_issued,
+    int my_pe,
+    cudaStream_t stream
+) {
+    AgWaitConsumedKernel<<<1, 1, 0, stream>>>(ag_refcnt, ag_issued, my_pe);
+}
 
-    The behavior is simple: set all semaphores[i] except i = my_pe, to 0, locally.
-    So that the next remote_get kernel on comm_stream will know that there is no
-    data available (before we do copy on aux_stream). Also, decrease all semaphores[i]
-    (i != my_pe) by 1, so other PEs will know that their local data has one few
-    dependent PE. If 0 is reached, they can start clean up. 
+/**
+ * @brief Tell all other PEs that the local PE has finished using their data.
 
- * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
- * @param my_pe except for semaphores[my_pe], for all other local semaphores: set zero
-    , and for remote semaphores: decrease (data ref_cnt) by 1
+    Locally zero every data-ready flag semaphores[i] (i != my_pe), so the next remote_get
+    kernel on comm_stream sees no data available. Remotely add 1 to ag_refcnt[i] on every
+    PE i, so it knows one more consumer released its chunk.
+
+ * @param semaphores int64 flags in the SRBuffer window: size is total_n_pes
+ * @param ag_refcnt SignalBuffer::ag_refcnt
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
 void notify_all_empty(
     int64_t* const __restrict__ semaphore,
+    uint64_t* const __restrict__ ag_refcnt,
     int my_pe,
     int total_pes,
     cudaStream_t stream
 ) {
-    NotifySemaphoreEmptyKernel<<<1, total_pes, 0, stream>>>(semaphore, my_pe);
+    NotifySemaphoreEmptyKernel<<<1, total_pes, 0, stream>>>(semaphore, ag_refcnt, my_pe);
 }
 
 void notify_segment_empty(
     int64_t* const __restrict__ semaphore,
+    uint64_t* const __restrict__ ag_refcnt,
     int my_pe,
     int start_rank,
     int chunk_per_seg,
     int total_pes,
     cudaStream_t stream
 ) {
-    NotifySegmentSemaphoreEmptyKernel<<<1, chunk_per_seg, 0, stream>>>(semaphore, my_pe, start_rank, total_pes);
+    NotifySegmentSemaphoreEmptyKernel<<<1, chunk_per_seg, 0, stream>>>(
+        semaphore, ag_refcnt, my_pe, start_rank, total_pes);
 }
 
 /**
- * Hierarchical notify_full: sets refcounts and broadcasts to congruence partners + same-node ranks.
+ * Hierarchical notify_full: books this round's refcount adds and broadcasts to congruence
+ * partners + same-node ranks.
  *
- * Dual-refcount protocol (local writes by thread 0, refcount lives in word 0 of the slot):
- *   sema_intra[my_pe] = producer refcount = (num_nodes-1) + (gpus_per_node-1)
- *   sema_intra[partner] = relay refcount = (gpus_per_node-1), for each congruence partner
- *     (partner's data will be relayed through us; same-node ranks will read and decrement)
+ * Dual-refcount protocol (thread 0 bumps the expected counts in ag_issued):
+ *   ag_refcnt[my_pe]   producer count: (num_nodes-1) + (gpus_per_node-1) adds per round
+ *   ag_refcnt[partner] relay count: (gpus_per_node-1) adds per round, for each congruence
+ *     partner (partner's data is relayed through us; same-node ranks read it, then add)
  *
- * Remote signals (threads 1..N):
+ * Remote flags (threads 1..N):
  *   sema_inter[my_node_id] = 1 on each congruence partner  (cross-node data ready)
  *   sema_intra[my_pe] = every batch bit set, on each same-node rank  (local chunk ready)
  *
- * Precondition: wait_self_empty_hier has ensured all local sema_intra entries being
- *   written here are already 0 (previous round fully consumed).
+ * Precondition: wait_self_empty_hier ran before, on the same stream.
  */
 __global__ void HierSetFullKernel(
     int64_t* const __restrict__ sema_inter,   // [num_nodes] cross-node flags
-    int64_t* const __restrict__ sema_intra,   // [total_n_pes] refcount + intra-node signals
-    int64_t refcount,
+    int64_t* const __restrict__ sema_intra,   // [total_n_pes] intra-node readiness bits
+    uint64_t* const __restrict__ ag_issued,
+    int refcount,
     int self_rank,
     int my_pe_node,
     int my_node_id,
@@ -250,21 +245,15 @@ __global__ void HierSetFullKernel(
     int num_batch
 ) {
     const int ready_words = batch_ready_words(num_batch);
-    if (threadIdx.x == 0) {
-        // Producer refcount: decremented by congruence partners + same-node ranks
-        sema_intra[self_rank * ready_words] = refcount;
-        // Relay refcounts: each congruence partner's data will be relayed through us,
-        // and (gpus_per_node-1) same-node ranks will read the relay then decrement.
+    int tid = threadIdx.x;
+    if (tid == 0) {
+        ag_issued[self_rank] += refcount;
         for (int i = 1; i < num_nodes; i++) {
             int partner = my_pe_node + ((my_node_id + i) % num_nodes) * gpus_per_node;
-            sema_intra[partner * ready_words] = static_cast<int64_t>(gpus_per_node - 1);
+            ag_issued[partner] += gpus_per_node - 1;
         }
+        return;
     }
-    __threadfence();
-    __syncthreads();
-
-    int tid = threadIdx.x;
-    if (tid == 0) return;
 
     const int congruence_count = num_nodes - 1;
     if (tid <= congruence_count) {
@@ -288,17 +277,16 @@ __global__ void HierSetFullKernel(
 
 void notify_full(
     int64_t* const __restrict__ semaphores,
+    uint64_t* const __restrict__ ag_issued,
     int my_pe,
     int total_pes,
     cudaStream_t stream
 ) {
-    int64_t bit_val = (1LL << total_pes) - (1LL << my_pe) - 1;
-    // make sure local store is visible to other ranks and notify other PE that data is ready (full)
-    SetFullKernel<<<1, total_pes, 0, stream>>>(semaphores, bit_val, my_pe);
+    SetFullKernel<<<1, total_pes, 0, stream>>>(semaphores, ag_issued, my_pe);
 }
 
 /**
- * Hierarchical notify_full: sets reference count = (num_nodes - 1) + (gpus_per_node - 1).
+ * Hierarchical notify_full: books refcount = (num_nodes - 1) + (gpus_per_node - 1) adds.
  * Broadcasts to:
  *   - sema_inter[my_node_id] = 1 on congruence partners (Phase 1 cross-node signal)
  *   - sema_intra[my_pe] = 1 on same-node ranks (Phase 2 local chunk signal)
@@ -306,6 +294,7 @@ void notify_full(
 void notify_full_hier(
     int64_t* const __restrict__ sema_inter,
     int64_t* const __restrict__ sema_intra,
+    uint64_t* const __restrict__ ag_issued,
     int my_pe,
     int total_pes,
     int gpus_per_node,
@@ -316,37 +305,38 @@ void notify_full_hier(
     const int my_pe_node = my_pe % gpus_per_node;
     const int my_node_id = my_pe / gpus_per_node;
     // Phase 1 consumers (num_nodes - 1) + Phase 2 consumers reading local chunk (gpus_per_node - 1)
-    const int64_t refcount = hier::hier_local_refcount(total_pes, gpus_per_node);
+    const int refcount = hier::hier_local_refcount(total_pes, gpus_per_node);
     // Thread count: 1 (self) + congruence partners + same-node ranks
     const int num_notify = 1 + refcount;
     HierSetFullKernel<<<1, num_notify, 0, stream>>>(
-        sema_inter, sema_intra, refcount, my_pe, my_pe_node, my_node_id, num_nodes, gpus_per_node, num_batch);
+        sema_inter, sema_intra, ag_issued, refcount, my_pe, my_pe_node, my_node_id,
+        num_nodes, gpus_per_node, num_batch);
 }
 
 /**
  * Hierarchical post-AG cleanup kernel.
  * Runs after AG remote_get kernel completes on comm_stream.
  *
- * Dual-refcount protocol:
- *   - Producer refcount: sema_intra[X] on producer PE X = (num_nodes-1) + (gpus_per_node-1)
- *     Decremented by: congruent ranks (Phase 1 consumers) + same-node ranks (Phase 2 direct readers)
- *   - Relay refcount: sema_intra[X] on relay holder PE = (gpus_per_node-1)
- *     Set by AG kernel's congruence_notify after Phase 1 fetch.
- *     Decremented by: same-node non-congruent ranks that read the relay copy.
+ * Dual-refcount protocol (VA signals in ag_refcnt, see HierSetFullKernel):
+ *   - Producer count: ag_refcnt[X] on producer PE X, +1 from each congruent rank (Phase 1
+ *     consumer) and each same-node rank (Phase 2 direct reader).
+ *   - Relay count: ag_refcnt[X] on relay holder PE H, +1 from each same-node non-congruent
+ *     rank that read the relay copy.
  *
  * Thread layout: threadIdx.x = 0..total_n_pes-1
  *
  * Three cases per target:
  *   1. Congruent (same slot, different node): Phase 1 target.
- *      Clear sema_inter, decrement producer's refcount on target PE.
+ *      Clear sema_inter, add 1 to the producer count on target PE.
  *   2. Non-congruent, same node: Phase 2 direct read from producer.
- *      Wait for signal, clear local sema_intra, decrement producer's refcount on target PE.
+ *      Wait for signal, clear local sema_intra, add 1 to the producer count on target PE.
  *   3. Non-congruent, different node: Phase 2 relay read from same-node relay holder.
- *      Wait for signal, clear local sema_intra, decrement relay holder's relay refcount.
+ *      Wait for signal, clear local sema_intra, add 1 to the relay holder's relay count.
  */
 __global__ void HierNotifyEmptyKernel(
     int64_t* const __restrict__ sema_inter,
     int64_t* const __restrict__ sema_intra,
+    uint64_t* const __restrict__ ag_refcnt,
     const int my_pe,
     const int total_n_pes,
     const int num_nodes,
@@ -366,7 +356,7 @@ __global__ void HierNotifyEmptyKernel(
     if (target_slot == my_slot) {
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
-        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), target);
+        gin::remote_add(ag_refcnt + target, 1, target);
     } else {
         wait_full_all_batch(sema_intra, num_batch, target);
         for (int w = 0; w < ready_words; w++) {
@@ -374,7 +364,7 @@ __global__ void HierNotifyEmptyKernel(
         }
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), remote_rank);
+        gin::remote_add(ag_refcnt + target, 1, remote_rank);
     }
 }
 
@@ -387,6 +377,7 @@ __global__ void HierNotifyEmptyKernel(
 __global__ void HierNotifySegmentEmptyKernel(
     int64_t* const __restrict__ sema_inter,
     int64_t* const __restrict__ sema_intra,
+    uint64_t* const __restrict__ ag_refcnt,
     const int my_pe,
     const int segment_idx,
     const int num_chunks,
@@ -413,8 +404,7 @@ __global__ void HierNotifySegmentEmptyKernel(
     if (target_slot == my_slot) {
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
-        // Do NOT zero sema_intra[target] — relay refcount managed by Phase 2 consumers.
-        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), target);
+        gin::remote_add(ag_refcnt + target, 1, target);
     } else {
         wait_full_all_batch(sema_intra, num_batch, target);
         for (int w = 0; w < ready_words; w++) {
@@ -422,13 +412,14 @@ __global__ void HierNotifySegmentEmptyKernel(
         }
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), remote_rank);
+        gin::remote_add(ag_refcnt + target, 1, remote_rank);
     }
 }
 
 void notify_all_empty_hier(
     int64_t* const __restrict__ sema_inter,
     int64_t* const __restrict__ sema_intra,
+    uint64_t* const __restrict__ ag_refcnt,
     int my_pe,
     int total_pes,
     int gpus_per_node,
@@ -437,12 +428,13 @@ void notify_all_empty_hier(
     cudaStream_t stream
 ) {
     HierNotifyEmptyKernel<<<1, total_pes, 0, stream>>>(
-        sema_inter, sema_intra, my_pe, total_pes, num_nodes, gpus_per_node, num_batch);
+        sema_inter, sema_intra, ag_refcnt, my_pe, total_pes, num_nodes, gpus_per_node, num_batch);
 }
 
 void notify_segment_empty_hier(
     int64_t* const __restrict__ sema_inter,
     int64_t* const __restrict__ sema_intra,
+    uint64_t* const __restrict__ ag_refcnt,
     int my_pe,
     int segment_idx,
     int num_chunks,
@@ -452,44 +444,40 @@ void notify_segment_empty_hier(
     cudaStream_t stream
 ) {
     HierNotifySegmentEmptyKernel<<<1, num_chunks, 0, stream>>>(
-        sema_inter, sema_intra, my_pe, segment_idx, num_chunks, total_pes, gpus_per_node, num_batch);
+        sema_inter, sema_intra, ag_refcnt, my_pe, segment_idx, num_chunks, total_pes,
+        gpus_per_node, num_batch);
 }
 
+// Thread i waits on partner i: thread 0 on our own producer count, threads 1.. on the
+// relay counts of our congruence partners.
 __global__ void WaitSelfEmptyHierarchicalKernel(
-    int64_t* const __restrict__ sema_intra,
+    const uint64_t* const __restrict__ ag_refcnt,
+    const uint64_t* const __restrict__ ag_issued,
     int my_pe_node,
     int my_node_id,
-    int gpus_per_node,
-    int num_batch
+    int gpus_per_node
 ) {
     int partner = my_pe_node + ((my_node_id + threadIdx.x) % blockDim.x) * gpus_per_node;
-    // Refcounts live in word 0 of each rank's slot.
-    const int64_t* const refcount = sema_intra + partner * batch_ready_words(num_batch);
-    int64_t current_val;
-    do {
-        asm volatile("ld.volatile.global.s64 %0, [%1];"
-            : "=l"(current_val) : "l"(refcount) : "memory");
-    } while (current_val);
+    gin::signal_wait_exact(ag_refcnt + partner, ag_issued[partner], "ag_refcnt_hier");
 }
 
 /**
- * @brief CPU wait until both producer refcount and all relay refcounts reach 0.
- *   Waits for sema_intra[my_pe] == 0 (producer refcount) and
- *   sema_intra[each_congruence_partner] == 0 (relay refcounts).
- *   Must be called before HierSetFullKernel to guarantee no data overwrite.
+ * @brief Stream-ordered wait until both the producer count and all relay counts reached
+ *   what the previous round's HierSetFullKernel booked. Must run before HierSetFullKernel,
+ *   on the same stream, to guarantee no data overwrite.
  */
 void wait_self_empty_hier(
-    int64_t* const __restrict__ sema_intra,
+    const uint64_t* const __restrict__ ag_refcnt,
+    const uint64_t* const __restrict__ ag_issued,
     int my_pe,
     int gpus_per_node,
     int num_nodes,
-    int num_batch,
     cudaStream_t stream
 ) {
     const int my_pe_node = my_pe % gpus_per_node;
     const int my_node_id = my_pe / gpus_per_node;
     WaitSelfEmptyHierarchicalKernel<<<1, num_nodes, 0, stream>>>(
-        sema_intra, my_pe_node, my_node_id, gpus_per_node, num_batch
+        ag_refcnt, ag_issued, my_pe_node, my_node_id, gpus_per_node
     );
 }
 

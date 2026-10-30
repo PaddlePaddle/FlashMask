@@ -11,6 +11,12 @@ from cutlass._mlir.dialects import llvm
 
 @dsl_user_op
 def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
+    """``ld.global.acquire.gpu``: synchronizes with a gpu-or-wider-scope release of the
+    word by any thread on this GPU, including other kernel grids (PTX ISA 8.5). Data the
+    releaser acquired from peers or the NIC reaches the caller by causality transitivity
+    (8.9.5), so the flag writer, not the data writer, must be on this GPU. The ordering
+    is generic-proxy only; async-proxy (TMA) readers need ``fence.proxy.async`` (8.6).
+    """
     lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
     state = llvm.inline_asm(
         T.i32(),
@@ -37,10 +43,10 @@ def wait_flag_eq(flag_ptr: cute.Pointer, elem_idx: int | Int32, target: Int32) -
 def wait_write_ptr_ge(wptr: cute.Pointer, elem_idx: int | Int32, target: Int32) -> None:
     """Busy-spin until wptr[elem_idx] >= target. Caller elects a single thread.
 
-    write_ptr is a monotonically advanced (atomicMax) row index on the comm side;
-    once it reaches `target` the corresponding remote KV rows are all-gathered and
-    visible to this rank. The compare is on non-negative row counts (the INT_MAX
-    whole-AG sentinel is also positive), so a plain b32 acquire load suffices.
+    write_ptr is a monotonically advanced (atomicMax) row index on the comm side; once
+    it reaches `target` the corresponding remote KV rows are all-gathered and visible to
+    the calling thread's generic-proxy reads. The compare is on non-negative row counts
+    (the INT_MAX whole-AG sentinel is also positive), so a plain b32 acquire load suffices.
     """
     flag_ptr = wptr + elem_idx
     read_val = ld_acquire(flag_ptr)
