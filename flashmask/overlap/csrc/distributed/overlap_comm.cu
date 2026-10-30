@@ -19,7 +19,7 @@ static constexpr int RDMA_ROW_PER_WARP = 32;
 
 // allowed value: 16 or 8 (16 warps are generally better for KV with larger num_head and higher CP)
 static constexpr int num_warps = 16;    // making the grid larger is generally better
-static constexpr int num_blocks = 32;   // comm CTAs per kernel; per-thread register budget: FM4_COMM_REGS_PER_THREAD
+static constexpr int num_blocks = 32;   // comm CTAs per kernel; register budget: shmem::comm_regs_per_thread
 static_assert(num_blocks == 32,
     "fwd frontier publish: lane j of every AG CTA reads block_work_idx[j], one slot per CTA");
 

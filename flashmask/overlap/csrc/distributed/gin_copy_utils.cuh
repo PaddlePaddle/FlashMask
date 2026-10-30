@@ -9,23 +9,16 @@
 
 namespace flashmask::shmem {
 
-// Register budget per thread of the comm kernels (AG get, RS put); the kernels derive
-// their __launch_bounds__ min-blocks from it via comm_min_blocks_per_sm. Comm CTAs never
-// share an SM with FM-4 compute CTAs, which allocate the whole register file through
-// setmaxnreg, so the budget only decides how many comm CTAs fit on one SM: 64 at 512
-// threads gives 2 (an AG and an RS CTA can still pair up) and leaves room for
-// lsa_copy_block's FM4_LSA_COPY_UNROLL staged int4 loads. The old budget of 32 capped
-// the copy at one load in flight per thread.
-#ifndef FM4_COMM_REGS_PER_THREAD
-#define FM4_COMM_REGS_PER_THREAD 64
-#endif
+// Register budget per thread of the comm kernels (AG get, RS put). Comm CTAs never share
+// an SM with FM-4 compute CTAs (those take the whole register file through setmaxnreg), so
+// the budget only decides how many comm CTAs fit on one SM: 64 at 512 threads gives 2, so
+// an AG and an RS CTA can pair up, and leaves room for the staged loads below.
+constexpr int comm_regs_per_thread = 64;
 // 16 B loads each thread keeps in flight per main-loop iteration of lsa_copy_block.
-#ifndef FM4_LSA_COPY_UNROLL
-#define FM4_LSA_COPY_UNROLL 8
-#endif
+constexpr int lsa_copy_unroll = 8;
 
 __host__ __device__ constexpr int comm_min_blocks_per_sm(int num_warps) {
-    return 65536 / (num_warps * 32 * FM4_COMM_REGS_PER_THREAD);
+    return 65536 / (num_warps * 32 * comm_regs_per_thread);
 }
 
 // A null dst2 means the caller has a single component to move (shared K/V); src2 is then
@@ -73,23 +66,23 @@ __device__ __forceinline__ void lsa_copy_block(int4* dst, const int4* src, int c
 // 72 B and the AG entries up to 44 B; out of line, every comm entry has 0 spill bytes
 // and this frame only saves its callee-saved registers once per call, outside the
 // loops. The two components are copied one after the other: each pass already has
-// FM4_LSA_COPY_UNROLL loads in flight, and interleaving them would double the staged
+// lsa_copy_unroll loads in flight, and interleaving them would double the staged
 // registers. A trailing bytes % 16 is not copied, as before; callers move whole rows
 // of D * 2 bytes.
 static __device__ __noinline__ void copy_two_buffers_block(
     void* dst1, void* dst2, const void* src1, const void* src2, int bytes) {
     const int count = bytes / sizeof(int4);
-    lsa_copy_block<FM4_LSA_COPY_UNROLL>(
+    lsa_copy_block<lsa_copy_unroll>(
         static_cast<int4*>(dst1), static_cast<const int4*>(src1), count);
     if (dst2 != nullptr) {
-        lsa_copy_block<FM4_LSA_COPY_UNROLL>(
+        lsa_copy_block<lsa_copy_unroll>(
             static_cast<int4*>(dst2), static_cast<const int4*>(src2), count);
     }
 }
 
 // Building a GIN work request needs far more live state than the bulk copy above
 // (about 126 registers unconstrained), so inlining it into the comm kernels makes
-// ptxas spill around the copy loop under FM4_COMM_REGS_PER_THREAD -- a cost every
+// ptxas spill around the copy loop under comm_regs_per_thread -- a cost every
 // chunk pays, including the intra-node ones that never reach here. Keeping it out of
 // line confines that pressure to its own frame.
 // `static` is required: with external linkage the ABI register count is fixed
