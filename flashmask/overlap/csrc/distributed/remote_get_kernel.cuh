@@ -278,11 +278,6 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         cached_semaphores[threadIdx.x] = 0;
     }
 
-    // // Uncomment this line to check what happens when communication is not stalling the computation
-    // if (threadIdx.x == 0) {
-    //     atomicMax(wptr, INT_MAX);
-    // }
-
     for (int work_id = update_wptr_and_work_id_sync(0); work_id <= total_chunks;) {
         const int work_id_m1 = work_id - 1;
         const int batch_id = work_id_m1 / chunk_per_batch;
@@ -398,7 +393,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
-    const int start_rank,               // first call is my_pe + 1 (non-hierarchical only)
+    const int start_rank,               // (my_pe + segment_idx * num_chunks) % total_n_pes
     const int segment_idx,
     const int total_n_pes,
     const int num_batch,                // B
@@ -428,10 +423,10 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
     // Per-stage batch stride = num_chunks * S_chunk * S_stride.
-    // Both dst (k_sr) and src (local_k) live in the same SR buffer that is partitioned
-    // into num_segments independent sub-tensors each of size B * num_chunks * S_chunk.
-    // Stage separation is handled by the caller advancing k_sr/local_k per segment.
-    // Non-hierarchical: same formula, overwrites the single segment region.
+    // Both dst (k_sr) and src (local_k) live in the SR buffer. Hierarchical: it is
+    // partitioned into num_segments sub-tensors of B * num_chunks * S_chunk rows and the
+    // caller advances only k_sr per segment; local_k stays at the SR base.
+    // Non-hierarchical: k_sr stays at the base; local_k is the base or the tail backup.
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S * row_stride;
     // remote_pe's local K/V (non-hierarchical): its SR base, chunk 0 of each batch row, when the

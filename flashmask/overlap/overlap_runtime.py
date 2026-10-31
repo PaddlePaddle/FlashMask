@@ -3,6 +3,11 @@
 
 """FM-4 Overlap Python runtime: ctypes front-end over ``libfm4_overlap.so``.
 Importing never loads the .so; ``_load()`` raises only on first use if missing.
+
+Stream contract: every overlap call of a process runs on one ordered compute stream
+(the framework's current stream). The SR buffer reuse guard is an event recorded on the
+calling stream, so attention kernels still reading the gathered K/V on another stream are
+not waited for. CUDA graph capture is rejected by check_inputs.
 """
 
 import ctypes
@@ -115,6 +120,8 @@ def _load():
         fn = getattr(lib, name)
         fn.argtypes = [ctypes.c_int]
         fn.restype = ctypes.c_uint64
+    lib.fm4_overlap_num_chunks_per_segment.argtypes = [ctypes.c_int] * 5
+    lib.fm4_overlap_num_chunks_per_segment.restype = ctypes.c_int
 
     # (mask_ptr) uint64, num_heads int, (batch_stride, head_stride) int64, (k_ptr, v_ptr,
     # compute_stream) uint64, fwd int.
@@ -147,7 +154,8 @@ def _load():
 # Communicator values of the current config generation (_CommLayout); see init_overlap.
 _LAYOUT = None
 
-# Cache one NCCL UID per Python process/group generation.
+# Cache one NCCL UID per Python process/group generation; _UID_KEY = (group, world_size)
+# keeps the group object alive, so its identity cannot be recycled.
 _UID = None
 _UID_KEY = None
 
@@ -161,10 +169,14 @@ def is_available():
         return False
 
 
-# Mirrors init_singleton_instance (overlap_comm.cu) and kMaxCommRanks
-# (remote_get_kernel.cuh); repeated only so check_inputs can fail before any comm.
+# Mirrors init_singleton_instance (overlap_comm.cu), kMaxCommRanks (remote_get_kernel.cuh),
+# the forward SeqlenDispatch (overlap_comm.cu, S_total powers of two up to 2^21) and the
+# split AG / RS chunk dispatch (NumChunkDispatchSplitted); repeated only so check_inputs
+# can fail before any comm instead of terminating inside the noexcept bridge.
 SUPPORTED_S_LOCAL = (4096, 8192, 16384, 32768, 65536, 131072)
 MAX_RANKS = 64
+MAX_S_TOTAL = 2097152
+SUPPORTED_CHUNKS_PER_SEGMENT = (1, 2, 4, 8)
 
 
 def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
@@ -173,6 +185,10 @@ def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
     Runs ahead of the unique-id broadcast and the communicator setup, so a bad call
     raises on every rank instead of after peers have entered a collective.
     """
+    if be.is_stream_capturing():
+        # First use / reconfiguration synchronizes the device and the internal comm and
+        # put streams are never joined back to a capture origin.
+        raise ValueError("overlap does not support CUDA graph capture")
     if startend_row_indices is None:
         raise ValueError("overlap requires startend_row_indices (group-rank KV-chunk order)")
     if causal:
@@ -187,6 +203,13 @@ def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
         # over-report fully-masked chunks and silently drop their contribution.
         raise ValueError(
             f"overlap requires a 2-column [lt_start, ut_end] mask, got {num_vecs} columns"
+        )
+    if startend_row_indices.shape[0] != k.shape[0]:
+        # The SM100 forward indexes the mask, its block max/min and valid_block_count by
+        # the real batch index, so a batch-1 mask cannot be broadcast over B > 1.
+        raise ValueError(
+            f"overlap requires mask batch == batch size {k.shape[0]}, got "
+            f"{startend_row_indices.shape[0]} (mask batch broadcasting is not supported)"
         )
     if not (q.dtype == k.dtype == v.dtype == be.bfloat16):
         raise ValueError(
@@ -203,22 +226,39 @@ def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
         raise ValueError(f"overlap requires S_local in {SUPPORTED_S_LOCAL}, got {s_local}")
     if nranks > MAX_RANKS:
         raise ValueError(f"overlap supports at most {MAX_RANKS} ranks per group, got {nranks}")
+    if nranks & (nranks - 1):
+        raise ValueError(f"overlap requires a power-of-two group size, got {nranks}")
+    if s_local * nranks > MAX_S_TOTAL:
+        raise ValueError(
+            f"overlap requires S_local * group size <= {MAX_S_TOTAL}, got "
+            f"{s_local} * {nranks} = {s_local * nranks}"
+        )
+    b, _, h, d = (int(x) for x in k.shape)
+    num_chunks = int(_load().fm4_overlap_num_chunks_per_segment(b, s_local, h, d, int(nranks)))
+    if num_chunks not in SUPPORTED_CHUNKS_PER_SEGMENT or nranks % num_chunks:
+        raise ValueError(
+            f"overlap backward picks {num_chunks} chunks per segment for K shape "
+            f"{tuple(k.shape)} and group size {nranks}; supported: "
+            f"{SUPPORTED_CHUNKS_PER_SEGMENT}, dividing the group size"
+        )
 
 
-def bootstrap_unique_id(rank, group=None, *, be=None, dist=None):
+def bootstrap_unique_id(rank, group, *, be, dist):
     """Generate and broadcast one NCCL UID for the current group generation.
 
     The id comes from the vendored bridge rather than from the framework, so
     overlap builds its own communicator and needs nothing from the framework
     beyond a byte broadcast.
+
+    Group contract: one active overlap group per process. Passing a different group
+    object builds a new communicator, and tearing the old one down is collective on the
+    old group, so every rank of the old group must switch at the same call; alternating
+    groups rebuilds every time. The cache holds the group object itself, so a destroyed
+    group's id() cannot be reused to alias a new group.
     """
     global _UID, _UID_KEY
-    if dist is None:
-        dist = get_dist(be.name if be is not None else "paddle")
-
     world_size = dist.world_size(group)
-    uid_key = (id(group), world_size) if group is not None else (None, world_size)
-    if _UID is not None and _UID_KEY == uid_key:
+    if _UID is not None and _UID_KEY[0] is group and _UID_KEY[1] == world_size:
         return _UID
 
     lib = _load()
@@ -228,28 +268,27 @@ def bootstrap_unique_id(rank, group=None, *, be=None, dist=None):
 
     src_global = dist.global_ranks(group)[0]
     _UID = dist.broadcast_bytes(buf, src_global, group=group, be=be)
-    _UID_KEY = uid_key
+    _UID_KEY = (group, world_size)
     return _UID
 
 
-def init_overlap(k, v, rank, nranks, uid_bytes, kv_shared=False):
-    """Create or reconfigure the C++ singleton from k/v shape + topology (only
-    k.shape is read; the local-KV copy into the SRBuffer happens in start_*_ag).
+def init_overlap(k, rank, nranks, uid_bytes, kv_shared=False):
+    """Create or reconfigure the C++ singleton from the K shape + topology (the local-KV
+    copy into the SRBuffer happens in start_*_ag).
     kv_shared: K and V alias one storage, so only K is transported."""
     global _LAYOUT
     lib = _load()
     b, s_local, h, d = (int(x) for x in k.shape)
+    # A failed init terminates inside the noexcept bridge; it never returns 0.
     generation = int(lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes,
                                           int(kv_shared)))
-    if generation == 0:
-        raise RuntimeError("fm4_overlap_init failed")
     # The generation moves on every rebuild, reconfigure (B/S/H/D) or kv_shared flip, so
     # an unchanged one guarantees every queried size and address is still current.
     if _LAYOUT is None or _LAYOUT.generation != generation:
         _LAYOUT = _query_layout(lib, generation, b, h, d)
 
 
-def ensure_initialized(k, v, group, kv_shared=False):
+def ensure_initialized(k, group, kv_shared=False):
     """Bootstrap the unique id once, then forward shape/topology to the C++ singleton
     every step. init_singleton_instance reconfigures (and reallocs the SRBuffer) only
     when they actually change, so unconditional forwarding is cheap and correct."""
@@ -258,8 +297,8 @@ def ensure_initialized(k, v, group, kv_shared=False):
     # A paddle Group exposes .rank / .world_size as attributes, a torch
     # ProcessGroup only through dist.get_rank(group); go through the adapter.
     rank = dist.rank(group)
-    uid = bootstrap_unique_id(rank, group=group, be=be, dist=dist)
-    init_overlap(k, v, rank, dist.world_size(group), uid, kv_shared=kv_shared)
+    uid = bootstrap_unique_id(rank, group, be=be, dist=dist)
+    init_overlap(k, rank, dist.world_size(group), uid, kv_shared=kv_shared)
 
 
 def _layout():
@@ -338,7 +377,9 @@ def _data_ptr(t):
 
 
 def symmetric_buffer_bytes():
-    """Total bytes of the communicator's registered symmetric (NCCL window) buffers."""
+    """Total bytes of the communicator's registered symmetric (NCCL window) buffers.
+    Raises RuntimeError before ensure_initialized (there is no communicator yet)."""
+    _layout()
     return int(_load().fm4_overlap_symmetric_buffer_bytes())
 
 
@@ -374,14 +415,13 @@ class ForwardAgArgs(NamedTuple):
 
 
 class BackwardAgArgs(NamedTuple):
-    """Split-AG metadata; retain ``mask_keepalive`` until all dependent launches are enqueued."""
+    """Split-AG metadata of one config generation."""
     num_segments: int
     segment_seqlen: int
     work_done_addr: int  # device int* base of the per-work done bitmap
     comm_rpb: int
     shape: tuple  # logical (B, S_segment, H, D) view of one segment
     segment_addrs: tuple  # per segment: (k_addr, v_addr, dk_send_addr, dv_send_addr)
-    mask_keepalive: object  # lifetime ownership only; not read by the CuTe kernel
 
     def kv_view(self, segment_idx):
         k_addr, v_addr, _, _ = self.segment_addrs[segment_idx]
@@ -401,7 +441,7 @@ class _CommLayout(NamedTuple):
     hierarchical: bool
     bhsd: bool
     fwd: ForwardAgArgs
-    bwd: BackwardAgArgs  # mask_keepalive is None; start_backward_ag fills it per call
+    bwd: BackwardAgArgs
 
 
 def _query_layout(lib, generation, b, h, d):
@@ -439,7 +479,6 @@ def _query_layout(lib, generation, b, h, d):
             )
             for i in range(num_segments)
         ),
-        mask_keepalive=None,
     )
     return _CommLayout(
         generation=generation,
@@ -456,26 +495,36 @@ def _query_layout(lib, generation, b, h, d):
 
 def _start_ag(k, v, startend_row_indices, compute_stream, fwd):
     """fm4_overlap_start_ag: chunk-skip mask, local K/V staging, the (segment-0) AG launch
-    and the stream coordinator. The check reads the mask in place (or a contiguous copy),
-    returned for keepalive."""
+    and the stream coordinator. The chunk-mask kernel reads the mask in place (or a
+    contiguous temporary) on compute_stream, so the stream-ordered caching allocator keeps
+    a temporary valid after this frame drops it."""
     mask, batch_stride, head_stride = _chunk_mask_pairs(startend_row_indices)
     _load().fm4_overlap_start_ag(
         _data_ptr(mask), int(mask.shape[1]), batch_stride, head_stride,
         _data_ptr(k), _data_ptr(v), int(compute_stream), 1 if fwd else 0,
     )
-    return mask
+
+
+def forward_ag_args():
+    """Forward SR view and frontier of the current config generation; launches nothing."""
+    return _layout().fwd
+
+
+def backward_ag_args():
+    """Split-AG metadata of the current config generation; launches nothing, so callers
+    validate, allocate and compile against it before booking the round."""
+    return _layout().bwd
 
 
 def start_forward_ag(k, v, startend_row_indices, compute_stream):
     """Launch forward sparse AG asynchronously for cumulative-frontier gating."""
     _start_ag(k, v, startend_row_indices, compute_stream, fwd=True)
-    return _layout().fwd
 
 
 def start_backward_ag(k, v, startend_row_indices, compute_stream):
-    """Prepare multi-stage backward AG/RS and launch split AG segment 0."""
-    mask = _start_ag(k, v, startend_row_indices, compute_stream, fwd=False)
-    return _layout().bwd._replace(mask_keepalive=mask)
+    """Book the backward AG/RS round and launch split AG segment 0. Every later segment
+    of the round (start_backward_segment / run_backward_rs) must follow on all ranks."""
+    _start_ag(k, v, startend_row_indices, compute_stream, fwd=False)
 
 
 def start_backward_segment(segment_idx, compute_stream):

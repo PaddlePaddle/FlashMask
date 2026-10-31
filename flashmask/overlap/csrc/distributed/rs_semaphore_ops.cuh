@@ -24,7 +24,6 @@ __global__ void FusedConsumerNotifyEmpty(
     target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
     if (target_rank == self_rank) return;
     gin::remote_store(semaphores + self_rank, int64_t(1), target_rank);
-    DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
 }
 
 // [local consumer (dk dv reducer and recv buffer)] sends out an empty
@@ -65,18 +64,14 @@ void consumer_wait_full(
     int num_producers,
     cudaStream_t comm_stream
 ) {
-    WARN_PRINT("Consumer wait full ...\n");
     RsWaitFullKernel<<<1, 1, 0, comm_stream>>>(rs_full_seg, rs_expected_seg, num_producers);
-    WARN_PRINT_SYNC(comm_stream, "Consumer wait full succeeded.\n");
 }
 
 __device__ void producer_wait_empty(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    WARN_PRINT("Producer block %d waits remote %d empty ...\n", blockIdx.x, target_pe);
     gin::wait_until(semaphores + target_pe, gin::Compare::NotEqual, 0, "rs_empty");
-    WARN_PRINT("Producer block %d waits remote %d empty succeeded.\n", blockIdx.x, target_pe);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +100,6 @@ __global__ void HierFusedConsumerNotifyEmpty(
     const int sender = hier::hier_sender_at_pos(logical_pos, self_rank, total_n_pes, gpus_per_node);
     if (sender == self_rank) return;  // local chunk, no notification needed
     gin::remote_store(semaphores + self_rank, int64_t(1), sender);
-    DEBUG_PRINT("HierConsumer %d notifies sender %d (logical_pos %d) empty\n", self_rank, sender, logical_pos);
 }
 
 /**

@@ -40,13 +40,6 @@ struct OverlapConfig {
     size_t cp_chunk_size() const {
         return static_cast<size_t>(S_local) * H * D;
     }
-
-    std::string to_string() const {
-        return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
-            + ", H=" + std::to_string(H)
-            + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
-            + ", use_bhsd=" + std::to_string(int(use_bhsd));
-    }
 };
 
 /**
@@ -55,8 +48,8 @@ struct OverlapConfig {
  * An RAII object managing CP-groups / comm stream / buffer lifetimes automatically
  *
  * Call the constructor of this communicator, and call `run_overlap_ag_kernel` before
- * the main attention kernel, make sure the lifetime of the instance outlast the main kernel
- * Then you should be able to get async remote get, costing only 4 SMs.
+ * the main attention kernel, make sure the lifetime of the instance outlast the main kernel.
+ * The comm kernels run on a separate stream with a fixed grid of comm CTAs.
  *
  * Dynamic reconfiguration: when B/H/D/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
@@ -197,8 +190,8 @@ public:
         return block_work_ids;
     }
 
-    // row_per_block used by comm kernel = num_warps * RDMA_ROW_PER_WARP.
-    // Returns 0 if per-work mode should not be used.
+    // row_per_block of the comm kernels = num_warps * RDMA_ROW_PER_WARP (always 512); the
+    // bwd gate waits on the work item holding a cluster tile's last row.
     int get_comm_rpb() const;
 
     int nranks() const {
@@ -215,9 +208,6 @@ public:
 
     int gpus_per_node() const {
         return _gpus_per_node;
-    }
-    int num_nodes() const {
-        return _num_nodes;
     }
     bool use_hierarchical() const {
         return _use_hierarchical;
@@ -403,23 +393,15 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     bool kv_shared = false
 );
 
-// get instance (mutable ref), make sure the instance is initialized, used in both fwd and bwd
+// The instance (mutable ref), used in both fwd and bwd; throws std::logic_error before
+// init_singleton_instance. It lives until static destruction at process exit; there is no
+// separate shutdown entry point.
 OverlapCommunicator<cutlass::bfloat16_t>& singleton();
-
-// check whether the singleton unique_ptr is nullptr
-bool is_singleton_null();
 
 // Bumped on every create, rebuild or reconfigure of the singleton, and whenever kv_shared
 // flips (it changes v_data / dv_send). Every value a getter returns (sizes, topology,
 // window addresses) stays fixed while the generation is unchanged. Never 0 once created.
 uint64_t config_generation();
-
-// Destroy the singleton for topology refresh.
-// After calling this, the next init_singleton_instance() will re-create from scratch.
-// IMPORTANT: communicator generation changes require a full destroy/rebuild when
-// rank/nranks remain the same. This function is intended for refreshing
-// transport-level resources (e.g., after node migration), not for changing topology.
-void destroy_singleton();
 
 }   // namespace comm
 

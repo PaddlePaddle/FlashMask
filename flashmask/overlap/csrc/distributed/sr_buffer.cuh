@@ -134,12 +134,6 @@ public:
     KVType* v_data() const noexcept { return _v_sr; }
     SemaphoreType* semaphores() const noexcept { return _semaphores; }
 
-    bool is_valid() const noexcept {
-        return _allocated && _k_sr != nullptr && _semaphores != nullptr;
-    }
-
-    size_t capacity() const noexcept { return _numel; }
-
 private:
     void reset() noexcept {
         _k_sr = nullptr;

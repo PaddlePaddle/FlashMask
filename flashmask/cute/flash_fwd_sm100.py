@@ -57,7 +57,7 @@ def _overlap_gate(
 ):
     """FM-4 overlap gate: spin until the comm side has gathered the KV rows of tile ``nblk``.
 
-    ``write_ptr`` is a per-batch row frontier (atomicMax, right-to-left traversal). A
+    ``write_ptr`` is one batch-major row frontier scalar (atomicMax, right-to-left). A
     negative ``reverse_row`` is the local chunk, written before the AG kernel and ordered
     by the stream coordinator plus the kernel boundary, so no wait and no fence. Every lane
     of the load warp calls this with warp-uniform arguments; ``tidx == 0`` spins, then all
@@ -746,7 +746,7 @@ class FlashAttentionForwardSm100:
         self.has_lt_end = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
         self.has_ut_start = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
         self.has_ut_end = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
-        # FM-4 overlap: K/V live in the NVSHMEM SRBuffer (no Paddle tensor / dlpack
+        # FM-4 overlap: K/V live in the NCCL-window SRBuffer (no Paddle tensor / dlpack
         # capsule), so they arrive as a raw addr + the gathered (B, S_total, H, D)
         # dims as RUNTIME Int32 scalars. Build the views HERE -- make_*_from_addr
         # needs this jit body's MLIR Context, and the Int32 dims give a dynamic

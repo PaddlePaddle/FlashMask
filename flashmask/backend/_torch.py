@@ -52,6 +52,12 @@ class TorchBackend(BackendBase):
     def cuda_stream(self):
         return torch.cuda.current_stream(self.device).cuda_stream
 
+    def is_stream_capturing(self):
+        if not torch.cuda.is_initialized():
+            return False  # nothing can be capturing before CUDA is initialized
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
     # -- introspection -------------------------------------------------------
 
     def strides(self, x):

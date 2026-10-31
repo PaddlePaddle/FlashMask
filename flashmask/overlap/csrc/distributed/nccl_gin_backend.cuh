@@ -11,8 +11,6 @@
 #include <memory>
 #include <vector>
 
-#if defined(FLASHMASK_GIN_DEVICE_API)
-
 #include <cuda/atomic>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -21,11 +19,7 @@
 #error "FlashMask overlap requires NCCL 2.30.5 or newer"
 #endif
 
-#endif  // FLASHMASK_GIN_DEVICE_API
-
 namespace flashmask::gin {
-
-#if defined(FLASHMASK_GIN_DEVICE_API)
 
 constexpr int kMaxRegions = 4;
 constexpr int kDefaultNumQPs = 17;
@@ -50,8 +44,6 @@ struct DeviceState {
     unsigned long long spin_timeout_ns;   // 0: no time-based trap (see SpinWatchdog)
 };
 
-#endif  // FLASHMASK_GIN_DEVICE_API
-
 enum class Compare {
     NotEqual,
     GreaterThan,
@@ -65,7 +57,6 @@ struct ContextDeleter {
 
 using ContextPtr = std::unique_ptr<Context, ContextDeleter>;
 
-std::vector<uint8_t> get_unique_id();
 ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks);
 int rank(const Context& context);
 int nranks(const Context& context);
@@ -90,8 +81,6 @@ void barrier(Context& context);
 uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained);
 // Sum of the requested sizes of every registered window.
 size_t window_bytes(const Context& context);
-
-#if defined(FLASHMASK_GIN_DEVICE_API)
 
 extern __device__ __constant__ DeviceState g_device_state;
 
@@ -372,7 +361,5 @@ static __device__ __noinline__ void signal_wait_exact(
         spin_trap(site, "overshoot", sig, want, got, 0);
     }
 }
-
-#endif  // FLASHMASK_GIN_DEVICE_API
 
 }  // namespace flashmask::gin

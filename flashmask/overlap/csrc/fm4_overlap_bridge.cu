@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The FlashMask Authors. All rights reserved.
 
 #include "overlap_comm.cuh"
+#include "cp_heuristic.cuh"
 #include "cutlass/bfloat16.h"
 
 #include <cstdint>
@@ -85,6 +86,14 @@ int fm4_overlap_get_unique_id(uint8_t* out) noexcept {
 
 size_t fm4_overlap_unique_id_size() noexcept {
     return sizeof(ncclUniqueId);
+}
+
+// Chunks per backward segment the communicator picks for this K shape (the host
+// heuristic alone; no communicator needed), so check_inputs can reject a shape the
+// split AG / RS kernels are not instantiated for before any communication.
+int fm4_overlap_num_chunks_per_segment(int b_kv, int s_kv, int h_kv, int d_kv,
+                                       int nranks) noexcept {
+    return flashmask::get_num_chunk_per_segment(b_kv, s_kv, h_kv, d_kv, nranks);
 }
 
 // Create, rebuild (new UID = new group) or reconfigure (new shape) the singleton.

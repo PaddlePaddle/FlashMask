@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The FlashMask Authors. All rights reserved.
 
 #include "nccl_gin_backend.cuh"
+#include "debug_logger.cuh"
 
 #include <dlfcn.h>
 
@@ -32,14 +33,6 @@ const char* loaded_nccl_path() {
         const ncclResult_t result = (call);                                                     \
         if (result != ncclSuccess) {                                                            \
             throw std::runtime_error(std::string("NCCL error: ") + ncclGetErrorString(result)); \
-        }                                                                                       \
-    } while (0)
-
-#define FM_CUDA_CHECK(call)                                                                    \
-    do {                                                                                        \
-        const cudaError_t result = (call);                                                      \
-        if (result != cudaSuccess) {                                                            \
-            throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(result)); \
         }                                                                                       \
     } while (0)
 
@@ -332,14 +325,6 @@ private:
     unsigned long long spin_timeout_ns_ = 0;
     std::vector<HostRegion> regions_;
 };
-
-std::vector<uint8_t> get_unique_id() {
-    ncclUniqueId id;
-    FM_NCCL_CHECK(ncclGetUniqueId(&id));
-    std::vector<uint8_t> result(sizeof(id));
-    std::memcpy(result.data(), &id, sizeof(id));
-    return result;
-}
 
 ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks) {
     ContextPtr context(new Context());

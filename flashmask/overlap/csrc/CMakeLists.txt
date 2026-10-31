@@ -100,10 +100,6 @@ add_library(fm4_overlap SHARED
     ${DIST_DIR}/nccl_gin_backend.cu
 )
 
-target_compile_definitions(fm4_overlap PRIVATE
-    FLASHMASK_GIN_DEVICE_API=1
-)
-
 target_compile_options(fm4_overlap PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-fPIC
     -Xcompiler=-O3

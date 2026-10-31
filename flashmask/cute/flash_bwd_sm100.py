@@ -808,7 +808,7 @@ class FlashAttentionBackwardSm100:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # FM-4 split-AG overlap: the segment K/V live in the NVSHMEM SRBuffer
+        # FM-4 split-AG overlap: the segment K/V live in the NCCL-window SRBuffer
         # (no Paddle tensor / dlpack capsule), so they arrive as a raw addr plus
         # the segment (B, S_segment, H, D) dims as RUNTIME Int32 scalars. Rebuild the
         # views HERE in this jit body's MLIR Context (make_*_from_addr requires it),

@@ -50,7 +50,7 @@ SepSRBuffer<KVType>::SepSRBuffer(
     // silently landing in the dK slab.
     _dv_data = kv_components == 2 ? _dk_data + chunks_per_seg * single_k_numel : nullptr;
     for (cudaEvent_t& event : _empty_states) {
-        cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        FM_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
     _semaphores = reinterpret_cast<SemaphoreType*>(_dk_data + (_num_send_slots + num_segments) * _buf_offset);
     _allocated = true;
@@ -94,13 +94,13 @@ void SepSRBuffer<KVType>::zero_recv_buf(int seg_idx, size_t single_k_numel, bool
 }
 
 template <typename KVType>
-void SepSRBuffer<KVType>::initialize_buffer(int self_rank) {
+void SepSRBuffer<KVType>::initialize_buffer() {
     // RS puts are sparse, so the reduce reads recv rows no producer wrote; every slot must
     // start at zero, and zero_recv_buf only recycles a slot after its first use.
     // all the GPU ops uses the default blocking stream, since this is only called during initialization (one-off)
     // recv slots and semaphores are contiguous: zero them all at once
     const size_t bytes = _num_segments * (sizeof(KVType) * _buf_offset + _semaphore_size * sizeof(SemaphoreType));
-    cudaMemset(k_recv(0), 0, bytes);
+    FM_CUDA_CHECK(cudaMemset(k_recv(0), 0, bytes));
 }
 
 template class SepSRBuffer<cutlass::bfloat16_t>;

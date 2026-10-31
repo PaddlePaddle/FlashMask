@@ -65,10 +65,6 @@ public:
         int kv_components = 2
     );
 
-    void team_bar() const {
-        gin::barrier(_context);
-    }
-
     void release();
     void release_for_realloc() { release(); }
 
@@ -84,7 +80,7 @@ public:
     }
 
     // Zero every recv slot; the sparse RS puts leave holes the reduce would otherwise read.
-    void initialize_buffer(int self_rank);
+    void initialize_buffer();
 
     // Orders `stream` after every read of send(seg)'s slot issued so far.
     void wait_buffer(int seg_idx, cudaStream_t stream) {

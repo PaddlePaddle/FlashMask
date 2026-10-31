@@ -222,7 +222,7 @@ def _flash_attn_fwd(
     # handled by a CTA *pair*, so it covers cta_group_size * q_stage * m_block_size rows.
     fwd_m_tile_rows = q_stage * m_block_size * fwd_cta_group_size
     # FM-4 overlap: when a CP `group` is given, K/V come in LOCAL (B, S_local, H, D)
-    # and the gathered KV lives in the NVSHMEM SRBuffer. Bootstrap+init the comm
+    # and the gathered KV lives in the NCCL-window SRBuffer. Bootstrap+init the comm
     # singleton once, run the sparse all-gather on the internal comm_stream, then
     # below swap the K/V cute tensors for SRBuffer-backed views with
     # seqlen_k = S_local*nranks. The SM100 load warp gates each K/V tile on the
@@ -251,7 +251,7 @@ def _flash_attn_fwd(
             and tuple(be.strides(k)) == tuple(be.strides(v))
             and _same_storage(k, v)
         )
-        overlap_runtime.ensure_initialized(k, v, group, kv_shared=overlap_kv_shared)
+        overlap_runtime.ensure_initialized(k, group, kv_shared=overlap_kv_shared)
         # Callers pass the mask in group-rank KV-chunk order; the chunk-skip mask and the
         # kernel both index the gathered K/V in this rank's SRBuffer order.
         startend_row_indices = overlap_runtime.sr_order_mask(startend_row_indices, fwd=True)
@@ -259,9 +259,10 @@ def _flash_attn_fwd(
         overlap_stream = overlap_runtime.current_stream_handle(be)
         # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
         # drives host-side validation and the runtime-dimension kernel arguments.
-        overlap_ag_args = overlap_runtime.start_forward_ag(
-            k, v, startend_row_indices, overlap_stream
-        )
+        # The forward round is one AG whose completion and consumer acks are all on the
+        # comm stream, so a Python exception after it leaves no round half-booked.
+        overlap_runtime.start_forward_ag(k, v, startend_row_indices, overlap_stream)
+        overlap_ag_args = overlap_runtime.forward_ag_args()
         overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
@@ -521,7 +522,7 @@ def _flash_attn_fwd(
         for t in (q, out if not is_split_kv else out_partial)
     ]
     if enable_overlap:
-        # K/V live in the NVSHMEM SRBuffer (gathered device memory), so there is no
+        # K/V live in the NCCL-window SRBuffer (gathered device memory), so there is no
         # dlpack capsule to wrap; the kernel builds the views from their addr instead.
         k_tensor = None
         v_tensor = None

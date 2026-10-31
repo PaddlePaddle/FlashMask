@@ -45,11 +45,6 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     const int num_segments = 4,
     const int gpus_per_node = 1         // hierarchical only
 ) {
-#ifdef FLASHMASK_DEBUG
-    if (threadIdx.x == 0) {
-       DEBUG_PRINT("Remote put starts, blockIdx: %d, self rank: %d, segment_idx: %d / %d\n", blockIdx.x, my_pe, segment_idx, num_segments);
-    }
-#endif  // FLASHMASK_DEBUG
     // segment has only a local chunk, nothing to remote-put. Return immediately.
     if constexpr (has_local_chunk && num_chunk == 1) {
         return;
@@ -99,8 +94,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         }
     };
 
-    // this lambda ensures correct visibility to the change of block_work_idx and
-    // the last CTA will correctly set the wptr to be INT_MAX to notify completion
+    // thread blockIdx.x claims the CTA's next work id from the dynamic scheduler and the
+    // __syncthreads publishes it to the whole CTA; unlike the AG, the put has no frontier.
     auto update_work_id_sync = [&]() {
         if (threadIdx.x == blockIdx.x) {
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
@@ -188,11 +183,6 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     if (threadIdx.x == 0 && gin::mesh_is_cross_node()) {
         gin::flush_ordered();
     }
-#ifdef FLASHMASK_DEBUG
-    if (threadIdx.x == 0) {
-       DEBUG_PRINT("Remote put quits, blockIdx: %d, self rank: %d, segment_idx: %d\n", blockIdx.x, my_pe, segment_idx);
-    }
-#endif  // FLASHMASK_DEBUG
 }
 
 }   // namespace flashmask

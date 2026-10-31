@@ -25,7 +25,6 @@ inline int get_num_chunk_per_segment(int b_kv, int local_seqlen_k, int h_kv, int
     // logarithm heuristic. Note(heqianyue): using 2 chunks per segement is actually faster for CP16
     int power = int(std::floor(std::log2(nranks) * 0.5));
     int num_chunks = std::pow(2, power);
-    DEBUG_PRINT("BWD RS-overlap chunk per segment: %d\n", num_chunks);
     return num_chunks;
 }
 
