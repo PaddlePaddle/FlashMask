@@ -954,13 +954,14 @@ def _flash_attn_bwd(
             return cutlass.Int64(int(addr) + 2 * element_offset)
 
     if is_bigd_bwd:
-        # The big-headdim accumulators are blocked as
+        # The big-headdim accumulators are blocked per head as
         #   [head_dim slice][row block][4-col group][row][4 cols]
         # so each slice is byte-identical to a head_dim=slice accumulator. The shared
-        # postprocess cannot swallow head_dim 576 in one go (it stages a whole
-        # tile x head_dim fp32 tile in SMEM and registers), so it runs once per slice,
-        # writing a last-dim slice of the output -- legal because the postprocess
-        # writes dQ/dK/dV with plain gmem copies rather than TMA.
+        # postprocess cannot swallow head_dim 576 in one go: it stages a whole
+        # tile x head_dim fp32 tile in SMEM and registers, and a full-width row block
+        # is not contiguous in this layout. So it runs at head_dim = slice, writing a
+        # last-dim slice of the output -- legal because the postprocess writes
+        # dQ/dK/dV with plain gmem copies rather than TMA.
         assert head_dim == head_dim_rounded and head_dim_v == head_dim_v_rounded, (
             "the big-headdim postprocess writes whole head_dim slices, so head_dim "
             f"must already be a multiple of 64 (got {head_dim} / {head_dim_v})"
@@ -973,31 +974,44 @@ def _flash_attn_bwd(
         bigd_scale = cutlass.Float32(1.0) if kv_shared else softmax_scale
 
         def _bigd_postprocess(
-            accum, out, scale, hd, hd_slice, block, seq_rounded,
-            tag, raw_addr=None, raw_storage_d=None,
+            accum, out, scale, hd, hd_slice, block, seq_rounded, tag, raw_addr=None,
         ):
-            # raw_addr routes the slice into the overlap send buffer instead of `out`,
-            # which then only carries the layout for the trace.
-            accum_slice_elems = seq_rounded * hd_slice
-            for j in range(hd // hd_slice):
-                accum_slice = _to_cute(
-                    accum[..., j * accum_slice_elems : (j + 1) * accum_slice_elems]
+            # ONE launch covers every slice: slice j of head h is head h * num_slices + j
+            # of a head_dim = hd_slice problem. The accumulator is [b][h][slice][...] and
+            # the output head_dim splits as [slice][hd_slice], so both reshapes are
+            # contiguous views and each CTA reads and writes exactly the bytes the
+            # matching CTA of a per-slice launch did, with the same compiled kernel.
+            # raw_addr routes the output into the overlap send buffer, whose contiguous
+            # (b, s, h, hd) layout splits the same way; `out` then only carries the
+            # layout for the trace.
+            num_slices = hd // hd_slice
+            batch, heads = accum.shape[0], accum.shape[1]
+            sliced_heads = heads * num_slices
+            accum_view = _to_cute(
+                accum.reshape([batch, sliced_heads, seq_rounded * hd_slice])
+            )
+            if raw_addr is None:
+                # The fold needs the head stride to equal hd; otherwise reshape would
+                # silently return a copy (torch keeps a permuted input's strides in
+                # empty_like) and the kernel would write into a temporary.
+                assert be.strides(out)[2] == hd, (
+                    f"big-headdim postprocess needs out head stride == {hd}, "
+                    f"got strides {tuple(be.strides(out))}"
                 )
-                if raw_addr is None:
-                    _postprocess_run(
-                        accum_slice,
-                        _to_cute(out[..., j * hd_slice : (j + 1) * hd_slice]),
-                        scale, hd_slice, block, 1, False, False, 1,
-                        tag,
-                    )
-                else:
-                    _postprocess_run(
-                        accum_slice, out,
-                        scale, hd_slice, block, 1, False, False, 1,
-                        tag,
-                        _raw_addr(raw_addr, j * hd_slice), raw_b, raw_s, raw_h,
-                        cutlass.Int32(hd_slice), raw_storage_d,
-                    )
+                _postprocess_run(
+                    accum_view,
+                    _to_cute(out.reshape([batch, out.shape[1], sliced_heads, hd_slice])),
+                    scale, hd_slice, block, 1, False, False, 1,
+                    tag,
+                )
+            else:
+                _postprocess_run(
+                    accum_view, out,
+                    scale, hd_slice, block, 1, False, False, 1,
+                    tag,
+                    _raw_addr(raw_addr), raw_b, raw_s, cutlass.Int32(sliced_heads),
+                    cutlass.Int32(hd_slice), cutlass.Int32(hd_slice),
+                )
 
     if enable_overlap:
         def _run_overlap_dkv_postprocess(dk_send_addr, dv_send_addr):
@@ -1006,7 +1020,7 @@ def _flash_attn_bwd(
                     dk_accum, dk_tensor, bigd_scale, head_dim_rounded, slice_d,
                     n_block_size, seqlen_k_rounded,
                     "ovl_bigd_dk",
-                    dk_send_addr, raw_storage_d_k,
+                    dk_send_addr,
                 )
                 # kv_shared merges dV into dK, and the comm layer then leaves the dV
                 # send buffer unread, so filling it with zeros is pure overhead.
@@ -1015,7 +1029,7 @@ def _flash_attn_bwd(
                         dv_accum, dv_tensor, cutlass.Float32(1.0), head_dim_v_rounded,
                         slice_dv, n_block_size, seqlen_k_rounded,
                         "ovl_bigd_dv",
-                        dv_send_addr, raw_storage_d_v,
+                        dv_send_addr,
                     )
             else:
                 _postprocess_run(
