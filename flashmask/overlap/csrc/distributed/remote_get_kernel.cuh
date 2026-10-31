@@ -434,7 +434,9 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // Non-hierarchical: same formula, overwrites the single segment region.
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S * row_stride;
-    const int64_t local_batch_stride = S_chunk * row_stride;
+    // remote_pe's local K/V (non-hierarchical): its SR base, chunk 0 of each batch row, when the
+    // gather is one segment; otherwise its (B, S_chunk) tail backup (bwd_local_kv_at_base).
+    const int64_t local_batch_stride = num_segments == 1 ? batch_stride : S_chunk * row_stride;
 
     extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_semaphores[kMaxCommRanks];

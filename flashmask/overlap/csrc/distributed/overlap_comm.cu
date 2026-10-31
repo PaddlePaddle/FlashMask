@@ -76,7 +76,8 @@ inline void check_comm_launch(const char* name) {
 // Host-side dispatch selects the compile-time S_chunk constant for GPU kernels.
 // Supported values: {4096, 8192, 16384, 32768, 65536, 131072}.
 // Chunks per backward segment come from get_num_chunk_per_segment (1, 2, 4 or 8); the
-// split AG/RS kernels handle num_chunks == 1 (segment 0 is then local-only).
+// split AG/RS kernels handle num_chunks == 1 (segment 0 is then local-only) and
+// num_chunks == nranks (one segment, which reduces its own recv slot).
 
 #define SChunkCase(MACRO_FUNC, _S_chunk, ...) \
     case _S_chunk: { MACRO_FUNC(_S_chunk, ##__VA_ARGS__); break; }
@@ -112,7 +113,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    S_local(s_kv),
    H(h_kv),
    D(d_kv),
-   num_chunks(get_num_chunk_per_segment(s_kv, nranks, h_kv)),
+   num_chunks(get_num_chunk_per_segment(b_kv, s_kv, h_kv, d_kv, nranks)),
    _kv_shared(kv_shared),
    _kv_alloc_v(!kv_shared),
    _sema_count(0),
@@ -277,10 +278,10 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     size_t batch_stride = _local_batch_stride * _total_n_pes;
     if (!fwd) {
         batch_stride = _local_batch_stride * num_chunks;
-        // Non-hierarchical BWD: save local KV at the SR tail so remote ranks can Phase-1 fetch it.
-        // Hierarchical BWD: local KV lives at segment-0 offset-0 (SR base) and is never overwritten,
-        // so no tail backup is needed.
-        if (!_use_hierarchical) {
+        // Multi-segment non-hierarchical BWD: later segments re-gather into the SR base, so save
+        // local KV at the SR tail for remote ranks to Phase-1 fetch. Otherwise (see
+        // bwd_local_kv_at_base) local KV at the SR base is never overwritten: no tail backup.
+        if (!bwd_local_kv_at_base()) {
             if (_config.use_bhsd) {
                 // BHSD: transpose local KV into the tail backup region as (B,H,S_local,D)
                 layout::transpose_copy_to_sr(
@@ -558,7 +559,8 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(int segment_idx
         cudaMemsetAsync(block_work_ids, 0, sizeof(int) * _bitmap_region_size, comm_stream);                   \
         /* Compute stage-advanced dst (k_sr) and base src (local_k) pointers. */                              \
         /* Hierarchical: SR buffer is num_segments sub-tensors; each stage uses its own region. */            \
-        /* Non-hierarchical: circular-reuse; k_sr stays at base, local_k at tail backup. */                   \
+        /* Non-hierarchical: circular-reuse; k_sr stays at base, local_k at tail backup, or at */             \
+        /* the base itself for a single segment (bwd_local_kv_at_base). */                                    \
         const size_t _stage_elems = (size_t)num_chunks * S_chunk * H * D;                                     \
         KVType* const _k_sr_ptr = _use_hierarchical                                                           \
             ? kv_buffer->k_data() + (size_t)segment_idx * B * _stage_elems                                    \
@@ -566,8 +568,8 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(int segment_idx
         KVType* const _v_sr_ptr = _kv_shared ? nullptr : (_use_hierarchical                                  \
             ? kv_buffer->v_data() + (size_t)segment_idx * B * _stage_elems                                    \
             : kv_buffer->v_data());                                                                           \
-        const KVType* const _local_k_ptr = _use_hierarchical ? kv_buffer->k_data() : local_k_data();          \
-        const KVType* const _local_v_ptr = _kv_shared ? nullptr : (_use_hierarchical                          \
+        const KVType* const _local_k_ptr = bwd_local_kv_at_base() ? kv_buffer->k_data() : local_k_data();    \
+        const KVType* const _local_v_ptr = _kv_shared ? nullptr : (bwd_local_kv_at_base()                     \
             ? kv_buffer->v_data() : local_v_data());                                                          \
         if (segment_idx) {                                                                                    \
             if (_use_hierarchical) {                                                                          \
@@ -712,18 +714,22 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         sig_buffer->rs_expected(segment_idx),
         segment_idx == 0 ? (num_chunks - 1) : num_chunks, aux_c_stream
     );
-    // ns >= 2 always (nc <= nranks / 2). recv(0), plus recv(1) when nc == 1, holds the
-    // fp32 running sum (see ReducedKdVKernel) from the segment-1 reduce to the last one,
-    // so those slots are recycled only after the last reduce; segment 0 reduces nothing.
+    // With ns >= 2, segment 0 reduces nothing: recv(0), plus recv(1) when nc == 1 (then
+    // ns == nranks), holds the fp32 running sum (see ReducedKdVKernel) from the segment-1
+    // reduce to the last one, so those slots are recycled only after the last reduce.
+    // A single segment (nc == nranks) reduces recv(0) in its one step.
     const int num_home_slots = num_chunks == 1 ? 2 : 1;
-    if (segment_idx) {
-        auto operand = [&](KVType* slot0, KVType* slot1, KVType* recv, KVType* out) {
-            return ReduceOperand{slot0, num_chunks == 1 ? slot1 : slot0 + _local_batch_stride, recv, out};
+    if (segment_idx || num_segments() == 1) {
+        auto operand = [&](auto recv_slot, KVType* out) {
+            KVType* const home = recv_slot(0);
+            return ReduceOperand{
+                home, num_chunks == 1 ? recv_slot(1) : home + _local_batch_stride,
+                recv_slot(segment_idx), out};
         };
         const ReduceOperand dk = operand(
-            dkv_buffer->k_recv(0), dkv_buffer->k_recv(1), dkv_buffer->k_recv(segment_idx), dk_accum);
+            [&](int seg) { return dkv_buffer->k_recv(seg); }, dk_accum);
         const ReduceOperand dv = _kv_shared ? ReduceOperand{} : operand(
-            dkv_buffer->v_recv(0), dkv_buffer->v_recv(1), dkv_buffer->v_recv(segment_idx), dv_accum);
+            [&](int seg) { return dkv_buffer->v_recv(seg); }, dv_accum);
         launch_dk_dv_reduce(
             dk, dv,
             B, S_local, H, D, num_chunks,
@@ -937,7 +943,8 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
             );
         }
     }
-    reserve_comm_kernel_smem(new_s_local, get_num_chunk_per_segment(new_s_local, _total_n_pes, new_h),
+    reserve_comm_kernel_smem(new_s_local,
+        get_num_chunk_per_segment(new_b, new_s_local, new_h, new_d, _total_n_pes),
         new_config.use_bhsd ? new_b * new_h : new_b, new_b);
 
     WARN_PRINT("[FlashMask Overlap] Reconfiguring: old=[%s], new=[%s]\n",
@@ -949,7 +956,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     H = new_h;
     D = new_d;
     _config.use_bhsd = new_config.use_bhsd;  // num_effective_batch() below must see the new layout
-    num_chunks = get_num_chunk_per_segment(S_local, _total_n_pes, H);
+    num_chunks = get_num_chunk_per_segment(B, S_local, H, D, _total_n_pes);
     _local_batch_stride = new_config.cp_chunk_size();
     _total_numel = new_config.sr_buffer_numel();
 
@@ -1012,9 +1019,9 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     const uint8_t* unique_id_ptr,
     bool kv_shared
 ) {
-    // Overlap gathers from peers; the bwd split AG/RS buffers assume num_segments >= 2.
-    // num_chunks=1 (CP2 or S_local >= 32768) is supported by the splitted kernels:
-    // segment 0's local-only chunk triggers early return, and segment 1 processes the single remote chunk.
+    // Overlap gathers from peers. The bwd split AG/RS runs nranks / num_chunks segments:
+    // num_chunks == 1 makes segment 0 local-only (its kernels return early), and
+    // num_chunks == nranks makes one segment that also reduces its own dK/dV.
     if (nranks < 2) {
         throw std::invalid_argument("[FlashMask Overlap] overlap requires nranks > 1, got: "
             + std::to_string(nranks));

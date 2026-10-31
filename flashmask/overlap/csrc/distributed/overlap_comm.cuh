@@ -253,8 +253,8 @@ public:
     cudaEvent_t local_moved;
     /**
      * dK/dV send/recv slots of the backward RS overlap; always allocated (nranks > 1).
-     * Since the fwd AG buffer is always bigger than bwd AG
-     * (due to the fact that bwd AG is splitted), fwd kv_buffer
+     * Since the fwd AG buffer is at least as big as the bwd AG
+     * (the bwd AG gathers one segment of it at a time), fwd kv_buffer
      * can be reused (carefully).
     */
     std::unique_ptr<SepSRBuffer<KVType>> dkv_buffer;
@@ -278,6 +278,11 @@ private:
     inline KVType* local_v_data() const {
         return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
+    // Backward: no segment re-gathers over the local KV at the SR base when hierarchical
+    // (each segment owns its region) or with a single segment, so peers fetch it there and
+    // no tail backup (local_k_data) is written. The split AG kernel takes the same branch
+    // on its num_segments == 1 argument.
+    bool bwd_local_kv_at_base() const { return _use_hierarchical || num_segments() == 1; }
 
     // Semaphore accessors for hierarchical dual-array protocol (putValue / LSA flags only;
     // the refcounts are VA signals in sig_buffer):
