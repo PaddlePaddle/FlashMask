@@ -214,15 +214,11 @@ class FlashAttentionBackwardPostprocess:
                     self.dtype, align=16,
                 )
             else:
+                s64, h64, sd64 = utils.int64_dims(raw_s, raw_h, raw_storage_d)
                 mdQ = utils.make_gmem_tensor_from_addr(
                     raw_output_addr,
                     (raw_b, raw_s, raw_h, raw_d),
-                    (
-                        raw_s * raw_h * raw_storage_d,
-                        raw_h * raw_storage_d,
-                        raw_storage_d,
-                        1,
-                    ),
+                    (s64 * h64 * sd64, h64 * sd64, sd64, 1),
                     self.dtype,
                     align=16,
                 )

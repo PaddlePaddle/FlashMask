@@ -125,7 +125,7 @@ FlashMask-4 将掩码信息用于上下文并行（CP）的计算分配与通信
 
 向 `flashmask_attention` 传入 CP `group`（world size > 1）即启用 Overlap。此时 key/value 为本地 `S_local` 分片，掩码的 key 维长度为 `S_local * group_size`，按 group 内 rank 顺序分块；库内部会转换为自身的通信顺序，调用方不要预先 roll。group 跨多个节点时自动启用分层（多机）通信。
 
-`FLASHMASK_SPIN_TIMEOUT_S`（默认 1800，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。
+`FLASHMASK_SPIN_TIMEOUT_S`（默认 1800，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。attention kernel 等待已收集 KV 的时间也受同一预算限制，超时后打印卡住的标志位并以 device-side assert 失败。
 
 <details>
 <summary>在 SM90（Hopper）上使用 Overlap</summary>

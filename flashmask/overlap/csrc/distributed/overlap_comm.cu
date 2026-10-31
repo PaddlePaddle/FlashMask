@@ -23,6 +23,54 @@ static constexpr int num_blocks = 32;   // comm CTAs per kernel; register budget
 static_assert(num_blocks == 32,
     "fwd frontier publish: lane j of every AG CTA reads block_work_idx[j], one slot per CTA");
 
+// Dynamic smem of the split AG / RS put kernels: one int chunk-mask entry per
+// num_warps * RDMA_ROW_PER_WARP-row work of a segment, staged at kernel start.
+inline size_t split_ag_smem_bytes(int effective_batch, int nc, int s_chunk) {
+    return effective_batch * sizeof(int) * nc * s_chunk / (num_warps * RDMA_ROW_PER_WARP);
+}
+inline size_t rs_put_smem_bytes(int b, int nc, int s_chunk) {
+    return b * sizeof(int) * s_chunk * nc / (num_warps * RDMA_ROW_PER_WARP);
+}
+
+// A kernel whose static + dynamic smem exceeds the default 48 KiB limit needs the
+// MaxDynamicSharedMemorySize opt-in, or its launch fails. The attribute is per kernel
+// and only raised, so each instantiation pays the call once per larger shape.
+inline void reserve_dynamic_smem(const void* kernel, size_t bytes, const char* name) {
+    cudaFuncAttributes attr;
+    cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("[FlashMask Overlap] cudaFuncGetAttributes(") + name
+            + ") failed: " + cudaGetErrorString(err));
+    }
+    if (bytes <= static_cast<size_t>(attr.maxDynamicSharedSizeBytes)) return;
+    int device = 0, optin = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (attr.sharedSizeBytes + bytes > static_cast<size_t>(optin)) {
+        throw std::invalid_argument(std::string("[FlashMask Overlap] ") + name + " needs "
+            + std::to_string(bytes) + " B of dynamic shared memory (its chunk mask: one int per "
+            + std::to_string(num_warps * RDMA_ROW_PER_WARP) + "-row work of a backward segment) plus "
+            + std::to_string(attr.sharedSizeBytes) + " B static, above the device's per-block opt-in "
+            "maximum of " + std::to_string(optin) + " B. Reduce the batch size, the KV heads "
+            "(BHSD layout) or S_local.");
+    }
+    err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("[FlashMask Overlap] cudaFuncSetAttribute(") + name
+            + ", " + std::to_string(bytes) + " B) failed: " + cudaGetErrorString(err));
+    }
+}
+
+// A failed launch never announces its CTAs, so the compute stream's coordinator wait
+// would spin until its watchdog. Report it at the launch instead.
+inline void check_comm_launch(const char* name) {
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("[FlashMask Overlap] launch of ") + name
+            + " failed: " + cudaGetErrorString(err));
+    }
+}
+
 // ====== S_local Static Dispatch ======
 // S_local (= S_chunk) must be a power of 2 and divisible by row_per_block (= num_warps * RDMA_ROW_PER_WARP = 512).
 // Host-side dispatch selects the compile-time S_chunk constant for GPU kernels.
@@ -87,6 +135,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     _use_hierarchical = hier::hier_is_effective(_total_n_pes, _gpus_per_node);
     // Set before any sizing: num_effective_batch() reads use_bhsd.
     _config = {b_kv, s_kv, h_kv, d_kv, nranks, OverlapConfig::bhsd_for(d_kv)};
+    reserve_comm_kernel_smem(S_local, num_chunks, num_effective_batch(), B);
 
     int least_priority, greatest_priority;
     cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
@@ -321,6 +370,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         fwd_write_ptr,                                                \
                         block_work_ids,                                               \
                         block_cnt_semaphore,                                          \
+                        fwd_exit_count,                                               \
                         stream_coordinator,                                           \
                         copy_chunk_mask,                                              \
                         _my_pe,                                                       \
@@ -332,7 +382,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                         _gpus_per_node,                                               \
                         _sema_inter_size,                                             \
                         effective_num_heads                                           \
-                    )
+                    );                                                                \
+    check_comm_launch("SparseLargeKVChunkRemoteGetKernel")
 
 #define SparseLargeChunkKernel(_S)                                                  \
     if constexpr ((_S) > S_chunk) {                                                 \
@@ -470,7 +521,8 @@ void OverlapCommunicator<KVType>::run_overlap_ag_kernel() {
                         _gpus_per_node,                                                         \
                         _sema_inter_size,                                                       \
                         effective_num_heads                                                     \
-                    )
+                    );                                                                          \
+    check_comm_launch("SparseLargeKVChunkSplittedRemoteGetKernel")
 
 #define NumChunkDispatchSplitted(MACRO_FUNC, num_chunk, _has_local, ...)  \
     switch (num_chunk) {                                                  \
@@ -497,7 +549,7 @@ void OverlapCommunicator<KVType>::run_overlap_splitted_ag_kernel(int segment_idx
 #define SplittedAgBody(_S_chunk)                                                                              \
     do {                                                                                                      \
         constexpr int S_chunk = _S_chunk;                                                                     \
-        const int mask_smem_bytes = effective_batch * sizeof(int) * num_chunks * S_chunk / (num_warps * RDMA_ROW_PER_WARP); \
+        const size_t mask_smem_bytes = split_ag_smem_bytes(effective_batch, num_chunks, S_chunk);             \
         /* Hierarchical: per-(effective_batch) Phase 1 counters */                                            \
         /* Non-hierarchical: no counters needed (release by post-AG kernel) */                                \
         if (_use_hierarchical) {                                                                              \
@@ -588,7 +640,8 @@ SparseLargeKVChunkRemotePutKernel<KVType, S_chunk, num_warps,                   
         sig_buffer->rs_full(seg_idx),                                               \
         num_segments(),                                                             \
         _gpus_per_node                                                              \
-    )
+    );                                                                              \
+    check_comm_launch("SparseLargeKVChunkRemotePutKernel")
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
@@ -617,7 +670,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
 #define RsKernelBody(_S_chunk)                                                                              \
     do {                                                                                                    \
         constexpr int S_chunk = _S_chunk;                                                                   \
-        const int dynamic_smem = B * sizeof(int) * S_chunk * num_chunks / (num_warps * RDMA_ROW_PER_WARP);  \
+        const size_t dynamic_smem = rs_put_smem_bytes(B, num_chunks, S_chunk);                              \
         if (segment_idx) {                                                                                  \
             if (_use_hierarchical) {                                                                        \
                 NumChunkDispatchSplitted(SegmentIdxPutKernelDispatch, num_chunks, false, true, segment_idx);\
@@ -708,6 +761,40 @@ void OverlapCommunicator<KVType>::notify_recv_empty(int segment_idx) {
     }
 }
 
+// Both segment variants (segment 0 with the local chunk, later segments) launch with the
+// same dynamic smem, so both get the opt-in. Runs at construction and on reconfiguration,
+// before the shape is committed, so an impossible shape fails here instead of at launch.
+template <typename KVType>
+void OverlapCommunicator<KVType>::reserve_comm_kernel_smem(
+    int s_local, int nc, int effective_batch, int b
+) const {
+#define ReserveSegmentKernelSmem(num_chunk, _has_local, _use_hier)                                  \
+    reserve_dynamic_smem(reinterpret_cast<const void*>(&SparseLargeKVChunkSplittedRemoteGetKernel<  \
+            KVType, S_chunk, num_warps, RDMA_ROW_PER_WARP, num_chunk, _has_local, _use_hier>),      \
+        ag_bytes, "SparseLargeKVChunkSplittedRemoteGetKernel");                                     \
+    reserve_dynamic_smem(reinterpret_cast<const void*>(&SparseLargeKVChunkRemotePutKernel<          \
+            KVType, S_chunk, num_warps, RDMA_ROW_PER_WARP, num_chunk, _has_local, _use_hier>),      \
+        rs_bytes, "SparseLargeKVChunkRemotePutKernel")
+
+#define ReserveSmemBody(_S_chunk)                                                                   \
+    do {                                                                                            \
+        constexpr int S_chunk = _S_chunk;                                                           \
+        const size_t ag_bytes = split_ag_smem_bytes(effective_batch, nc, S_chunk);                  \
+        const size_t rs_bytes = rs_put_smem_bytes(b, nc, S_chunk);                                  \
+        if (_use_hierarchical) {                                                                    \
+            NumChunkDispatchSplitted(ReserveSegmentKernelSmem, nc, true, true);                     \
+            NumChunkDispatchSplitted(ReserveSegmentKernelSmem, nc, false, true);                    \
+        } else {                                                                                    \
+            NumChunkDispatchSplitted(ReserveSegmentKernelSmem, nc, true, false);                    \
+            NumChunkDispatchSplitted(ReserveSegmentKernelSmem, nc, false, false);                   \
+        }                                                                                           \
+    } while (0)
+
+    SChunkDispatch(ReserveSmemBody, s_local);
+#undef ReserveSmemBody
+#undef ReserveSegmentKernelSmem
+}
+
 #undef SegmentIdxPutKernelDispatch
 #undef NumChunkDispatchSplitted
 
@@ -754,6 +841,7 @@ void OverlapCommunicator<KVType>::size_block_work_ids() {
     block_cnt_semaphore = copy_chunk_mask + _bwi_copy_capacity;
     fwd_write_ptr = block_cnt_semaphore + 1;
     stream_coordinator = block_cnt_semaphore + 2;
+    fwd_exit_count = block_cnt_semaphore + 3;
     rank_commit_counters = block_cnt_semaphore + 4;
     rank_empty_counters = rank_commit_counters + _total_n_pes;
     // comp stream waits until comm CTAs have set every bit of this
@@ -849,6 +937,8 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
             );
         }
     }
+    reserve_comm_kernel_smem(new_s_local, get_num_chunk_per_segment(new_s_local, _total_n_pes, new_h),
+        new_config.use_bhsd ? new_b * new_h : new_b, new_b);
 
     WARN_PRINT("[FlashMask Overlap] Reconfiguring: old=[%s], new=[%s]\n",
         _config.to_string().c_str(), new_config.to_string().c_str());
@@ -928,6 +1018,11 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     if (nranks < 2) {
         throw std::invalid_argument("[FlashMask Overlap] overlap requires nranks > 1, got: "
             + std::to_string(nranks));
+    }
+    // The AG kernels cache per-rank wait_full results in a kMaxCommRanks-entry smem array.
+    if (nranks > kMaxCommRanks) {
+        throw std::invalid_argument("[FlashMask Overlap] overlap supports at most "
+            + std::to_string(kMaxCommRanks) + " ranks, got: " + std::to_string(nranks));
     }
 
     // Validate S_local is in the supported dispatch set (applies to both first-time and reconfigure)

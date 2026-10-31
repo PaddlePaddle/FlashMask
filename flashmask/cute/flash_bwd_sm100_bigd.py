@@ -1350,6 +1350,7 @@ class FlashAttentionBackwardSm100BigD:
         overlap_k_addr=None,
         overlap_v_addr=None,
         overlap_work_done_addr=None,
+        overlap_spin_timeout_ns=None,
         overlap_segment_idx=None,
         overlap_dk_addr=None,
         overlap_dv_addr=None,
@@ -1393,6 +1394,9 @@ class FlashAttentionBackwardSm100BigD:
         assert overlap_dk_addr is None and overlap_dv_addr is None, (
             "dK / dV always leave this kernel through the fp32 accumulators, so the "
             "overlap send buffers are filled by the postprocess, not here"
+        )
+        assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
+            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
         )
         # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
         # capsule, so rebuild the views from the raw segment addresses. The dims must
@@ -1441,6 +1445,7 @@ class FlashAttentionBackwardSm100BigD:
             mdK_semaphore=mdK_semaphore,
             mdV_semaphore=mdV_semaphore,
             overlap_work_done_addr=overlap_work_done_addr,
+            overlap_spin_timeout_ns=overlap_spin_timeout_ns,
             overlap_segment_idx=overlap_segment_idx,
             overlap_comm_rpb=overlap_comm_rpb,
         )
@@ -1463,6 +1468,7 @@ class FlashAttentionBackwardSm100BigD:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[Int32] = None,
         overlap_comm_rpb: cutlass.Constexpr = None,
     ):
@@ -1594,6 +1600,7 @@ class FlashAttentionBackwardSm100BigD:
             self.sKt_layout,
             softmax_scale_log2,
             overlap_work_done_addr,
+            overlap_spin_timeout_ns,
             overlap_segment_idx,
             overlap_comm_rpb,
         ).launch(
@@ -1641,6 +1648,7 @@ class FlashAttentionBackwardSm100BigD:
         sKt_layout: cute.ComposedLayout,
         softmax_scale_log2: Float32,
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[Int32],
         overlap_comm_rpb: cutlass.Constexpr,
     ):
@@ -2145,6 +2153,7 @@ class FlashAttentionBackwardSm100BigD:
                         cute.AddressSpace.gmem,
                         assumed_align=4,
                     ),
+                    overlap_spin_timeout_ns,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,

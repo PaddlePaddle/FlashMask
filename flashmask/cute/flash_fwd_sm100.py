@@ -51,6 +51,7 @@ def _overlap_gate(
     s_total: Int32,
     batch_idx: Int32,
     write_ptr: cute.Pointer,
+    spin_timeout_ns: cutlass.Int64,
     n_block_size: cutlass.Constexpr[int],
     kv_chunk_size: cutlass.Constexpr[int],
 ):
@@ -67,7 +68,7 @@ def _overlap_gate(
     if reverse_row >= 0:
         if tidx == 0:
             target = batch_idx * (s_total - kv_chunk_size) + reverse_row
-            wait_write_ptr_ge(write_ptr, 0, Int32(target))
+            wait_write_ptr_ge(write_ptr, 0, Int32(target), spin_timeout_ns)
         # Carries lane 0's acquire to every lane of the load warp.
         cute.arch.sync_warp()
         # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
@@ -721,6 +722,7 @@ class FlashAttentionForwardSm100:
         overlap_s: Optional[cutlass.Int32] = None,
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_kv_chunk_size: cutlass.Constexpr = None,
         overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -791,11 +793,13 @@ class FlashAttentionForwardSm100:
                     mQ.element_type,
                     align=16,
                 )
+            assert overlap_spin_timeout_ns is not None
             overlap_info = OverlapInfo(
                 utils.make_gmem_tensor_from_addr(
                     overlap_write_ptr_addr, (1,), (1,), cutlass.Int32, align=4
                 ),
                 overlap_kv_chunk_size,
+                overlap_spin_timeout_ns,
             )
         else:
             overlap_info = None
@@ -2425,6 +2429,7 @@ class FlashAttentionForwardSm100:
                     s_total=seqlen.seqlen_k,
                     batch_idx=gate_batch_idx,
                     write_ptr=overlap_info.write_ptr.iterator,
+                    spin_timeout_ns=overlap_info.spin_timeout_ns,
                     n_block_size=self.n_block_size,
                     kv_chunk_size=overlap_info.kv_chunk_size,
                 )

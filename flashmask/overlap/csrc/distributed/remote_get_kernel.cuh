@@ -11,6 +11,10 @@
 
 namespace flashmask {
 
+// Largest world size the AG kernels support: each CTA caches one wait_full result per
+// rank in shared memory. init_singleton_instance rejects larger nranks.
+inline constexpr int kMaxCommRanks = 64;
+
 // Tells the compute stream that this comm CTA is resident (see
 // WaitAndResetStreamCoordKernel). Release: it also publishes everything stream-ordered
 // before this kernel, which reaches the compute kernel only through this edge.
@@ -162,6 +166,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const __restrict__ wptr,
     int* const __restrict__ block_work_idx,
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
+    int* const __restrict__ exit_count,               // CTAs past their last work; zeroed per launch
     int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
@@ -194,7 +199,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // so every offset built from it is 64-bit. Loop counters stay int.
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S * row_stride;
-    __shared__ int cached_semaphores[64];
+    __shared__ int cached_semaphores[kMaxCommRanks];
     __shared__ int next_work_id;
     // note that block_cnt_semaphore starts from 1. dyn-scheduling from the beginning.
 
@@ -208,12 +213,20 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // the lanes' acquires plus bar.warp.sync carry every CTA's data to the publishing
     // lane, whose release fetch_max pairs with the compute gate's acquire. A stale slot
     // is only ever smaller, so a stale read keeps wptr conservative.
+    // The min cannot guarantee the final INT_MAX: two CTAs finishing together may each
+    // read the other's slot before its INT_MAX store lands (store buffering; release
+    // and acquire do not forbid it), and nobody publishes after them. So every CTA also
+    // counts its exit with an acq_rel RMW. RMWs on one address are totally ordered, so
+    // exactly one CTA reads gridDim.x - 1; it is the last to exit and has acquired every
+    // other exit (all of them form one release sequence), so its INT_MAX is complete.
     auto update_wptr_and_work_id_sync = [&](int wid) {
         if (threadIdx.x < 32) {
+            bool exiting = false;                                       // owning lane only
             if (threadIdx.x == blockIdx.x) {
                 int next_wid = atomicAdd(block_cnt_semaphore, 1);       // fetch and check the next work ID
                 // if there is no more work to do: set the wid for the current block to be INT_MAX
-                wid = next_wid <= total_chunks ? wid : INT_MAX;
+                exiting = next_wid > total_chunks;
+                wid = exiting ? INT_MAX : wid;
                 next_work_id = next_wid;
                 cuda::atomic_ref<int, cuda::thread_scope_device>(block_work_idx[blockIdx.x])
                     .store(wid, cuda::memory_order_release);
@@ -224,9 +237,14 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             wid = __reduce_min_sync(0xffffffff, wid);
             __syncwarp();
             if (threadIdx.x == blockIdx.x) {
-                cuda::atomic_ref<int, cuda::thread_scope_device>(*wptr).fetch_max(
+                cuda::atomic_ref<int, cuda::thread_scope_device> frontier(*wptr);
+                frontier.fetch_max(
                     wid == INT_MAX ? INT_MAX : (wid * row_per_block),       // 256 or 512 * wid, or INT_MAX
                     cuda::memory_order_release);
+                if (exiting && cuda::atomic_ref<int, cuda::thread_scope_device>(*exit_count)
+                        .fetch_add(1, cuda::memory_order_acq_rel) == static_cast<int>(gridDim.x) - 1) {
+                    frontier.fetch_max(INT_MAX, cuda::memory_order_release);
+                }
             }
         }
         __syncthreads();
@@ -293,7 +311,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
-                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, false);
+                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node);
             src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
             // Circular-shift traversal, right to left
@@ -419,7 +437,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     const int64_t local_batch_stride = S_chunk * row_stride;
 
     extern __shared__ int smem_chunk_mask[];
-    __shared__ int cached_semaphores[64];
+    __shared__ int cached_semaphores[kMaxCommRanks];
     __shared__ int next_work_id;
 
     // Dual-array pointers (only meaningful when use_hierarchical)
@@ -523,14 +541,15 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             // seq_work_id * row_per_block == chunk_id * S_chunk + row_within_chunk * row_per_block
             seqlen_id = seq_work_id * row_per_block;
 
-            // src: from local_k (caller passes the stage-advanced SR buffer base for Phase 2 reads,
-            //   OR the actual local KV base for Phase 1; both use the same batch_stride).
-            //   Phase 1 (bwd): target_rank's local KV at position 0 in its SR buffer stage.
-            //   Phase 2 (bwd): target_rank's data at position j in src_pe's SR buffer stage 0,
-            //     where src_pe wrote Phase 1 data during segment 0 at seqlen j * S_chunk.
-            const int src_chunk_seqlen = hier::hier_src_chunk_offset(
-                info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, /*bwd=*/true);
-            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
+            // src: local_k is the unadvanced SR buffer base on every PE, laid out as
+            //   [segment][batch][chunk][row] (each segment region is num_batch * batch_stride).
+            //   Phase 1: target_rank's local KV, at segment 0, chunk 0.
+            //   Phase 2: src_pe fetched target_rank at its own position p during segment
+            //     p / num_chunks, so the data is in that segment's region at chunk p % num_chunks.
+            const hier::HierBwdChunk src = hier::hier_bwd_src_chunk(
+                info, num_chunks, total_n_pes, gpus_per_node);
+            src_addr = (src.segment * num_batch + batch_id) * batch_stride
+                + (src.chunk * S_chunk + row_within_chunk * row_per_block) * row_stride;
         } else {
             // Non-hierarchical: circular shift order
             seqlen_id = seq_work_id * row_per_block;

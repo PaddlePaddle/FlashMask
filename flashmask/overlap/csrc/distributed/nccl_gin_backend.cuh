@@ -274,6 +274,10 @@ __device__ __forceinline__ void remote_or(int64_t* ptr, int64_t value, int world
 // The budget (FLASHMASK_SPIN_TIMEOUT_S, read once at context init) must exceed the
 // longest legitimate rank skew, like a framework collective timeout, so a trip means
 // a lost signal or a peer that stopped participating.
+// Not covered: NIC error completions. They are handled inside NCCL's GIN wait, which
+// drops the status without an abort flag (the fetch counts as landed) or retries until
+// ncclCommAbort; DOCA only prints the error CQE. The compute-side gates
+// (flashmask/cute/barrier.py) apply the same budget.
 // ---------------------------------------------------------------------------
 
 constexpr unsigned kSpinCheckInterval = 1024;   // polls between timer reads

@@ -179,6 +179,11 @@ public:
         return fwd_write_ptr;
     }
 
+    // Forward AG exit counter (its last CTA publishes INT_MAX); reset with block_cnt_semaphore.
+    int* get_fwd_exit_count() const {
+        return fwd_exit_count;
+    }
+
     // Ensure previous AG kernel on comm_stream has completed before comp_stream
     // resets block_cnt_semaphore / fwd_write_ptr (reset_ag_counter) or overwrites
     // copy_chunk_mask (compute_chunk_mask), both of which that kernel still uses.
@@ -295,6 +300,9 @@ private:
     bool dkv_needs_recreate() const {
         return B * _local_batch_stride > _dkv_single_k_numel_capacity || num_chunks != _dkv_num_chunks;
     }
+    // Opt the split AG and RS put kernels of this shape into their dynamic shared memory;
+    // throws if the device cannot provide it. Call before the shape is committed.
+    void reserve_comm_kernel_smem(int s_local, int nc, int effective_batch, int b) const;
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
     // Zero recv(segment_idx) and tell its producers it is empty, on aux_c_stream.
@@ -350,7 +358,7 @@ private:
     //  ──────────────────────────────────────────   ──────────────────────────────
     //  [0 .. head_region)                          block_work_ids  (fwd: per-CTA work ids, bwd: work_done bitmap)
     //  [head_region .. +N)                         copy_chunk_mask  (N = _bwi_copy_capacity)
-    //  [+N .. +N+4)                                block_cnt_semaphore, fwd_write_ptr, stream_coordinator, pad
+    //  [+N .. +N+4)                                block_cnt_semaphore, fwd_write_ptr, stream_coordinator, fwd_exit_count
     //  [+N+4 .. +N+4+nranks)                       rank_commit_counters
     //  [.. + effective_batch * nranks)             rank_empty_counters
     //
@@ -359,6 +367,7 @@ private:
     int* copy_chunk_mask;
     int* fwd_write_ptr;
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
+    int* fwd_exit_count;            // forward AG CTAs past their last work
     int* rank_commit_counters;      // per-rank put completion counters for P2P RS commit
     int* rank_empty_counters;       // per-rank get completion counters for P2P AG empty notify
 

@@ -18,6 +18,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from flashmask.backend import Tensor, get_backend
 from flashmask.cute import utils
+from flashmask.cute.barrier import spin_timeout_ns_from_env
 from flashmask.cute.block_sparsity import (
     BlockSparseTensorsPaddle,
     normalize_block_sparse_tensors,
@@ -627,6 +628,7 @@ def _flash_attn_fwd(
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
         overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
+        overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
     else:
         overlap_k_addr = None
         overlap_v_addr = None
@@ -636,6 +638,7 @@ def _flash_attn_fwd(
         overlap_h = None
         overlap_d = None
         overlap_kv_chunk_size = None
+        overlap_spin_timeout_ns = None
         overlap_bhsd_layout = None
 
     compile_key = (
@@ -741,6 +744,7 @@ def _flash_attn_fwd(
                     "overlap_s": overlap_s,
                     "overlap_h": overlap_h,
                     "overlap_d": overlap_d,
+                    "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
                     "overlap_kv_chunk_size": overlap_kv_chunk_size,
                     "overlap_bhsd_layout": overlap_bhsd_layout,
                 }
@@ -781,6 +785,7 @@ def _flash_attn_fwd(
                 "overlap_s": overlap_s,
                 "overlap_h": overlap_h,
                 "overlap_d": overlap_d,
+                "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
             }
             if enable_overlap
             else {}

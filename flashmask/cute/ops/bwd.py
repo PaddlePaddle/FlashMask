@@ -17,6 +17,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from flashmask.backend import Tensor, get_backend
+from flashmask.cute.barrier import spin_timeout_ns_from_env
 from flashmask.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flashmask.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flashmask.cute.flash_bwd_sink import FlashAttentionBackwardDsink
@@ -509,6 +510,7 @@ def _flash_attn_bwd(
         overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
         overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
         overlap_work_done_addr = cutlass.Int64(overlap_ag_args.work_done_addr)
+        overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
         _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)
@@ -532,6 +534,7 @@ def _flash_attn_bwd(
         overlap_k_addr = None
         overlap_v_addr = None
         overlap_work_done_addr = None
+        overlap_spin_timeout_ns = None
         overlap_dk_addr = None
         overlap_dv_addr = None
         overlap_b = None
@@ -746,6 +749,7 @@ def _flash_attn_bwd(
                 overlap_k_addr=overlap_k_addr,
                 overlap_v_addr=overlap_v_addr,
                 overlap_work_done_addr=overlap_work_done_addr,
+                overlap_spin_timeout_ns=overlap_spin_timeout_ns,
                 overlap_segment_idx=overlap_segment_idx,
                 overlap_dk_addr=overlap_dk_addr,
                 overlap_dv_addr=overlap_dv_addr,
@@ -802,6 +806,7 @@ def _flash_attn_bwd(
                 overlap_k_addr=segment_k_addr,
                 overlap_v_addr=segment_v_addr,
                 overlap_work_done_addr=overlap_work_done_addr,
+                overlap_spin_timeout_ns=overlap_spin_timeout_ns,
                 overlap_segment_idx=(
                     None if segment_idx is None else cutlass.Int32(segment_idx)
                 ),

@@ -48,6 +48,7 @@ def _overlap_gate_bwd(
     seqlen_k: Int32,
     batch_idx: Int32,
     work_done: cute.Pointer,
+    spin_timeout_ns: cutlass.Int64,
     comm_rpb: cutlass.Constexpr[int],
     cta_group_size: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
@@ -62,7 +63,7 @@ def _overlap_gate_bwd(
         right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
         work_per_batch = seqlen_k // comm_rpb
         work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
-        wait_flag_eq(work_done, Int32(work_id), Int32(1))
+        wait_flag_eq(work_done, Int32(work_id), Int32(1), spin_timeout_ns)
     # Carries lane 0's acquire to every lane of the load warp.
     cute.arch.sync_warp()
     # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
@@ -794,6 +795,7 @@ class FlashAttentionBackwardSm100:
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[cutlass.Int32] = None,
         overlap_dk_addr: Optional[cutlass.Int64] = None,
         overlap_dv_addr: Optional[cutlass.Int64] = None,
@@ -815,6 +817,9 @@ class FlashAttentionBackwardSm100:
         # This mirrors the forward SRBuffer view construction. Readiness is gated
         # per communication work item in the load warp below.
         self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
+        assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
+            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
+        )
         if const_expr(overlap_k_addr is not None):
             if const_expr(overlap_bhsd_layout):
                 mK = utils.make_bhsd_storage_bshd_from_addr(
@@ -1378,6 +1383,7 @@ class FlashAttentionBackwardSm100:
             tma_atom_dK,
             flashmask_info,
             overlap_work_done_addr,
+            overlap_spin_timeout_ns,
             overlap_segment_idx,
             overlap_comm_rpb,
             self.sQ_layout,
@@ -1447,6 +1453,7 @@ class FlashAttentionBackwardSm100:
         tma_atom_dK: Optional[cute.CopyAtom],
         flashmask_info: Optional[FlashMaskInfo],
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
@@ -1908,6 +1915,7 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 flashmask_info,
                 overlap_work_done_addr,
+                overlap_spin_timeout_ns,
                 overlap_segment_idx,
                 overlap_comm_rpb,
                 sStartEndRowIndices,
@@ -2174,6 +2182,7 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         flashmask_info: FlashMaskInfo,
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
@@ -2245,6 +2254,7 @@ class FlashAttentionBackwardSm100:
                     seqlen.seqlen_k,
                     gate_batch_idx,
                     work_done,
+                    overlap_spin_timeout_ns,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,
