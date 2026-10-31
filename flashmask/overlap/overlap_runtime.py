@@ -10,6 +10,9 @@ import importlib.util
 import os
 from typing import NamedTuple
 
+from ..backend import get_backend
+from ..distributed import get_dist
+
 _UID_NBYTES = None
 _LIB = None
 
@@ -158,6 +161,50 @@ def is_available():
         return False
 
 
+# Mirrors init_singleton_instance (overlap_comm.cu) and kMaxCommRanks
+# (remote_get_kernel.cuh); repeated only so check_inputs can fail before any comm.
+SUPPORTED_S_LOCAL = (4096, 8192, 16384, 32768, 65536, 131072)
+MAX_RANKS = 64
+
+
+def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
+    """Reject an unsupported overlap call before ensure_initialized.
+
+    Runs ahead of the unique-id broadcast and the communicator setup, so a bad call
+    raises on every rank instead of after peers have entered a collective.
+    """
+    if startend_row_indices is None:
+        raise ValueError("overlap requires startend_row_indices (group-rank KV-chunk order)")
+    if causal:
+        # Under causal, column 1 holds lt_end, but the comm-side chunk mask reads it as ut_end.
+        raise ValueError(
+            "overlap does not support causal=True; express causality in a non-causal "
+            "2-column [lt_start, ut_end] mask"
+        )
+    num_vecs = startend_row_indices.shape[-1]
+    if num_vecs != 2:
+        # lt_end / ut_start are not plumbed through the bridge: the skip bitmap would
+        # over-report fully-masked chunks and silently drop their contribution.
+        raise ValueError(
+            f"overlap requires a 2-column [lt_start, ut_end] mask, got {num_vecs} columns"
+        )
+    if not (q.dtype == k.dtype == v.dtype == be.bfloat16):
+        raise ValueError(
+            f"overlap requires bfloat16 q/k/v (the SRBuffer is bf16), got "
+            f"{q.dtype}/{k.dtype}/{v.dtype}"
+        )
+    if v.shape[-1] != q.shape[-1]:
+        raise ValueError(
+            "overlap requires head_dim_v == head_dim (the SRBuffer V view is built from "
+            f"K's head_dim), got head_dim={q.shape[-1]}, head_dim_v={v.shape[-1]}"
+        )
+    s_local = k.shape[1]
+    if s_local not in SUPPORTED_S_LOCAL:
+        raise ValueError(f"overlap requires S_local in {SUPPORTED_S_LOCAL}, got {s_local}")
+    if nranks > MAX_RANKS:
+        raise ValueError(f"overlap supports at most {MAX_RANKS} ranks per group, got {nranks}")
+
+
 def bootstrap_unique_id(rank, group=None, *, be=None, dist=None):
     """Generate and broadcast one NCCL UID for the current group generation.
 
@@ -167,8 +214,6 @@ def bootstrap_unique_id(rank, group=None, *, be=None, dist=None):
     """
     global _UID, _UID_KEY
     if dist is None:
-        from flashmask.distributed import get_dist
-
         dist = get_dist(be.name if be is not None else "paddle")
 
     world_size = dist.world_size(group)
@@ -208,9 +253,6 @@ def ensure_initialized(k, v, group, kv_shared=False):
     """Bootstrap the unique id once, then forward shape/topology to the C++ singleton
     every step. init_singleton_instance reconfigures (and reallocs the SRBuffer) only
     when they actually change, so unconditional forwarding is cheap and correct."""
-    from flashmask.backend import get_backend
-    from flashmask.distributed import get_dist
-
     be = get_backend(k)
     dist = get_dist(be.name)
     # A paddle Group exposes .rank / .world_size as attributes, a torch
@@ -283,8 +325,6 @@ def sr_order_mask(mask, fwd):
     )
     if order == tuple(range(nranks)):
         return mask
-    from flashmask.backend import get_backend
-
     be = get_backend(mask)
     if not layout.hierarchical:
         # SR position j holds chunk (order[0] + j) % nranks: one roll by order[0] chunks.
@@ -305,13 +345,8 @@ def symmetric_buffer_bytes():
 def _chunk_mask_pairs(startend_row_indices):
     """The (B, H_mask, S_total, 2) [lt_start, ut_end] mask as the chunk-mask kernel reads
     it in place: contiguous, 16-byte aligned (S_total is even, so the batch / head strides
-    are multiples of 4 int32). Returns (mask, batch_stride, head_stride)."""
-    # 4-vec is rejected: lt_end / ut_start are not plumbed through the bridge, so the skip
-    # bitmap would over-report fully-masked chunks and silently drop their contribution.
-    num_vecs = startend_row_indices.shape[-1]
-    assert num_vecs == 2, f"overlap mask must be 2-vec (non-causal), got {num_vecs}"
-    from flashmask.backend import get_backend
-
+    are multiples of 4 int32). Returns (mask, batch_stride, head_stride). The 2-column
+    shape is checked up front by check_inputs."""
     be = get_backend(startend_row_indices)
     mask = be.contiguous(startend_row_indices)
     assert be.data_ptr(mask) % 16 == 0, "overlap mask must be 16-byte aligned"

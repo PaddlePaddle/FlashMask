@@ -16,28 +16,28 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from flashmask.cute import copy_utils
-from flashmask.cute import layout_utils
-from flashmask.cute import hopper_helpers as sm90_utils
-from flashmask.cute.hopper_helpers import gemm_zero_init, gemm_w_idx
+from . import copy_utils
+from . import layout_utils
+from . import hopper_helpers as sm90_utils
+from .hopper_helpers import gemm_zero_init, gemm_w_idx
 
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-from flashmask.cute import utils
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute import pipeline
-from flashmask.cute.tile_scheduler import (
+from .cute_dsl_utils import assume_tensor_aligned
+from . import utils
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from . import pipeline
+from .tile_scheduler import (
     ParamsBase,
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,
 )
-from flashmask.cute import barrier
-from flashmask.cute.named_barrier import NamedBarrierBwd
-from flashmask.cute.block_sparsity import BlockSparseTensors
-from flashmask.cute.flashmask_utils import FlashMaskInfo
-from flashmask.cute.block_sparse_utils import (
+from . import barrier
+from .named_barrier import NamedBarrierBwd
+from .block_sparsity import BlockSparseTensors
+from .flashmask_utils import FlashMaskInfo
+from .block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
     consume_block_sparse_mma_bwd_sm90,

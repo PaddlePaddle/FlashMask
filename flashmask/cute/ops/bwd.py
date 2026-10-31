@@ -16,18 +16,18 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashmask.backend import Tensor, get_backend
-from flashmask.cute.barrier import spin_timeout_ns_from_env
-from flashmask.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flashmask.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flashmask.cute.flash_bwd_sink import FlashAttentionBackwardDsink
-from flashmask.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flashmask.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flashmask.cute.flash_bwd_sm100_bigd import (
+from ...backend import Tensor, get_backend
+from ..barrier import spin_timeout_ns_from_env
+from ..flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from ..flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from ..flash_bwd_sink import FlashAttentionBackwardDsink
+from ..flash_bwd_sm90 import FlashAttentionBackwardSm90
+from ..flash_bwd_sm100 import FlashAttentionBackwardSm100
+from ..flash_bwd_sm100_bigd import (
     FlashAttentionBackwardSm100BigD,
     bigd_host_config,
 )
-from flashmask.cute.flashmask_utils import (
+from ..flashmask_utils import (
     FlashMaskInfoPaddle,
     prepare_block_maxmin,
     to_cute_flashmask_info,
@@ -43,7 +43,7 @@ from ._common import (
 )
 
 try:
-    from flashmask.utils import accum_zero_axis1_kv
+    from ...utils import accum_zero_axis1_kv
 except ImportError:
     accum_zero_axis1_kv = None
 
@@ -172,25 +172,18 @@ def _flash_attn_bwd(
     # on the producer's per-work completion bitmap.
     # A paddle Group exposes .world_size, a torch ProcessGroup does not;
     # ask the collective adapter instead of duck-typing the handle.
-    enable_overlap = group is not None and _dist_world_size(be, group) > 1
+    overlap_nranks = _dist_world_size(be, group) if group is not None else 1
+    enable_overlap = overlap_nranks > 1
     if enable_overlap:
         if compute_capability != 10:
             raise NotImplementedError("FM-4 overlap bwd is only supported on SM100")
         overlap_runtime = _get_overlap_runtime()
-        assert flashmask_info is not None, (
-            "overlap bwd requires flashmask_info (group-rank KV-chunk order)"
-        )
         assert kv_postprocess_start is None and kv_postprocess_end is None, (
             "overlap bwd owns the KV segment postprocess range"
         )
-        assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
-        assert head_dim_v == head_dim, (
-            "the SRBuffer is a single K/V pair of equal-width slabs, so the V view is "
-            "built from K's head_dim"
-        )
-        assert not causal, "overlap bwd does not support causal yet"
         if isinstance(flashmask_info, FlashMaskInfoPaddle):
             flashmask_info = flashmask_info.startend_row_indices
+        overlap_runtime.check_inputs(q, k, v, flashmask_info, causal, overlap_nranks, be)
         overlap_runtime.ensure_initialized(k, v, group, kv_shared=kv_shared)
         # Permute before the block max/min below: the chunk-skip mask and the kernel
         # both index the gathered K/V in this rank's SRBuffer order.

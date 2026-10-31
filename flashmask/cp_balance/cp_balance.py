@@ -4,8 +4,8 @@
 import heapq
 import numpy as np
 from .cp_balance_cuda_kernels import scanMaxMinChunkedKernel, reduce_workload, indices_to_chunks_cuda, indices_rerank_cuda, cp_balance_ipo_solve
-from flashmask.backend import Tensor, get_backend
-from flashmask.distributed import get_dist
+from ..backend import Tensor, get_backend
+from ..distributed import get_dist
 from typing import List, Tuple, Dict, Optional
 
 def get_q_workload(

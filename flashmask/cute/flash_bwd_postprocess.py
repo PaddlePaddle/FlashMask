@@ -15,16 +15,16 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
-from flashmask.cute import copy_utils
-from flashmask.cute import layout_utils
-from flashmask.cute import hopper_helpers as sm90_utils
+from . import copy_utils
+from . import layout_utils
+from . import hopper_helpers as sm90_utils
 
-from flashmask.cute import utils
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-from flashmask.cute import ampere_helpers as sm80_utils
-from flashmask.cute.seqlen_info import SeqlenInfoQK
+from . import utils
+from .cute_dsl_utils import assume_tensor_aligned
+from . import ampere_helpers as sm80_utils
+from .seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from flashmask.cute.tile_scheduler import (
+from .tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     TileSchedulerArguments,

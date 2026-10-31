@@ -15,33 +15,33 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-import flashmask.cute.utils as utils
-from flashmask.cute import copy_utils
-from flashmask.cute.barrier import wait_write_ptr_ge
-import flashmask.cute.pipeline as pipeline
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.softmax import SoftmaxSm100
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute.block_sparsity import BlockSparseTensors
-from flashmask.cute.block_sparse_utils import (
+from . import utils
+from . import copy_utils
+from .barrier import wait_write_ptr_ge
+from . import pipeline
+from .mask import AttentionMask
+from .softmax import SoftmaxSm100
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flashmask.cute.pack_gqa import PackGQA
-from flashmask.cute import mma_sm100_desc as sm100_desc
-from flashmask.cute import blackwell_helpers as sm100_utils
+from .pack_gqa import PackGQA
+from . import mma_sm100_desc as sm100_desc
+from . import blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
-from flashmask.cute.tile_scheduler import (
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     ParamsBase,
 )
-from flashmask.cute.flashmask_utils import FlashMaskInfo, OverlapInfo
+from .flashmask_utils import FlashMaskInfo, OverlapInfo
 
 
 @cute.jit

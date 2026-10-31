@@ -15,9 +15,9 @@ from typing import Tuple
 
 import paddle
 
-from flashmask.cute.flashmask_utils import FlashMaskInfoPaddle
-from flashmask.cute.ops.bwd import _flash_attn_bwd
-from flashmask.cute.ops.fwd import _flash_attn_fwd
+from ...cute.flashmask_utils import FlashMaskInfoPaddle
+from ...cute.ops.bwd import _flash_attn_bwd
+from ...cute.ops.fwd import _flash_attn_fwd
 
 __all__ = ["FlashMaskFunc"]
 

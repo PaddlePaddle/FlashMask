@@ -125,6 +125,14 @@ FlashMask-4 将掩码信息用于上下文并行（CP）的计算分配与通信
 
 向 `flashmask_attention` 传入 CP `group`（world size > 1）即启用 Overlap。此时 key/value 为本地 `S_local` 分片，掩码的 key 维长度为 `S_local * group_size`，按 group 内 rank 顺序分块；库内部会转换为自身的通信顺序，调用方不要预先 roll。group 跨多个节点时自动启用分层（多机）通信。
 
+Overlap 仅支持以下输入，其他输入会在任何通信开始前抛出 `ValueError`：
+
+- `S_local` ∈ {4096, 8192, 16384, 32768, 65536, 131072}；
+- 每个 CP group 最多 64 个 rank；
+- `head_dim_v == head_dim`（因此不支持 192/128、576/512 等 MLA 形状）；
+- Q/K/V 为 bf16；
+- `causal=False`，掩码为 2 列 `[lt_start, ut_end]`（因果性通过掩码表达）。
+
 `FLASHMASK_SPIN_TIMEOUT_S`（默认 1800，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。attention kernel 等待已收集 KV 的时间也受同一预算限制，超时后打印卡住的标志位并以 device-side assert 失败。
 
 <details>
@@ -231,7 +239,11 @@ FlashAttention-4 `mask_mod` 在 SM100 上不支持 `d=256, dv=256`，因此这�
 - **深度学习框架**：已启用 CUDA 的 PaddlePaddle 或 PyTorch（二者均不会被自动安装）。
 - **构建工具**：`setuptools>=64`。
 - **自动安装的依赖**：`nvidia-cutlass==4.2.0.0`、`nvidia-cutlass-dsl[cu13]==4.5.2`、`apache-tvm-ffi>=0.1.5,<0.2.0`。它们由 `setup.py` 在构建时安装，因此安装命令需要加 `--no-build-isolation`。
-- **Overlap（`ovl`）额外要求**：NCCL >= 2.30.5（如 `nvidia-nccl-cu13`，或通过 `NCCL_HOME` 指定）。缺少 NCCL 时会跳过该组件，核心内核不受影响。
+- **Overlap（`ovl`）额外要求**：
+  - NCCL >= 2.30.5（如 `nvidia-nccl-cu13`，或通过 `NCCL_HOME` 指定）以及 cutlass C++ 头文件（`nvidia-cutlass`，或 `FM4_OVERLAP_CUTLASS_INC`）。
+  - `FLASHMASK_BUILD` 显式包含 `ovl`（如 `ovl`、`utils+ovl`）时，NCCL 缺失或版本过低、cutlass 头文件缺失都会使构建失败并给出原因；使用 `all` 时只告警并跳过该组件，核心内核不受影响。
+  - 运行时 NCCL 版本必须与构建时一致，否则通信器初始化失败。该组件加载当前解释器的 `nvidia-nccl` wheel（或 `FLASHMASK_NCCL_LIB`），而进程中最先加载的 `libnccl.so.2` 生效，因此框架自带的 NCCL 也必须是同一版本。请在同一镜像中构建和运行。
+  - 目标架构由 `FM4_OVERLAP_CUDA_ARCH` 指定，可为单个架构或 `,`/`;` 分隔的列表（如 `100a;103a`，同一个 `.so` 内为每个架构生成 SASS）。默认取本机 GPU，无 GPU 时为 `90a`。`sm_100a` 与 `sm_103a` 的二进制不通用，无 GPU 的构建机必须设置该变量。
 
 ### 快速安装
 

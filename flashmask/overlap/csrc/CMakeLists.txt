@@ -22,7 +22,7 @@ find_package(CUDAToolkit REQUIRED)
 # file) or supplied by the caller. This keeps the tree relocatable across the
 # A100 dev box and the H100/B200 build boxes.
 # ---------------------------------------------------------------------------
-set(FM4_OVERLAP_CUDA_ARCH "90a" CACHE STRING "target sm arch, e.g. 90a or 100a")
+set(FM4_OVERLAP_CUDA_ARCH "90a" CACHE STRING "target sm arch or list, e.g. 100a or 100a;103a")
 set(NCCL_INSTALL_DIR "" CACHE PATH "NCCL install dir (include/ + lib/)")
 set(FM4_OVERLAP_CUTLASS_INC "" CACHE PATH "cutlass include dir (must contain cutlass/bfloat16.h)")
 
@@ -49,9 +49,17 @@ if(NOT FM4_OVERLAP_CUTLASS_INC)
     message(FATAL_ERROR "FM4_OVERLAP_CUTLASS_INC is required (dir containing cutlass/bfloat16.h).")
 endif()
 
-# Derive compute_ capability: gencode 'compute_' must drop the trailing 'a'
+# One SASS per listed arch: sm_100a and sm_103a binaries are not interchangeable,
+# so a .so for both needs both. setup.py passes a ';' list; ',' is accepted too.
+# The gencode 'compute_' must drop the trailing 'a'
 # (compute_90a is illegal; the correct pair is arch=compute_90,code=sm_90a).
-string(REGEX REPLACE "a$" "" FM4_OVERLAP_CUDA_ARCH_NUM "${FM4_OVERLAP_CUDA_ARCH}")
+string(REPLACE "," ";" FM4_OVERLAP_CUDA_ARCH "${FM4_OVERLAP_CUDA_ARCH}")
+set(FM4_OVERLAP_GENCODE "")
+foreach(_arch IN LISTS FM4_OVERLAP_CUDA_ARCH)
+    string(REGEX REPLACE "a$" "" _arch_num "${_arch}")
+    # One token per arch: CMake de-duplicates repeated options such as a bare -gencode.
+    list(APPEND FM4_OVERLAP_GENCODE "-gencode=arch=compute_${_arch_num},code=sm_${_arch}")
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Source locations (relative to this CMakeLists.txt).
@@ -101,7 +109,7 @@ target_compile_options(fm4_overlap PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-O3
     -std=c++17
     --use_fast_math
-    -gencode arch=compute_${FM4_OVERLAP_CUDA_ARCH_NUM},code=sm_${FM4_OVERLAP_CUDA_ARCH}
+    ${FM4_OVERLAP_GENCODE}
     -lineinfo
     -DNDEBUG
     --expt-relaxed-constexpr

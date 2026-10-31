@@ -9,7 +9,6 @@ refuses a mix of frameworks. Detection only consults frameworks already in
 this never drags torch into a paddle-only process, or the reverse.
 """
 
-import importlib
 import sys
 
 from .base import REQUIRED_ATTRS, BackendBase, Tensor, check_backend_class
@@ -38,7 +37,15 @@ def _backend_class(name):
         if name not in _IMPLS:
             raise ValueError(f"unknown framework {name!r}; expected one of {sorted(_IMPLS)}")
         submodule, cls_name = _IMPLS[name]
-        module = importlib.import_module(f"{__name__}.{submodule}")
+        # Imported by flashmask.frontend.<name>, which binds it in this namespace.
+        # Read rather than imported: a host that moves the package to another name
+        # in sys.modules after loading it (paddlefleet_ops does) leaves nothing for
+        # an import statement to resolve.
+        module = globals().get(submodule)
+        if module is None:
+            raise RuntimeError(
+                f"no {name} backend: flashmask.frontend.{name} was not imported"
+            )
         _CLASS_CACHE[name] = check_backend_class(getattr(module, cls_name))
     return _CLASS_CACHE[name]
 

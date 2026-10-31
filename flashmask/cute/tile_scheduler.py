@@ -15,8 +15,8 @@ from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-import flashmask.cute.utils as utils
-from flashmask.cute.fast_math import clz
+from . import utils
+from .fast_math import clz
 from cutlass.cute import FastDivmodDivisor
 
 

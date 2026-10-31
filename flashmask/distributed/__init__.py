@@ -9,8 +9,6 @@ there is nothing to sniff. Callers always have a backend at hand, so they pass
 ``be.name``.
 """
 
-import importlib
-
 from .base import REQUIRED_ATTRS, DistBase, check_dist_class
 
 __all__ = ["REQUIRED_ATTRS", "DistBase", "get_dist"]
@@ -30,6 +28,12 @@ def get_dist(name):
         if name not in _IMPLS:
             raise ValueError(f"unknown framework {name!r}; expected one of {sorted(_IMPLS)}")
         submodule, cls_name = _IMPLS[name]
-        module = importlib.import_module(f"{__name__}.{submodule}")
+        # Imported by flashmask.frontend.<name>; read, not imported, for the same
+        # reason as flashmask.backend._backend_class.
+        module = globals().get(submodule)
+        if module is None:
+            raise RuntimeError(
+                f"no {name} collectives: flashmask.frontend.{name} was not imported"
+            )
         _CACHE[name] = check_dist_class(getattr(module, cls_name))()
     return _CACHE[name]

@@ -10,8 +10,8 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
-import flashmask.cute.mma_sm100_desc as sm100_desc
-from flashmask.cute.utils import parse_swizzle_from_pointer
+from . import mma_sm100_desc as sm100_desc
+from .utils import parse_swizzle_from_pointer
 
 # cudaFuncAttributeMaxDynamicSharedMemorySize on SM100.
 SM100_SMEM_CAPACITY_BYTES = 227 * 1024

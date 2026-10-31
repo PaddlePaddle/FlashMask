@@ -125,6 +125,14 @@ The implementation lives in [`flashmask/overlap`](flashmask/overlap/). It commun
 
 Overlap is enabled by passing a CP `group` (world size > 1) to `flashmask_attention`. Key/value are then the local `S_local` shard, and the mask key axis has length `S_local * group_size` in group-rank chunk order. The library converts it to its internal order, so callers must not pre-roll it. Hierarchical (multi-node) communication is selected automatically when the group spans more than one node.
 
+Overlap supports only the following inputs. Anything else raises a `ValueError` before any communication starts:
+
+- `S_local` in {4096, 8192, 16384, 32768, 65536, 131072};
+- at most 64 ranks per CP group;
+- `head_dim_v == head_dim` (so MLA shapes such as 192/128 or 576/512 are not supported);
+- bf16 Q/K/V;
+- `causal=False` with a 2-column `[lt_start, ut_end]` mask (express causality in the mask).
+
 `FLASHMASK_SPIN_TIMEOUT_S` (default `1800`, `0` disables) bounds how long an Overlap communication kernel waits for a peer before it prints a diagnostic and traps, like NCCL's collective timeout. The same budget bounds the attention kernels' waits on the gathered KV; on timeout they print the stuck flag and fail with a device-side assert.
 
 <details>
@@ -231,7 +239,11 @@ At `d/dv` of 576/512 and sequence lengths from 4K to 128K, the shared KV version
 - **Deep learning framework**: a CUDA-enabled PaddlePaddle or PyTorch (neither is installed automatically).
 - **Build tools**: `setuptools>=64`.
 - **Automatically installed dependencies**: `nvidia-cutlass==4.2.0.0`, `nvidia-cutlass-dsl[cu13]==4.5.2`, and `apache-tvm-ffi>=0.1.5,<0.2.0`. They are installed by `setup.py` at build time, so the install command needs `--no-build-isolation`.
-- **Extra requirement for Overlap (`ovl`)**: NCCL >= 2.30.5 (e.g. `nvidia-nccl-cu13`, or point `NCCL_HOME` at an installation). Without NCCL the component is skipped; the core kernels are unaffected.
+- **Extra requirements for Overlap (`ovl`)**:
+  - NCCL >= 2.30.5 (e.g. `nvidia-nccl-cu13`, or point `NCCL_HOME` at an installation) and the cutlass C++ headers (`nvidia-cutlass`, or `FM4_OVERLAP_CUTLASS_INC`).
+  - If `FLASHMASK_BUILD` names `ovl` explicitly (e.g. `ovl`, `utils+ovl`), a missing or too-old NCCL or missing cutlass headers fail the build with the reason. Under `all`, the bridge is skipped with a warning and the core kernels are unaffected.
+  - The NCCL version at runtime must equal the one the bridge was built against, otherwise communicator setup fails. The bridge loads the interpreter's `nvidia-nccl` wheel (or `FLASHMASK_NCCL_LIB`), and the first `libnccl.so.2` the process loads wins, so the framework's own NCCL must be that same version. Build and run in the same image.
+  - The target arch comes from `FM4_OVERLAP_CUDA_ARCH`, which takes one arch or a `,`/`;` list such as `100a;103a` (one SASS per arch in one `.so`). The default is the local GPU, or `90a` if no GPU is visible. `sm_100a` and `sm_103a` binaries are not interchangeable, so a build host without a GPU must set this variable.
 
 ### Quick install
 

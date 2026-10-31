@@ -9,8 +9,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-import flashmask.cute.utils as utils
-from flashmask.cute import layout_utils
+from . import utils
+from . import layout_utils
 
 
 @cute.jit

@@ -16,19 +16,19 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
-from flashmask.cute import utils
-from flashmask.cute import layout_utils
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-from flashmask.cute import copy_utils
-from flashmask.cute.barrier import wait_flag_eq
-from flashmask.cute import pipeline
-from flashmask.cute import blackwell_helpers as sm100_utils
-from flashmask.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from flashmask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute.tile_scheduler import (
+from . import utils
+from . import layout_utils
+from .cute_dsl_utils import assume_tensor_aligned
+from . import copy_utils
+from .barrier import wait_flag_eq
+from . import pipeline
+from . import blackwell_helpers as sm100_utils
+from .blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from .blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
@@ -36,9 +36,9 @@ from flashmask.cute.tile_scheduler import (
     ParamsBase,
 )
 
-from flashmask.cute import barrier
-from flashmask.cute.named_barrier import NamedBarrierBwdSm100
-from flashmask.cute.flashmask_utils import FlashMaskInfo
+from . import barrier
+from .named_barrier import NamedBarrierBwdSm100
+from .flashmask_utils import FlashMaskInfo
 
 
 @cute.jit

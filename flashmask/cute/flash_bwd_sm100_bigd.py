@@ -65,11 +65,11 @@ from cutlass.utils.layout import LayoutEnum
 from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from flashmask.cute import blackwell_helpers as sm100_utils
-from flashmask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
-from flashmask.cute import barrier, copy_utils, layout_utils, utils
-from flashmask.cute.flash_bwd_sm100 import _overlap_gate_bwd
-from flashmask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
+from . import blackwell_helpers as sm100_utils
+from .blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
+from . import barrier, copy_utils, layout_utils, utils
+from .flash_bwd_sm100 import _overlap_gate_bwd
+from .tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
 SM100_TMEM_CAPACITY_COLUMNS = 512

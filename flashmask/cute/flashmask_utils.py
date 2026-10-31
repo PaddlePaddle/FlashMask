@@ -13,8 +13,8 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
-from flashmask.cute import utils
-from flashmask.backend import Tensor, get_backend
+from . import utils
+from ..backend import Tensor, get_backend
 import operator
 
 __all__ = [

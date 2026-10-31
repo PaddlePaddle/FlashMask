@@ -25,7 +25,7 @@ from typing import Tuple, Optional, NamedTuple
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashmask.backend import Tensor, get_backend
+from ..backend import Tensor, get_backend
 
 
 class BlockSparseTensors(NamedTuple):

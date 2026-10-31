@@ -12,13 +12,20 @@ project(flashmask_cpbalance LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
-# target sm arch; setup.py passes the local GPU's (e.g. 90a / 100a). The kernels
-# use __reduce_max_sync/__reduce_min_sync (sm_80+), so any sm >= 80 works.
-set(CPB_CUDA_ARCH "90a" CACHE STRING "target sm arch, e.g. 90a or 100a")
+# target sm arch or list; setup.py passes the local GPU's (e.g. 90a / 100a) or the
+# FM4_OVERLAP_CUDA_ARCH list. The kernels use __reduce_max_sync/__reduce_min_sync
+# (sm_80+), so any sm >= 80 works.
+set(CPB_CUDA_ARCH "90a" CACHE STRING "target sm arch or list, e.g. 100a or 100a;103a")
 
-# Derive compute_ capability: gencode 'compute_' must drop the trailing 'a'
+# One SASS per listed arch. The gencode 'compute_' must drop the trailing 'a'
 # (compute_90a is illegal; the correct pair is arch=compute_90,code=sm_90a).
-string(REGEX REPLACE "a$" "" CPB_CUDA_ARCH_NUM "${CPB_CUDA_ARCH}")
+string(REPLACE "," ";" CPB_CUDA_ARCH "${CPB_CUDA_ARCH}")
+set(CPB_GENCODE "")
+foreach(_arch IN LISTS CPB_CUDA_ARCH)
+    string(REGEX REPLACE "a$" "" _arch_num "${_arch}")
+    # One token per arch: CMake de-duplicates repeated options such as a bare -gencode.
+    list(APPEND CPB_GENCODE "-gencode=arch=compute_${_arch_num},code=sm_${_arch}")
+endforeach()
 
 add_library(flashmask_cpbalance SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/cp_balance_bridge.cu
@@ -28,7 +35,7 @@ target_compile_options(flashmask_cpbalance PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -Xcompiler=-fPIC
     -Xcompiler=-O3
     -std=c++17
-    -gencode arch=compute_${CPB_CUDA_ARCH_NUM},code=sm_${CPB_CUDA_ARCH}
+    ${CPB_GENCODE}
     -lineinfo
     -DNDEBUG
     --expt-relaxed-constexpr

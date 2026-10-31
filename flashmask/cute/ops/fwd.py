@@ -16,17 +16,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashmask.backend import Tensor, get_backend
-from flashmask.cute import utils
-from flashmask.cute.barrier import spin_timeout_ns_from_env
-from flashmask.cute.block_sparsity import (
+from ...backend import Tensor, get_backend
+from .. import utils
+from ..barrier import spin_timeout_ns_from_env
+from ..block_sparsity import (
     BlockSparseTensorsPaddle,
     normalize_block_sparse_tensors,
     to_cute_block_sparse_tensors,
 )
-from flashmask.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flashmask.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flashmask.cute.flashmask_utils import (
+from ..flash_fwd_sm90 import FlashAttentionForwardSm90
+from ..flash_fwd_sm100 import FlashAttentionForwardSm100
+from ..flashmask_utils import (
     FlashMaskInfoPaddle,
     build_flashmask_block_lists,
     prepare_block_maxmin,
@@ -230,22 +230,17 @@ def _flash_attn_fwd(
 
     # A paddle Group exposes .world_size, a torch ProcessGroup does not;
     # ask the collective adapter instead of duck-typing the handle.
-    enable_overlap = group is not None and _dist_world_size(be, group) > 1
+    overlap_nranks = _dist_world_size(be, group) if group is not None else 1
+    enable_overlap = overlap_nranks > 1
     if enable_overlap and compute_capability != 10:
         raise NotImplementedError("FM-4 overlap fwd is only supported on SM100")
     overlap_view_args = None
     overlap_bhsd_layout = None
     if enable_overlap:
         overlap_runtime = _get_overlap_runtime()
-        assert startend_row_indices is not None, (
-            "overlap mode requires startend_row_indices (group-rank KV-chunk order)"
+        overlap_runtime.check_inputs(
+            q, k, v, startend_row_indices, causal, overlap_nranks, be
         )
-        assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
-        # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
-        # the comm-side compute_chunk_mask reads col1 as ut_end; FM-3 overlap
-        # forbids causal for the same reason. Guarding here keeps the col mapping in
-        # _chunk_mask_pairs exact.
-        assert not causal, "overlap mode does not support causal yet"
         # One storage for K and V makes the gathered V region a bit-for-bit copy of the
         # gathered K region, so the comm layer transports K only and hands out the K region
         # for V. _same_storage stays last: it raises rather than guess.
@@ -308,9 +303,6 @@ def _flash_attn_fwd(
         # from overlap_view_args) carries the gathered shape into the kernel.
         assert num_head_kv == overlap_view_args.shape[2]
         assert head_dim == overlap_view_args.shape[3]
-        # The V view is built from K's overlap_d, so an unequal head_dim_v would read
-        # the wrong bytes rather than fail.
-        assert head_dim_v == head_dim, "overlap requires head_dim_v == head_dim"
     else:
         assert list(k.shape) == [batch_size, seqlen_k, num_head_kv, head_dim], (
             f"expect k with shape {[batch_size, seqlen_k, num_head_kv, head_dim]}, received {k.shape=}"

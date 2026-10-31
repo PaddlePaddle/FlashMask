@@ -22,8 +22,12 @@ from typing import Optional
 
 import torch
 
-from flashmask.backend import get_backend
-from flashmask.cute.ops._common import _check_cutedsl_supported, _dist_world_size
+# The adapters are bound here, where the framework is already a hard import, so
+# get_backend / get_dist never import at call time.
+from ...backend import _torch as _backend_adapter  # noqa: F401
+from ...backend import get_backend
+from ...distributed import _torch as _dist_adapter  # noqa: F401
+from ...cute.ops._common import _check_cutedsl_supported, _dist_world_size
 from .autograd import FlashMaskFunc
 
 __all__ = [

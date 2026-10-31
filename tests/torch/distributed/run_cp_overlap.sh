@@ -48,11 +48,8 @@ S_LOCAL=${S_LOCAL:-$((32768 / CP_SIZE))}
 BS=${BS:-1,2}
 HQ=${HQ:-16}
 HKS=${HKS:-16,4,1}
-# ONE mask per launch. The overlap singleton carries dK/dV state across calls, so
-# switching mask *content* mid-process (e.g. document -> prefix_lm) leaves a stale
-# dK/dV buffer and corrupts the second mask's gradients. Default to a single mask;
-# use run_cp_overlap_sweep.sh (one process per mask) for the full matrix. Passing a
-# comma-joined MASKS still runs, but is unsafe for exactly this reason.
+# ONE mask per launch by default; run_cp_overlap_sweep.sh covers the full matrix.
+# Switching mask content mid-process no longer corrupts dK/dV (fixed in 647d699).
 MASKS=${MASKS:-document}
 REPEATS=${REPEATS:-2}
 
