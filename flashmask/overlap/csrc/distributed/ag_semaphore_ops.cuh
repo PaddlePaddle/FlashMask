@@ -10,7 +10,7 @@ namespace flashmask {
 namespace sema {
 namespace ag {
 
-// sema_intra holds `batch_ready_words(num_batch)` int64 flag words per rank; word w carries the
+// sema_intra: `batch_ready_words(num_batch)` int64 words per rank; word w holds the
 // per-batch readiness bits of batches [64w, 64w+64). This lifts the old single-word cap of
 // 64 effective batches (BHSD: B*H). Refcounts are VA signals in SignalBuffer::ag_refcnt.
 __host__ __device__ __forceinline__ int batch_ready_words(int num_batch) {
@@ -48,10 +48,8 @@ __device__ __forceinline__ void wait_full(
 
 /**
  * @brief (Device Function) Wait until semaphores' batch_idx readiness bit is set for target_pe.
- *   Used in hierarchical Phase 2 to wait for per-batch relay data readiness. The acquire
- *   pairs with the relay holder's release fetch_or; the caller's bar.sync extends it to the
- *   CTA's NVLink loads of the relay data.
- *   Out of line: see gin::wait_until.
+ *   Hierarchical Phase 2 relay wait. Acquire pairs with the relay holder's release fetch_or;
+ *   the caller's bar.sync extends it to the CTA's NVLink loads. Out of line: see gin::wait_until.
  */
 static __device__ __noinline__ void wait_full_one_batch(
     const int64_t* const __restrict__ semaphores,
@@ -68,8 +66,7 @@ static __device__ __noinline__ void wait_full_one_batch(
 
 /**
  * @brief (Device Function) Publish "batch_idx of target_pe's data is readable" to the other
- *   ranks of this node. The caller acquired every producing CTA's counter increment
- *   (acq_rel), so the release fetch_or orders all of their SR buffer writes before the bit.
+ *   ranks of this node. Release; the caller's acq_rel RMW already acquired all producer CTAs' writes.
  */
 __device__ __forceinline__ void notify_batch_ready_to_same_node(
     int64_t* const __restrict__ semaphores,
@@ -147,8 +144,8 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
     }
 }
 
-// num thread: total_pes. The self thread books the total_pes - 1 consumer adds this
-// round will bring; every other thread raises the data-ready flag on its consumer.
+// num thread: total_pes. The self thread books the total_pes - 1 incoming consumer adds;
+// the others raise the data-ready flag on their consumer.
 __global__ void SetFullKernel(
     int64_t* const __restrict__ semaphores,
     uint64_t* const __restrict__ ag_issued,
@@ -186,9 +183,7 @@ void wait_self_empty(
 /**
  * @brief Tell all other PEs that the local PE has finished using their data.
 
-    Locally zero every data-ready flag semaphores[i] (i != my_pe), so the next remote_get
-    kernel on comm_stream sees no data available. Remotely add 1 to ag_refcnt[i] on every
-    PE i, so it knows one more consumer released its chunk.
+    Zero local data-ready flags semaphores[i] (i != my_pe) and add 1 to ag_refcnt[i] on each PE i.
 
  * @param semaphores int64 flags in the SRBuffer window: size is total_n_pes
  * @param ag_refcnt SignalBuffer::ag_refcnt
@@ -221,10 +216,9 @@ void notify_segment_empty(
  * Hierarchical notify_full: books this round's refcount adds and broadcasts to congruence
  * partners + same-node ranks.
  *
- * Dual-refcount protocol (thread 0 bumps the expected counts in ag_issued):
- *   ag_refcnt[my_pe]   producer count: (num_nodes-1) + (gpus_per_node-1) adds per round
- *   ag_refcnt[partner] relay count: (gpus_per_node-1) adds per round, for each congruence
- *     partner (partner's data is relayed through us; same-node ranks read it, then add)
+ * Thread 0 books the expected adds per round in ag_issued:
+ *   ag_refcnt[my_pe]   producer count: (num_nodes-1) + (gpus_per_node-1)
+ *   ag_refcnt[partner] relay count: (gpus_per_node-1) per congruence partner relayed through us
  *
  * Remote flags (threads 1..N):
  *   sema_inter[my_node_id] = 1 on each congruence partner  (cross-node data ready)
@@ -317,21 +311,19 @@ void notify_full_hier(
  * Hierarchical post-AG cleanup kernel.
  * Runs after AG remote_get kernel completes on comm_stream.
  *
- * Dual-refcount protocol (VA signals in ag_refcnt, see HierSetFullKernel):
- *   - Producer count: ag_refcnt[X] on producer PE X, +1 from each congruent rank (Phase 1
- *     consumer) and each same-node rank (Phase 2 direct reader).
- *   - Relay count: ag_refcnt[X] on relay holder PE H, +1 from each same-node non-congruent
- *     rank that read the relay copy.
+ * Refcounts (VA signals in ag_refcnt, see HierSetFullKernel):
+ *   - Producer count on PE X: +1 per congruent rank and per same-node rank that read X.
+ *   - Relay count on relay holder H: +1 per same-node non-congruent rank that read H's copy.
  *
  * Thread layout: threadIdx.x = 0..total_n_pes-1
  *
  * Three cases per target:
  *   1. Congruent (same slot, different node): Phase 1 target.
- *      Clear sema_inter, add 1 to the producer count on target PE.
+ *      Clear sema_inter, add 1 to target's producer count.
  *   2. Non-congruent, same node: Phase 2 direct read from producer.
- *      Wait for signal, clear local sema_intra, add 1 to the producer count on target PE.
+ *      Wait, clear local sema_intra, add 1 to target's producer count.
  *   3. Non-congruent, different node: Phase 2 relay read from same-node relay holder.
- *      Wait for signal, clear local sema_intra, add 1 to the relay holder's relay count.
+ *      Wait, clear local sema_intra, add 1 to the relay holder's relay count.
  */
 __global__ void HierNotifyEmptyKernel(
     int64_t* const __restrict__ sema_inter,
@@ -448,8 +440,7 @@ void notify_segment_empty_hier(
         gpus_per_node, num_batch);
 }
 
-// Thread i waits on partner i: thread 0 on our own producer count, threads 1.. on the
-// relay counts of our congruence partners.
+// Thread 0 waits on our producer count, thread i > 0 on congruence partner i's relay count.
 __global__ void WaitSelfEmptyHierarchicalKernel(
     const uint64_t* const __restrict__ ag_refcnt,
     const uint64_t* const __restrict__ ag_issued,
@@ -462,9 +453,8 @@ __global__ void WaitSelfEmptyHierarchicalKernel(
 }
 
 /**
- * @brief Stream-ordered wait until both the producer count and all relay counts reached
- *   what the previous round's HierSetFullKernel booked. Must run before HierSetFullKernel,
- *   on the same stream, to guarantee no data overwrite.
+ * @brief Stream-ordered wait until the previous round's producer and relay counts are reached.
+ *   Run before HierSetFullKernel on the same stream so no data is overwritten.
  */
 void wait_self_empty_hier(
     const uint64_t* const __restrict__ ag_refcnt,

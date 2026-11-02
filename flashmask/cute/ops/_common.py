@@ -16,10 +16,8 @@ import cutlass.cute as cute
 from ...distributed import get_dist
 from ..cute_dsl_utils import make_fake_tensor
 
-# Imported with the package rather than on first overlap call: an import at call
-# time cannot resolve once a host has moved the package to another name in
-# sys.modules (paddlefleet_ops does). flashmask.overlap is left out of wheels
-# built without 'ovl'; that is only an error for a call that asks for overlap.
+# Import eagerly: a call-time import fails once a host renames the package in sys.modules.
+# Wheels built without 'ovl' lack flashmask.overlap; only overlap calls report that.
 try:
     from ...overlap import overlap_runtime as _overlap_runtime
     _overlap_import_error = None

@@ -133,7 +133,7 @@ Overlap 仅支持以下输入，其他输入会在任何通信开始前抛出 `V
 - Q/K/V 为 bf16；
 - `causal=False`，掩码为 2 列 `[lt_start, ut_end]`（因果性通过掩码表达）。
 
-`FLASHMASK_SPIN_TIMEOUT_S`（默认 1800，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。attention kernel 等待已收集 KV 的时间也受同一预算限制，超时后打印卡住的标志位并以 device-side assert 失败。
+`FLASHMASK_SPIN_TIMEOUT_S`（默认 300，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。attention kernel 等待已收集 KV 的时间也受同一预算限制，超时后打印卡住的标志位并以 device-side assert 失败。如果进入 overlap 之前各 rank 可能合理地错开更久（例如只有 rank 0 在保存 checkpoint 或做评估），请调大这个值。
 
 <details>
 <summary>在 SM90（Hopper）上使用 Overlap</summary>

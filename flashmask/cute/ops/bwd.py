@@ -82,10 +82,9 @@ def _flash_attn_bwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
     """Backward pass for FlashAttention.
 
-    group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
-    S_local shard, dk/dv come back reduce-scattered to S_local, and the mask key axis (dim 2)
-    has length S_local * group_size in group-rank chunk order (chunk r is rank r's local
-    K/V). The library reorders it internally; pass it unshifted.
+    group: CP group enabling FM-4 overlap. If size > 1, k/v are the local S_local shard,
+    dk/dv come back reduce-scattered to S_local, and the mask key axis has length
+    S_local * group_size (chunk r = rank r); pass it unshifted.
     """
     be = get_backend(q, k, v)
     compute_capability = be.device_capability()[0]
@@ -185,8 +184,7 @@ def _flash_attn_bwd(
             flashmask_info = flashmask_info.startend_row_indices
         overlap_runtime.check_inputs(q, k, v, flashmask_info, causal, overlap_nranks, be)
         overlap_runtime.ensure_initialized(k, group, kv_shared=kv_shared)
-        # Permute before the block max/min below: the chunk-skip mask and the kernel
-        # both index the gathered K/V in this rank's SRBuffer order.
+        # Reorder to this rank's SRBuffer order before the block max/min below.
         flashmask_info = overlap_runtime.sr_order_mask(flashmask_info, fwd=False)
 
     cute_flashmask_info = None
@@ -214,8 +212,7 @@ def _flash_attn_bwd(
         startend_row_indices = flashmask_info.startend_row_indices
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle(be)
-        # Metadata only: the round is booked by start_backward_ag right before the first
-        # compute-stream launch, after every validation, allocation and compile below.
+        # Metadata only; start_backward_ag books the round after all validation and compiles.
         overlap_ag_args = overlap_runtime.backward_ag_args()
         overlap_view_args = overlap_ag_args.kv_view(0)
         segment_seqlen = overlap_ag_args.segment_seqlen
@@ -226,8 +223,7 @@ def _flash_attn_bwd(
         assert segment_nblocks % 4 == 0, (
             "FM-3 segment mask metadata requires a 4-block-aligned segment"
         )
-        # cute_flashmask_info keeps the full mask tensors. The SM100 loader applies the
-        # segment offset while indexing, preserving the original batch/head stride.
+        # cute_flashmask_info keeps the full mask; the SM100 loader adds the segment offset.
         # All segment-local scheduler and semaphore shapes use this length. The
         # original local length is retained by k/v and by the final dK/dV outputs.
         seqlen_k = segment_seqlen
@@ -564,7 +560,7 @@ def _flash_attn_bwd(
             None,  # mdLSE
             current_stream,
         )
-    # Overlap launches the preprocess after booking its AG round (see the segment loop).
+    # Overlap runs the preprocess after booking its AG round (see the segment loop).
     def _run_preprocess():
         _flash_attn_bwd.compile_cache_pre[compile_key_pre](
             o_tensor,
@@ -889,7 +885,7 @@ def _flash_attn_bwd(
     def _kv_accum_cute(t, tensor, accum_hdim):
         return _to_cute(_slice_kv_accum(t, accum_hdim)) if kv_postprocess_enabled else tensor
 
-    # The overlap round sets this to compile its postprocesses before booking the round.
+    # Set by the overlap round to compile its postprocesses without launching them.
     post_compile_only = False
 
     def _postprocess_run(
@@ -964,14 +960,11 @@ def _flash_attn_bwd(
             return cutlass.Int64(int(addr) + 2 * element_offset)
 
     if is_bigd_bwd:
-        # The big-headdim accumulators are blocked per head as
+        # Big-headdim accumulators are blocked per head as
         #   [head_dim slice][row block][4-col group][row][4 cols]
         # so each slice is byte-identical to a head_dim=slice accumulator. The shared
-        # postprocess cannot swallow head_dim 576 in one go: it stages a whole
-        # tile x head_dim fp32 tile in SMEM and registers, and a full-width row block
-        # is not contiguous in this layout. So it runs at head_dim = slice, writing a
-        # last-dim slice of the output -- legal because the postprocess writes
-        # dQ/dK/dV with plain gmem copies rather than TMA.
+        # postprocess cannot hold head_dim 576 in SMEM and registers, so it runs at
+        # head_dim = slice and writes a last-dim output slice (plain gmem copies, no TMA).
         assert head_dim == head_dim_rounded and head_dim_v == head_dim_v_rounded, (
             "the big-headdim postprocess writes whole head_dim slices, so head_dim "
             f"must already be a multiple of 64 (got {head_dim} / {head_dim_v})"
@@ -986,28 +979,28 @@ def _flash_attn_bwd(
         def _bigd_postprocess(
             accum, out, scale, hd, hd_slice, block, seq_rounded, tag, raw_addr=None,
         ):
-            # ONE launch covers every slice: slice j of head h is head h * num_slices + j
-            # of a head_dim = hd_slice problem. The accumulator is [b][h][slice][...] and
-            # the output head_dim splits as [slice][hd_slice], so both reshapes are
-            # contiguous views and each CTA reads and writes exactly the bytes the
-            # matching CTA of a per-slice launch did, with the same compiled kernel.
-            # raw_addr routes the output into the overlap send buffer, whose contiguous
-            # (b, s, h, hd) layout splits the same way; `out` then only carries the
-            # layout for the trace.
+            # One launch for all slices: slice j of head h is head h * num_slices + j of a
+            # head_dim = hd_slice problem. raw_addr targets the overlap send buffer instead.
             num_slices = hd // hd_slice
+            if raw_addr is None and be.strides(out)[2] != hd:
+                # Preserve strided outputs with per-slice views; the fused reshape would copy.
+                accum_slice_elems = seq_rounded * hd_slice
+                for j in range(num_slices):
+                    _postprocess_run(
+                        _to_cute(
+                            accum[..., j * accum_slice_elems : (j + 1) * accum_slice_elems]
+                        ),
+                        _to_cute(out[..., j * hd_slice : (j + 1) * hd_slice]),
+                        scale, hd_slice, block, 1, False, False, 1,
+                        tag,
+                    )
+                return
             batch, heads = accum.shape[0], accum.shape[1]
             sliced_heads = heads * num_slices
             accum_view = _to_cute(
                 accum.reshape([batch, sliced_heads, seq_rounded * hd_slice])
             )
             if raw_addr is None:
-                # The fold needs the head stride to equal hd; otherwise reshape would
-                # silently return a copy (torch keeps a permuted input's strides in
-                # empty_like) and the kernel would write into a temporary.
-                assert be.strides(out)[2] == hd, (
-                    f"big-headdim postprocess needs out head stride == {hd}, "
-                    f"got strides {tuple(be.strides(out))}"
-                )
                 _postprocess_run(
                     accum_view,
                     _to_cute(out.reshape([batch, out.shape[1], sliced_heads, hd_slice])),
@@ -1075,10 +1068,8 @@ def _flash_attn_bwd(
                     use_2cta_instrs, 1, "ovl_dq",
                 )
 
-        # Compile every postprocess of the round through its real call sites before the
-        # round is booked: once start_backward_ag runs, every rank must enqueue all of its
-        # segments, so a predictable compile failure must not happen in between. The main
-        # kernel's compile key fixes every postprocess key, so this runs once per key.
+        # Compile all postprocesses before booking: after start_backward_ag every rank must
+        # enqueue all its segments, so a compile failure then would hang the peers.
         if compile_key not in _flash_attn_bwd.overlap_post_compiled:
             post_compile_only = True
             try:
@@ -1089,8 +1080,7 @@ def _flash_attn_bwd(
                 post_compile_only = False
             _flash_attn_bwd.overlap_post_compiled.add(compile_key)
 
-        # Book the backward AG/RS round only now; launch order on every stream is the same
-        # as before: AG segment 0, preprocess, then the segment loop.
+        # Book the round only now: AG segment 0, preprocess, then the segment loop.
         overlap_runtime.start_backward_ag(k, v, startend_row_indices, overlap_stream)
         _run_preprocess()
         rs_issued = False
@@ -1125,9 +1115,8 @@ def _flash_attn_bwd(
                     segment_idx=segment_idx,
                 )
                 if need_kv_accum:
-                    # AG(s+1) goes ahead of post(s): AG(s+1) and its reset (SR K/V, work_done
-                    # bitmap, scheduler counters) follow main(s), their only compute reader,
-                    # and post(s) reads only dk_accum / dv_accum and writes only send slot s.
+                    # AG(s+1) may go before post(s): its resets follow main(s), their only
+                    # reader, and post(s) touches only dk_accum / dv_accum and send slot s.
                     if has_next:
                         overlap_runtime.start_backward_segment(
                             segment_idx + 1, overlap_stream
@@ -1141,8 +1130,7 @@ def _flash_attn_bwd(
 
                 if has_next:
                     if need_kv_accum:
-                        # dk_accum / dv_accum are the two halves of _zero_big (under
-                        # kv_shared dv_accum aliases a standalone dk_accum): one fill.
+                        # dk_accum / dv_accum are halves of _zero_big (one buffer if kv_shared).
                         (dk_accum if kv_shared else _zero_big).zero_()
                     else:
                         overlap_runtime.start_backward_segment(
@@ -1154,13 +1142,10 @@ def _flash_attn_bwd(
                             dK_semaphore.zero_()
                             dV_semaphore.zero_()
 
-            # The dq postprocess reads dq_accum and writes dq only, none of which the RS
-            # chain (send / recv slots, the reduce into dk / dv) touches, so it runs before
-            # the join.
+            # The dq postprocess touches nothing the RS chain uses, so it runs before the join.
             _run_overlap_dq_postprocess()
         except BaseException:
-            # An issued RS still reduces into dk / dv on the aux stream: join it before the
-            # caller can release them. Without an issued RS nothing writes them.
+            # An issued RS still writes dk / dv on the aux stream; join it before re-raising.
             if rs_issued:
                 overlap_runtime.wait_backward_rs(overlap_stream)
             raise
@@ -1249,5 +1234,5 @@ _flash_attn_bwd.compile_cache_pre = {}
 _flash_attn_bwd.compile_cache = {}
 _flash_attn_bwd.compile_cache_post = {}
 _flash_attn_bwd.compile_cache_dsink = {}
-# Main-kernel compile keys whose overlap postprocesses are compiled (see the overlap round).
+# Main-kernel compile keys whose overlap postprocesses are already compiled.
 _flash_attn_bwd.overlap_post_compiled = set()

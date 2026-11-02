@@ -23,8 +23,7 @@ static constexpr int num_blocks = 32;   // comm CTAs per kernel; register budget
 static_assert(num_blocks == 32,
     "fwd frontier publish: lane j of every AG CTA reads block_work_idx[j], one slot per CTA");
 
-// Dynamic smem of the split AG / RS put kernels: one int chunk-mask entry per
-// num_warps * RDMA_ROW_PER_WARP-row work of a segment, staged at kernel start.
+// Split AG / RS put dynamic smem: one int chunk-mask entry per work item of a segment.
 inline size_t split_ag_smem_bytes(int effective_batch, int nc, int s_chunk) {
     return effective_batch * sizeof(int) * nc * s_chunk / (num_warps * RDMA_ROW_PER_WARP);
 }
@@ -32,9 +31,8 @@ inline size_t rs_put_smem_bytes(int b, int nc, int s_chunk) {
     return b * sizeof(int) * s_chunk * nc / (num_warps * RDMA_ROW_PER_WARP);
 }
 
-// A kernel whose static + dynamic smem exceeds the default 48 KiB limit needs the
-// MaxDynamicSharedMemorySize opt-in, or its launch fails. The attribute is per kernel
-// and only raised, so each instantiation pays the call once per larger shape.
+// Kernels needing more than 48 KiB of smem must opt in via MaxDynamicSharedMemorySize,
+// or the launch fails. The attribute is only ever raised.
 inline void reserve_dynamic_smem(const void* kernel, size_t bytes, const char* name) {
     cudaFuncAttributes attr;
     cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
@@ -61,8 +59,8 @@ inline void reserve_dynamic_smem(const void* kernel, size_t bytes, const char* n
     }
 }
 
-// A failed launch never announces its CTAs, so the compute stream's coordinator wait
-// would spin until its watchdog. Report it at the launch instead.
+// A failed launch never sets its coordinator bits, so report it here instead of letting
+// the compute stream spin until its watchdog.
 inline void check_comm_launch(const char* name) {
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -75,9 +73,8 @@ inline void check_comm_launch(const char* name) {
 // S_local (= S_chunk) must be a power of 2 and divisible by row_per_block (= num_warps * RDMA_ROW_PER_WARP = 512).
 // Host-side dispatch selects the compile-time S_chunk constant for GPU kernels.
 // Supported values: {4096, 8192, 16384, 32768, 65536, 131072}.
-// Chunks per backward segment come from get_num_chunk_per_segment (1, 2, 4 or 8); the
-// split AG/RS kernels handle num_chunks == 1 (segment 0 is then local-only) and
-// num_chunks == nranks (one segment, which reduces its own recv slot).
+// Chunks per backward segment: 1, 2, 4 or 8 (get_num_chunk_per_segment). nc == 1 makes
+// segment 0 local-only; nc == nranks makes one segment that reduces its own recv slot.
 
 #define SChunkCase(MACRO_FUNC, _S_chunk, ...) \
     case _S_chunk: { MACRO_FUNC(_S_chunk, ##__VA_ARGS__); break; }
@@ -163,8 +160,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         std::min(greatest_priority + 1, least_priority)));
     FM_CUDA_CHECK(cudaEventCreateWithFlags(&reduce_done, cudaEventDisableTiming));
     FM_CUDA_CHECK(cudaEventCreateWithFlags(&local_moved, cudaEventDisableTiming));
-    // setup_dkv_buffer runs the first team barrier: every PE's windows are zero before any
-    // PE primes the RS empty flags.
+    // setup_dkv_buffer's team barrier: all windows are zero before any PE primes RS empty flags.
     setup_dkv_buffer();
     if (rank == 0) {
         printf("[FlashMask Overlap] hierarchical=%d, bhsd=%d, num_segments=%d, num_chunks=%d\n",
@@ -203,10 +199,8 @@ void OverlapCommunicator<KVType>::wait_wptr_init() {
     cudaStreamWaitEvent(comm_stream, wptr_init);
 }
 
-// Every comm CTA release-ORs bit blockIdx.x at kernel start; spins until all num_blocks
-// bits are set. The acquire makes comm_stream work ordered before the AG kernel (local
-// chunk copy/transpose, work_done memset, InitBitmapForLocalSkip) visible to the
-// compute kernel launched after this one; no event carries that edge.
+// Spins until every comm CTA has set its bit (release-OR at kernel start). The acquire makes
+// comm_stream work before the AG kernel visible to the next compute kernel; no event does.
 __global__ void WaitAndResetStreamCoordKernel(
     int* const stream_coordinator,
     const unsigned full_mask
@@ -229,9 +223,8 @@ void OverlapCommunicator<KVType>::wait_reset_stream_coordinator(cudaStream_t str
 
 template <typename KVType>
 void OverlapCommunicator<KVType>::wait_sr_buffer_empty(cudaStream_t stream) {
-    // Ownership guard, not optional: the local K/V copy and the AG about to start overwrite
-    // SR rows the previous attention kernel on `stream` may still read (single ordered
-    // compute stream contract). Peers' consumption of the local chunk is waited on below.
+    // Required: the local K/V copy and the AG overwrite SR rows the previous attention
+    // kernel on `stream` may still read. Peer consumption is waited on below.
     cudaEventRecord(sr_usable, stream);
     cudaStreamWaitEvent(comm_stream, sr_usable);
     // block if computation that uses the local chunk is not finished
@@ -268,9 +261,8 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     size_t batch_stride = _local_batch_stride * _total_n_pes;
     if (!fwd) {
         batch_stride = _local_batch_stride * num_chunks;
-        // Multi-segment non-hierarchical BWD: later segments re-gather into the SR base, so save
-        // local KV at the SR tail for remote ranks to Phase-1 fetch. Otherwise (see
-        // bwd_local_kv_at_base) local KV at the SR base is never overwritten: no tail backup.
+        // Multi-segment non-hierarchical BWD: later segments overwrite the SR base, so back up
+        // local KV at the SR tail for peers to fetch (see bwd_local_kv_at_base).
         if (!bwd_local_kv_at_base()) {
             if (_config.use_bhsd) {
                 // BHSD: transpose local KV into the tail backup region as (B,H,S_local,D)
@@ -325,7 +317,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                                     comm_stream));
         }
     }
-    // notify all other PEs that the local data is ready (1. book the expected consumer adds. 2. broadcast to other PEs)
+    // Book the expected consumer adds, then tell peers the local data is ready.
     const int effective_batch = num_effective_batch();
     if (_use_hierarchical) {
         sema::ag::notify_full_hier(
@@ -418,8 +410,8 @@ void OverlapCommunicator<KVType>::compute_chunk_mask(
     if (mask == nullptr || num_heads <= 0) {
         throw std::invalid_argument("[FlashMask Overlap] compute_chunk_mask needs a (B, H_mask, S, 2) mask.");
     }
-    // copy_chunk_mask is one shared buffer: the previous pass's AG kernels and RS put
-    // kernels stage it at kernel start, so do not overwrite it before they finished.
+    // The previous pass's AG and RS put kernels stage copy_chunk_mask at kernel start;
+    // wait for them before overwriting it.
     ensure_ag_done(stream);
     dkv_buffer->wait_all_send_slots(stream);
     constexpr int num_reduce_warp = RDMA_ROW_PER_WARP == 16 ? 4 : num_warps;
@@ -696,10 +688,8 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         sig_buffer->rs_expected(segment_idx),
         segment_idx == 0 ? (num_chunks - 1) : num_chunks, aux_c_stream
     );
-    // With ns >= 2, segment 0 reduces nothing: recv(0), plus recv(1) when nc == 1 (then
-    // ns == nranks), holds the fp32 running sum (see ReducedKdVKernel) from the segment-1
-    // reduce to the last one, so those slots are recycled only after the last reduce.
-    // A single segment (nc == nranks) reduces recv(0) in its one step.
+    // With ns >= 2, segment 0 reduces nothing; recv(0) (and recv(1) if nc == 1) holds the
+    // fp32 running sum until the last reduce, so those slots are recycled last.
     const int num_home_slots = num_chunks == 1 ? 2 : 1;
     if (segment_idx || num_segments() == 1) {
         auto operand = [&](auto recv_slot, KVType* out) {
@@ -719,8 +709,7 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             aux_c_stream
         );
     }
-    // Notify only after the reduce consumed the slot: the producer_wait_empty latency
-    // then hides behind the whole inter-BWD interval.
+    // Recycle only after the reduce consumed the slot; producer_wait_empty hides behind the inter-BWD gap.
     if (segment_idx >= num_home_slots) recycle_recv_slot(segment_idx);
     if (segment_idx == num_segments() - 1) {
         for (int seg = 0; seg < num_home_slots; seg++) recycle_recv_slot(seg);
@@ -747,9 +736,8 @@ void OverlapCommunicator<KVType>::notify_recv_empty(int segment_idx) {
     }
 }
 
-// Both segment variants (segment 0 with the local chunk, later segments) launch with the
-// same dynamic smem, so both get the opt-in. Runs at construction and on reconfiguration,
-// before the shape is committed, so an impossible shape fails here instead of at launch.
+// Both segment variants use the same dynamic smem. Runs before the shape is committed,
+// so an impossible shape fails here instead of at launch.
 template <typename KVType>
 void OverlapCommunicator<KVType>::reserve_comm_kernel_smem(
     int s_local, int nc, int effective_batch, int b
@@ -841,8 +829,7 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer() {
     const size_t single_k_numel = _local_batch_stride * B;
     if (!dkv_needs_recreate()) return;
 
-    // Exact size: this runs on growth, or on an nc change, which re-lays the window out
-    // whatever its capacity. The caller has quiesced.
+    // Exact size: runs on growth or an nc change (which re-lays out the window). Caller has quiesced.
     const int ns = _total_n_pes / num_chunks;
     if (dkv_buffer) dkv_buffer->release_for_realloc();
     dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
@@ -890,7 +877,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     int new_b, int new_s_local, int new_h, int new_d,
     int nranks, bool kv_shared
 ) {
-    // BHSD per config, so a D change can flip it back.
+    // use_bhsd depends on D, so a D change can flip it.
     OverlapConfig new_config = {new_b, new_s_local, new_h, new_d, nranks, OverlapConfig::bhsd_for(new_d)};
 
     // Shared K/V allocates no V/dV region, so the first non-shared pass has to grow the
@@ -935,15 +922,15 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     _local_batch_stride = new_config.cp_chunk_size();
     _total_numel = new_config.sr_buffer_numel();
 
-    // Exact, grow-only sizing. The hierarchical semaphore stride follows effective_batch
-    // (B*H in BHSD), so the semaphore layout can change while the capacities still fit.
+    // Exact, grow-only sizing. The hierarchical semaphore stride follows effective_batch,
+    // so the layout can change while the capacities still fit.
     const int new_sema_count = sema::ag::semaphore_count(
         _use_hierarchical, _num_nodes, _total_n_pes, num_effective_batch());
     const bool sr_realloc = _total_numel > _sr_buffer_capacity || new_sema_count > _sema_capacity;
     const bool sema_relayout = new_sema_count != _sema_count;
     const bool dkv_recreate = dkv_needs_recreate();
-    // Quiesce only when a window is freed or rezeroed, so no GIN write is still in flight
-    // to it; otherwise in-flight flags land at unchanged offsets. All ranks decide alike.
+    // Quiesce only before freeing or rezeroing a window; otherwise in-flight flags land at
+    // unchanged offsets. All ranks decide alike.
     if (sr_realloc || sema_relayout || dkv_recreate) quiesce();
 
     if (sr_realloc) {
@@ -973,7 +960,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
 
 template class OverlapCommunicator<cutlass::bfloat16_t>;
 static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> overlap_comm = nullptr;
-// UID of the live communicator's generation; a different UID means a different group.
+// UID of the live communicator; a different UID means a different group.
 static ncclUniqueId overlap_comm_uid;
 static uint64_t overlap_comm_generation = 0;
 
@@ -989,9 +976,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     const uint8_t* unique_id_ptr,
     bool kv_shared
 ) {
-    // Overlap gathers from peers. The bwd split AG/RS runs nranks / num_chunks segments:
-    // num_chunks == 1 makes segment 0 local-only (its kernels return early), and
-    // num_chunks == nranks makes one segment that also reduces its own dK/dV.
+    // Overlap gathers from peers, so it needs at least two ranks.
     if (nranks < 2) {
         throw std::invalid_argument("[FlashMask Overlap] overlap requires nranks > 1, got: "
             + std::to_string(nranks));
@@ -1025,8 +1010,8 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
         }
         return *overlap_comm;
     }
-    // New UID = new group generation (same size or not): rebuild. The teardown barrier
-    // is collective on the old communicator, so all its ranks must switch at the same call.
+    // New UID means a new group: rebuild. Teardown is collective on the old communicator,
+    // so all its ranks must switch at the same call.
     if (overlap_comm) {
         overlap_comm->quiesce();
         overlap_comm.reset();

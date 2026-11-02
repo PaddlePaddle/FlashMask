@@ -349,3 +349,48 @@ def test_flashmask(
         )
 
     torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("seqlen", [128, 129])
+@pytest.mark.parametrize("kv_mode", ["split", "shared"])
+@pytest.mark.parametrize("d, dv", KV_SHARED_D_DV, ids=[f"d{d}-dv{dv}" for d, dv in KV_SHARED_D_DV])
+def test_flashmask_bigd_permuted_bshd(d, dv, kv_mode, seqlen):
+    """Dense-permuted BSHD must match contiguous forward and gradients bitwise."""
+    if torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("head dim > 256 not supported on SM90")
+    batch, nheads, nheads_kv, dtype = 1, 4, 2, torch.bfloat16
+    torch.manual_seed(2026)
+    q_src = torch.randn([batch, seqlen, nheads, d], dtype=dtype, device="cuda")
+    k_src = torch.randn([batch, seqlen, nheads_kv, d], dtype=dtype, device="cuda")
+    v_src = torch.randn([batch, seqlen, nheads_kv, dv], dtype=dtype, device="cuda")
+    g_src = torch.randn([batch, seqlen, nheads, dv], dtype=dtype, device="cuda")
+
+    def run(permuted):
+        def layout(x):
+            if not permuted:
+                return x.clone()
+            x = x.transpose(1, 2).contiguous().transpose(1, 2)
+            assert x.stride(-1) == 1 and (x.shape[2] == 1 or x.stride(2) != x.shape[-1])
+            return x
+
+        q = layout(q_src).requires_grad_(True)
+        k = layout(k_src).requires_grad_(True)
+        if kv_mode == "shared":  # k.grad carries the merged dK + dV.
+            v = k[..., :dv]
+            assert kv_shared_detected(k, v)
+        else:
+            v = layout(v_src).requires_grad_(True)
+        out = flashmask_attention(q, k, v, causal=True)
+        out.backward(layout(g_src))
+        return [out, q.grad, k.grad] + ([] if kv_mode == "shared" else [v.grad])
+
+    prev = (torch.are_deterministic_algorithms_enabled(),
+            torch.is_deterministic_algorithms_warn_only_enabled())
+    torch.use_deterministic_algorithms(True)
+    try:
+        contig, permuted = run(False), run(True)
+    finally:
+        torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
+    for name, a, b in zip(("out", "dq", "dk", "dv"), contig, permuted):
+        assert torch.equal(a, b), f"{name}: max diff {(a.float() - b.float()).abs().max().item()}"
+    torch.cuda.empty_cache()

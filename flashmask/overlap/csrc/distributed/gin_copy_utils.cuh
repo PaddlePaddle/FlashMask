@@ -9,12 +9,10 @@
 
 namespace flashmask::shmem {
 
-// Register budget per thread of the comm kernels (AG get, RS put). Comm CTAs never share
-// an SM with FM-4 compute CTAs (those take the whole register file through setmaxnreg), so
-// the budget only decides how many comm CTAs fit on one SM: 64 at 512 threads gives 2, so
-// an AG and an RS CTA can pair up, and leaves room for the staged loads below.
+// Per-thread register cap of the comm kernels. Comm CTAs never share an SM with compute
+// CTAs; 64 regs at 512 threads fits 2 comm CTAs (one AG + one RS) per SM.
 constexpr int comm_regs_per_thread = 64;
-// 16 B loads each thread keeps in flight per main-loop iteration of lsa_copy_block.
+// 16 B loads each thread keeps in flight per lsa_copy_block iteration.
 constexpr int lsa_copy_unroll = 8;
 
 __host__ __device__ constexpr int comm_min_blocks_per_sm(int num_warps) {
@@ -28,17 +26,8 @@ __device__ __forceinline__ T* offset_or_null(T* base, int64_t offset) {
     return base != nullptr ? base + offset : nullptr;
 }
 
-// Block-wide copy of `count` int4s. One NVLink peer access costs microseconds, so the
-// per-SM bandwidth is the bytes each thread keeps in flight divided by that latency:
-// the main loop stages `unroll` independent loads before any store. Source order alone
-// does this -- dst and src may alias as far as the compiler knows, so it keeps every
-// load of an iteration ahead of that iteration's stores but never hoists the next
-// iteration's loads. __restrict__ is deliberately absent: it lets nvcc emit
-// ld.global.nc, which is illegal here because hierarchical Phase 2 reads a peer slot
-// that the peer's NIC fills while this kernel runs, and the RS send buffers have no
-// kernel-lifetime read-only guarantee either. Element i is moved by the same thread
-// with the same data as the plain strided loop; the tail (count % (unroll * blockDim))
-// runs that loop.
+// Block-wide copy of `count` int4s; stages `unroll` loads before storing to hide NVLink
+// latency. No __restrict__: the source can change mid-kernel, so ld.global.nc is illegal.
 template <int unroll>
 __device__ __forceinline__ void lsa_copy_block(int4* dst, const int4* src, int count) {
     const int stride = blockDim.x;
@@ -61,14 +50,8 @@ __device__ __forceinline__ void lsa_copy_block(int4* dst, const int4* src, int c
     }
 }
 
-// Out of line, as for network_get_two_buffers below (which explains why `static` is
-// mandatory). Measured on sm_103a at 64 registers: inlined, the RS put entries spill
-// 72 B and the AG entries up to 44 B; out of line, every comm entry has 0 spill bytes
-// and this frame only saves its callee-saved registers once per call, outside the
-// loops. The two components are copied one after the other: each pass already has
-// lsa_copy_unroll loads in flight, and interleaving them would double the staged
-// registers. A trailing bytes % 16 is not copied, as before; callers move whole rows
-// of D * 2 bytes.
+// Out of line to avoid register spills in the comm kernels (see network_get_two_buffers).
+// Copies whole int4s only; a trailing bytes % 16 is dropped.
 static __device__ __noinline__ void copy_two_buffers_block(
     void* dst1, void* dst2, const void* src1, const void* src2, int bytes) {
     const int count = bytes / sizeof(int4);
@@ -80,11 +63,8 @@ static __device__ __noinline__ void copy_two_buffers_block(
     }
 }
 
-// Building a GIN work request needs far more live state than the bulk copy above
-// (about 126 registers unconstrained), so inlining it into the comm kernels makes
-// ptxas spill around the copy loop under comm_regs_per_thread -- a cost every
-// chunk pays, including the intra-node ones that never reach here. Keeping it out of
-// line confines that pressure to its own frame.
+// Out of line: building a GIN request needs ~126 registers, and inlining it would make
+// the register-capped comm kernels spill around the copy loop.
 // `static` is required: with external linkage the ABI register count is fixed
 // before ptxas sees the caller, and separable compilation then rejects a
 // budget-capped entry calling a 126-register function.
@@ -177,8 +157,7 @@ __device__ __forceinline__ void two_buffers_putmem_block(
     if (auto* peer_dst1 = gin::get_lsa_ptr(dst1, world_peer); peer_dst1 != nullptr) {
         auto* peer_dst2 = dst2 != nullptr ? gin::get_lsa_ptr(dst2, world_peer) : nullptr;
         copy_two_buffers_block(peer_dst1, peer_dst2, src1, src2, bytes);
-        // System scope, in every storing thread: cross-node, the commit signal for these
-        // NVLink stores travels through the NIC, and GIN only releases at device scope.
+        // System scope: cross-node, the commit signal for these stores goes through the NIC.
         __threadfence_system();
         __syncthreads();
         return;

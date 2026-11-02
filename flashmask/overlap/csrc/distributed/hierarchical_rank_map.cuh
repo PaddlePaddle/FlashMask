@@ -140,7 +140,7 @@ __device__ __host__ inline int hier_position_in_src_pe(
 }
 
 /**
- * Forward seqlen_id for a given logical chunk position (the SR buffer is filled right to left).
+ * Forward seqlen_id for a logical chunk position (SR buffer filled right to left).
  */
 __device__ __host__ inline int hier_seqlen_id(
     int logical_pos,
@@ -153,7 +153,7 @@ __device__ __host__ inline int hier_seqlen_id(
 }
 
 /**
- * Forward: seqlen offset of the source chunk in src_pe's SR buffer (filled right to left).
+ * Forward: seqlen offset of the source chunk in src_pe's SR buffer.
  * Phase 1: src_pe's local chunk, at position nranks-1.
  * Phase 2: position of target_rank's data in src_pe's SR buffer.
  */
@@ -179,9 +179,8 @@ struct HierBwdChunk {
 
 /**
  * Backward: where the source chunk sits in src_pe's split-AG SR buffer.
- * Phase 1 / local: target_rank's local KV, which lives at segment 0, chunk 0.
- * Phase 2: src_pe fetched target_rank at its logical position p (< num_nodes) while
- *   running segment p / num_chunks, into that segment's region at chunk p % num_chunks.
+ * Phase 1 / local: segment 0, chunk 0.
+ * Phase 2: logical position p maps to segment p / num_chunks, chunk p % num_chunks.
  */
 __device__ __host__ inline HierBwdChunk hier_bwd_src_chunk(
     const HierRankInfo& info,

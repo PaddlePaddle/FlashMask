@@ -99,10 +99,8 @@ def _flash_attn_fwd(
             garbage; do not pass an uninitialized / reused buffer.
         block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
             the kernel's n_block_size. Ignored when block_logit is None.
-        group: CP group enabling the FM-4 overlap. With a group of size > 1, k/v are the local
-            S_local shard and the mask key axis (dim 2) has length S_local * group_size, in
-            group-rank chunk order (chunk r is rank r's local K/V). The library reorders it
-            internally; pass it unshifted.
+        group: CP group enabling FM-4 overlap. If size > 1, k/v are the local S_local shard and
+            the mask key axis has length S_local * group_size (chunk r = rank r); pass it unshifted.
     """
     be = get_backend(q, k, v)
 
@@ -252,15 +250,13 @@ def _flash_attn_fwd(
             and _same_storage(k, v)
         )
         overlap_runtime.ensure_initialized(k, group, kv_shared=overlap_kv_shared)
-        # Callers pass the mask in group-rank KV-chunk order; the chunk-skip mask and the
-        # kernel both index the gathered K/V in this rank's SRBuffer order.
+        # The kernel indexes gathered K/V in this rank's SRBuffer order; reorder the mask to match.
         startend_row_indices = overlap_runtime.sr_order_mask(startend_row_indices, fwd=True)
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle(be)
         # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
         # drives host-side validation and the runtime-dimension kernel arguments.
-        # The forward round is one AG whose completion and consumer acks are all on the
-        # comm stream, so a Python exception after it leaves no round half-booked.
+        # One AG with all acks on the comm stream: an exception after it leaves nothing half-booked.
         overlap_runtime.start_forward_ag(k, v, startend_row_indices, overlap_stream)
         overlap_ag_args = overlap_runtime.forward_ag_args()
         overlap_view_args = overlap_ag_args.view

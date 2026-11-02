@@ -11,13 +11,11 @@
 
 namespace flashmask {
 
-// Largest world size the AG kernels support: each CTA caches one wait_full result per
-// rank in shared memory. init_singleton_instance rejects larger nranks.
+// Max AG world size (one cached wait_full per rank in smem); init_singleton_instance rejects more.
 inline constexpr int kMaxCommRanks = 64;
 
-// Tells the compute stream that this comm CTA is resident (see
-// WaitAndResetStreamCoordKernel). Release: it also publishes everything stream-ordered
-// before this kernel, which reaches the compute kernel only through this edge.
+// Marks this comm CTA resident for the compute stream. Release: this edge is the only path
+// by which earlier stream-ordered work reaches the compute kernel.
 __device__ __forceinline__ void announce_comm_cta(int* stream_coordinator) {
     if (threadIdx.x == 0) {
         cuda::atomic_ref<int, cuda::thread_scope_device>(*stream_coordinator)
@@ -42,8 +40,7 @@ __global__ void InitBitmapForLocalSkip(
 // Supports mask_head >= 1. When mask_head > 1, AND-reduces across all mask heads
 // so that a chunk is skippable only when ALL heads agree it is fully masked.
 // When mask_head == 1, the head loop runs once with negligible overhead.
-// mask: (B, num_head, S_k, 2) int32 [lt_start, ut_end] pairs with row stride 2; each thread
-// checks 4 rows with two aligned int4 loads.
+// mask: (B, num_head, S_k, 2) int32 [lt_start, ut_end]; each thread checks 4 rows via two int4 loads.
 template <int num_warps = 8, int row_per_warp = 32>
 __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
     const int* const __restrict__ mask,
@@ -166,7 +163,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const __restrict__ wptr,
     int* const __restrict__ block_work_idx,
     int* const __restrict__ block_cnt_semaphore,      // for dynamic scheduling
-    int* const __restrict__ exit_count,               // CTAs past their last work; zeroed per launch
+    int* const __restrict__ exit_count,               // exited CTAs; zeroed per launch
     int* const __restrict__ stream_coordinator,
     const int* const __restrict__ copy_chunk_mask,
     const int my_pe,
@@ -207,18 +204,10 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int64_t* const sema_inter = semaphores;
     int64_t* const sema_intra = semaphores + sema_inter_size;
 
-    // Publishes the frontier: wptr = min over all CTAs' latest completed work id. Lane j
-    // of every CTA reads slot j, so the grid has exactly 32 CTAs (static_assert at the
-    // launch site). Each CTA releases its slot after the bar.sync that ends its copy;
-    // the lanes' acquires plus bar.warp.sync carry every CTA's data to the publishing
-    // lane, whose release fetch_max pairs with the compute gate's acquire. A stale slot
-    // is only ever smaller, so a stale read keeps wptr conservative.
-    // The min cannot guarantee the final INT_MAX: two CTAs finishing together may each
-    // read the other's slot before its INT_MAX store lands (store buffering; release
-    // and acquire do not forbid it), and nobody publishes after them. So every CTA also
-    // counts its exit with an acq_rel RMW. RMWs on one address are totally ordered, so
-    // exactly one CTA reads gridDim.x - 1; it is the last to exit and has acquired every
-    // other exit (all of them form one release sequence), so its INT_MAX is complete.
+    // wptr = min of all CTAs' latest done work id; lane j reads CTA j's slot, so the grid is 32 CTAs.
+    // Slot release + lane acquires carry every CTA's data to the publisher; a stale slot only lowers wptr.
+    // The min can miss the final INT_MAX (two exiting CTAs may read each other's stale slots), so
+    // the last exiter, found by the acq_rel exit_count RMW, publishes INT_MAX.
     auto update_wptr_and_work_id_sync = [&](int wid) {
         if (threadIdx.x < 32) {
             bool exiting = false;                                       // owning lane only
@@ -260,8 +249,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         if constexpr (use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {
                 const int counter_offset = target_rank_val + total_n_pes * batch_id;
-                // acq_rel: releases this CTA's SR buffer writes; the winner acquires all of
-                // them before notify_batch_ready_to_same_node releases to the peers.
+                // acq_rel: release this CTA's SR writes; the winner acquires all before notifying peers.
                 int prev = cuda::atomic_ref<int, cuda::thread_scope_device>(rank_empty_counters[counter_offset])
                     .fetch_add(1, cuda::memory_order_acq_rel);
                 if (prev + 1 == work_per_chunk) {
@@ -301,7 +289,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             is_phase1 = info.is_phase1;
             seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk);
 
-            // mask_index: seqlen_id to copy_chunk_mask entry (mask laid out in SR buffer order from seqlen 0)
+            // copy_chunk_mask is in SR buffer order from seqlen 0
             mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + seqlen_id / row_per_block;
 
             // Source address in remote_pe's SR buffer
@@ -373,8 +361,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     }
 }
 
-// Backward remote get kernel: gathers one segment (num_chunks chunks) of the split AG.
-// The bwd compute kernel gates each KV tile on the per-work work_done flag.
+// Bwd remote get of one split-AG segment; the compute kernel gates each KV tile on work_done.
 //
 // @param num_chunks  total chunks per segment (always the real count, e.g. 4 for CP16)
 // @param has_local_chunk  true iff segment 0 (the first chunk is local and should be skipped)
@@ -423,14 +410,11 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
     const int total_works = num_batch * work_per_seg;
     // Per-stage batch stride = num_chunks * S_chunk * S_stride.
-    // Both dst (k_sr) and src (local_k) live in the SR buffer. Hierarchical: it is
-    // partitioned into num_segments sub-tensors of B * num_chunks * S_chunk rows and the
-    // caller advances only k_sr per segment; local_k stays at the SR base.
+    // Hierarchical: one SR region per segment; the caller advances only k_sr, local_k stays at the base.
     // Non-hierarchical: k_sr stays at the base; local_k is the base or the tail backup.
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S * row_stride;
-    // remote_pe's local K/V (non-hierarchical): its SR base, chunk 0 of each batch row, when the
-    // gather is one segment; otherwise its (B, S_chunk) tail backup (bwd_local_kv_at_base).
+    // Non-hierarchical remote local K/V: SR base for one segment, else the (B, S_chunk) tail backup.
     const int64_t local_batch_stride = num_segments == 1 ? batch_stride : S_chunk * row_stride;
 
     extern __shared__ int smem_chunk_mask[];
@@ -459,9 +443,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const work_done = block_work_idx;
 
     // Per-work ready flag update (thread-0 only):
-    //   Mark:  release store work_done[wid]=1. Thread 0 is ordered after every thread's copy
-    //          by the bar.sync ending two_buffers_getmem_block, and after NIC data by its own
-    //          completed wait(); pairs with the compute kernel's acquire load.
+    //   Mark:  release store work_done[wid]=1, after all copies (bar.sync) and NIC data (wait());
+    //          pairs with the compute kernel's acquire load.
     //   Next:  atomicAdd to grab the next work item
     // No scan or wptr update needed — compute kernel checks work_done[] directly.
     // All local chunk works (every batch) are pre-filled by InitBitmapForLocalSkip,
@@ -486,7 +469,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     };
 
     // Phase 1 per-batch congruence_notify (hierarchical only).
-    // Same logic as in the forward kernel; see the comments there.
+    // Same as the forward kernel.
     auto try_congruence_notify = [&](int chunk_id, int target_rank_val, bool is_phase1_val, int batch_id) {
         if constexpr (use_hierarchical) {
             if (threadIdx.x == 0 && is_phase1_val) {
@@ -538,11 +521,9 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             // seq_work_id * row_per_block == chunk_id * S_chunk + row_within_chunk * row_per_block
             seqlen_id = seq_work_id * row_per_block;
 
-            // src: local_k is the unadvanced SR buffer base on every PE, laid out as
-            //   [segment][batch][chunk][row] (each segment region is num_batch * batch_stride).
-            //   Phase 1: target_rank's local KV, at segment 0, chunk 0.
-            //   Phase 2: src_pe fetched target_rank at its own position p during segment
-            //     p / num_chunks, so the data is in that segment's region at chunk p % num_chunks.
+            // src: local_k is the SR base, laid out [segment][batch][chunk][row].
+            //   Phase 1: target_rank's local KV (segment 0, chunk 0). Phase 2: src_pe's copy, stored
+            //   at its fetch position p (segment p / num_chunks, chunk p % num_chunks).
             const hier::HierBwdChunk src = hier::hier_bwd_src_chunk(
                 info, num_chunks, total_n_pes, gpus_per_node);
             src_addr = (src.segment * num_batch + batch_id) * batch_stride

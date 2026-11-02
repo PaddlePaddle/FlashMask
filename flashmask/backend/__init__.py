@@ -37,10 +37,8 @@ def _backend_class(name):
         if name not in _IMPLS:
             raise ValueError(f"unknown framework {name!r}; expected one of {sorted(_IMPLS)}")
         submodule, cls_name = _IMPLS[name]
-        # Imported by flashmask.frontend.<name>, which binds it in this namespace.
-        # Read rather than imported: a host that moves the package to another name
-        # in sys.modules after loading it (paddlefleet_ops does) leaves nothing for
-        # an import statement to resolve.
+        # Bound by flashmask.frontend.<name>; read from globals because hosts like
+        # paddlefleet_ops rename the package in sys.modules.
         module = globals().get(submodule)
         if module is None:
             raise RuntimeError(

@@ -143,7 +143,7 @@ Overlap also assumes the following usage contract, which it does not check:
 - **One active CP group per process.** Every rank of a group passes the same group object. Switching to a different group rebuilds the communicator, and the teardown of the old one is collective: all ranks of the old group must switch at the same call. Alternating between groups rebuilds every time.
 - **Rank-uniform schedules.** All ranks make the same sequence of overlap calls with the same shapes. A Python exception raised before a backward call starts its all-gather leaves the communicator usable; one raised in the middle of the backward does not.
 
-`FLASHMASK_SPIN_TIMEOUT_S` (default `1800`, `0` disables) bounds how long an Overlap communication kernel waits for a peer before it prints a diagnostic and traps, like NCCL's collective timeout. The same budget bounds the attention kernels' waits on the gathered KV; on timeout they print the stuck flag and fail with a device-side assert.
+`FLASHMASK_SPIN_TIMEOUT_S` (default `300`, `0` disables) bounds how long an Overlap communication kernel waits for a peer before it prints a diagnostic and traps, like NCCL's collective timeout. The same budget bounds the attention kernels' waits on the gathered KV; on timeout they print the stuck flag and fail with a device-side assert. Raise it if ranks can legitimately drift apart for longer before an overlap call, e.g. rank-0-only checkpoint saving or evaluation.
 
 <details>
 <summary>Using Overlap on SM90 (Hopper)</summary>

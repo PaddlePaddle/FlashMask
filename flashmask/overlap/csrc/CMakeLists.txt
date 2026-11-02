@@ -49,15 +49,14 @@ if(NOT FM4_OVERLAP_CUTLASS_INC)
     message(FATAL_ERROR "FM4_OVERLAP_CUTLASS_INC is required (dir containing cutlass/bfloat16.h).")
 endif()
 
-# One SASS per listed arch: sm_100a and sm_103a binaries are not interchangeable,
-# so a .so for both needs both. setup.py passes a ';' list; ',' is accepted too.
-# The gencode 'compute_' must drop the trailing 'a'
+# One SASS per arch (';' or ',' list): sm_100a and sm_103a binaries are not
+# interchangeable. The gencode 'compute_' must drop the trailing 'a'
 # (compute_90a is illegal; the correct pair is arch=compute_90,code=sm_90a).
 string(REPLACE "," ";" FM4_OVERLAP_CUDA_ARCH "${FM4_OVERLAP_CUDA_ARCH}")
 set(FM4_OVERLAP_GENCODE "")
 foreach(_arch IN LISTS FM4_OVERLAP_CUDA_ARCH)
     string(REGEX REPLACE "a$" "" _arch_num "${_arch}")
-    # One token per arch: CMake de-duplicates repeated options such as a bare -gencode.
+    # One token per arch: CMake de-duplicates a repeated bare -gencode.
     list(APPEND FM4_OVERLAP_GENCODE "-gencode=arch=compute_${_arch_num},code=sm_${_arch}")
 endforeach()
 

@@ -666,11 +666,7 @@ def make_gmem_tensor_from_addr(
 
 
 def int64_dims(*dims):
-    """Promote runtime Int32 dims to Int64 so stride products cannot wrap at 2^31.
-
-    The from_dlpack(...).mark_layout_dynamic path already yields 64-bit dynamic strides,
-    so Int64 strides make these raw-address views type-identical to the dense views.
-    """
+    """Promote runtime Int32 dims to Int64 so stride products cannot wrap at 2^31."""
     return tuple(cutlass.Int64(x) for x in dims)
 
 
@@ -682,7 +678,7 @@ def make_contiguous_bshd_from_addr(addr, b, s, h, d, dtype, *, align=16, loc=Non
     (?,?,?,?):(?,?,?,1), matching the from_dlpack(...).mark_layout_dynamic path. Python
     ints bake a static layout the TMA descriptor builder specializes differently, which
     reads the wrong bytes. Stride is row-major BSHD (last static 1, rest from the dims),
-    computed in Int64 like the dlpack strides: S*H*D reaches 2^31 at e.g. S=256K, H=16, D=512.
+    computed in Int64.
     """
     s64, h64, d64 = int64_dims(s, h, d)
     stride = (s64 * h64 * d64, h64 * d64, d64, 1)
@@ -696,8 +692,7 @@ def make_bhsd_storage_bshd_from_addr(
     """Build a logical (B, S, H, D) view over physical BHSD storage.
 
     The dimensions must remain runtime Int32 so the resulting layout stays
-    dynamic for TMA descriptor construction. Strides are Int64 (see
-    make_contiguous_bshd_from_addr). No data movement is performed.
+    dynamic for TMA descriptor construction. Strides are Int64. No data movement is performed.
     """
     s64, h64, d64 = int64_dims(s, h, d)
     stride = (h64 * s64 * d64, d64, s64 * d64, 1)

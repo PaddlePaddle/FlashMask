@@ -117,8 +117,7 @@ S_LOCAL=${S_LOCAL:-$((32768 / CP_SIZE))}
 BS=${BS:-1,2}
 HQ=${HQ:-16}
 HKS=${HKS:-16,4,1}
-# ONE mask per launch by default; run_cp_overlap_sweep.sh covers the full matrix.
-# Switching mask content mid-process no longer corrupts dK/dV (fixed in 647d699).
+# One mask per launch by default; run_cp_overlap_sweep.sh covers the full matrix.
 MASKS=${MASKS:-document}
 REPEATS=${REPEATS:-2}
 

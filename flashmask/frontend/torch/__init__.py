@@ -22,8 +22,7 @@ from typing import Optional
 
 import torch
 
-# The adapters are bound here, where the framework is already a hard import, so
-# get_backend / get_dist never import at call time.
+# Bind the adapters here so get_backend / get_dist never import at call time.
 from ...backend import _torch as _backend_adapter  # noqa: F401
 from ...backend import get_backend
 from ...distributed import _torch as _dist_adapter  # noqa: F401
@@ -58,11 +57,9 @@ def flashmask_attention(
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         learnable_sink: (num_heads,) additive sink logit per head.
         return_lse: also return the log-sum-exp, (batch, num_heads, seqlen_q).
-        group: context-parallel process group; enables the FM-4 overlap path
-            when its world size is greater than 1. Then k/v are the local S_local
-            shard and the mask key axis has length S_local * group_size, in
-            group-rank chunk order (chunk r is rank r's local K/V). The library
-            reorders it internally; pass it unshifted.
+        group: context-parallel group; world size > 1 enables the overlap path.
+            k/v are then local shards, and the mask key axis spans all ranks'
+            chunks (S_local * group_size) in group-rank order, unshifted.
 
     Returns:
         ``out``, or ``(out, lse)`` when ``return_lse``.
@@ -81,7 +78,7 @@ def flashmask_attention(
             "startend_row_indices.shape[0] must equal batch_size, but got "
             f"{startend_row_indices.shape[0]} and {k.shape[0]}"
         )
-        # Overlap: the mask covers the full key length, group-rank chunk order.
+        # With a CP group the mask spans the full key length.
         group_size = _dist_world_size(be, group) if group is not None else 1
         seqlen_k = k.shape[1] * group_size
         assert startend_row_indices.shape[2] == seqlen_k, (

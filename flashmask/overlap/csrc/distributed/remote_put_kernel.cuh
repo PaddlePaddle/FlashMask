@@ -21,8 +21,8 @@ namespace flashmask {
  * actually an all-gather op implemented by an A2A op, the buffer cannot be reused the same way as the
  * all-gather overlap.
  *
- * P2P commit: when the last CTA finishes all puts to a given rank, it signals that specific
- * remote consumer immediately (strong add on SignalBuffer::rs_full) — no blocking quiet or group commit needed.
+ * P2P commit: the last CTA done with a rank signals that consumer at once (strong add on
+ * SignalBuffer::rs_full); no quiet or group commit.
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
     int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
@@ -94,8 +94,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         }
     };
 
-    // thread blockIdx.x claims the CTA's next work id from the dynamic scheduler and the
-    // __syncthreads publishes it to the whole CTA; unlike the AG, the put has no frontier.
+    // Thread blockIdx.x claims the CTA's next work id; __syncthreads shares it. No frontier, unlike the AG.
     auto update_work_id_sync = [&]() {
         if (threadIdx.x == blockIdx.x) {
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
@@ -113,8 +112,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         if (threadIdx.x == 0) {
             // chunk_offset maps seg_chunk_id back to the counter index for remote chunks
             int counter_idx = seg_chunk_id - chunk_offset;
-            // acq_rel: the winner acquires every CTA's puts (their release half) before
-            // its own release add below; a relaxed RMW would give it no acquire.
+            // acq_rel: the winner must acquire every CTA's puts before its release add below.
             int prev = cuda::atomic_ref<int, cuda::thread_scope_device>(rank_commit_counters[counter_idx])
                 .fetch_add(1, cuda::memory_order_acq_rel);
             if (prev + 1 == works_per_rank) {

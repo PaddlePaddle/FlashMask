@@ -43,10 +43,9 @@ struct HostRegion {
     ncclWindow_t window = nullptr;
 };
 
-// FLASHMASK_SPIN_TIMEOUT_S: device spin budget in whole seconds, 0 disables the
-// time-based trap. The default matches Paddle's collective timeout.
+// FLASHMASK_SPIN_TIMEOUT_S: device spin budget in seconds (0 disables it).
 unsigned long long spin_timeout_ns_from_env() {
-    constexpr unsigned long long kDefaultSeconds = 1800;
+    constexpr unsigned long long kDefaultSeconds = 300;
     constexpr unsigned long long kNsPerSecond = 1000ull * 1000ull * 1000ull;
     const char* text = std::getenv("FLASHMASK_SPIN_TIMEOUT_S");
     if (text == nullptr || *text == '\0') {
@@ -63,10 +62,8 @@ unsigned long long spin_timeout_ns_from_env() {
     return seconds * kNsPerSecond;
 }
 
-// Each block drives one GIN context, each thread one peer. A strong signal is visible
-// only after every earlier put on its context to that peer has settled, so once a
-// rank has counted one from every (context, peer) pair, nothing issued to it before
-// the drain can still land.
+// One strong signal per (GIN context, peer): it lands only after every earlier put on that
+// context to that peer, so counting all of them means the drain is complete.
 __global__ void DrainSendKernel(uint64_t* drain_signal) {
     if (static_cast<int>(threadIdx.x) == g_device_state.world_rank) {
         return;
@@ -165,8 +162,7 @@ public:
         region.bytes = bytes;
         FM_NCCL_CHECK(ncclMemAlloc(&region.raw_ptr, bytes));
 
-        // STRICT_ORDERING only orders NIC (IB Verbs) traffic; single node has no GIN and
-        // reaches signals with LSA atomics only.
+        // STRICT_ORDERING only affects NIC traffic; single node uses LSA atomics only.
         const bool strict = kind == WindowKind::Signal && use_rail_;
         const ncclResult_t register_result = ncclCommWindowRegister(
             comm_, region.raw_ptr, bytes, &region.window,
@@ -225,8 +221,7 @@ public:
         FM_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
-    // Single node has no GIN contexts: every remote access was an LSA load/store or
-    // atomic of a kernel that has completed, so synchronizing the device suffices.
+    // Single node: all remote accesses came from finished kernels, so a device sync suffices.
     uint64_t quiesce(uint64_t* drain_signal, uint64_t drained) {
         FM_CUDA_CHECK(cudaDeviceSynchronize());
         if (num_qps_ > 0) {

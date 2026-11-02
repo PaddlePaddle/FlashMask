@@ -28,9 +28,8 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
 
 namespace flashmask {
 
-// Host setup calls (allocation, stream / event creation, synchronization) whose results
-// later launches depend on. Throws like every other host failure; the noexcept bridge
-// entry points turn the escape into std::terminate, which prints what().
+// Checks host setup calls that later launches depend on. Throws; the noexcept bridge
+// entry points turn that into std::terminate, which prints what().
 inline void check_cuda(cudaError_t err, const char* call) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("[FlashMask Overlap] ") + call + " failed: "

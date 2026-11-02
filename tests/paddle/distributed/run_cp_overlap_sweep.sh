@@ -7,8 +7,7 @@
 # process (2 reps). S_local = 32768/CP so S_total=32768 (the DOC_PACKING fits exactly).
 # CP16 needs two nodes and is intentionally left out of this single-node gate.
 #
-# One process per mask keeps the launches independent; switching mask content
-# mid-process no longer corrupts dK/dV (fixed in 647d699).
+# One process per mask keeps the launches independent.
 #
 # Usage (single node, just run it):
 #   bash run_cp_overlap_sweep.sh

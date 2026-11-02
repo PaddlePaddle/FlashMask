@@ -41,7 +41,7 @@ class PaddleBackend(BackendBase):
         return paddle.device.current_stream().stream_base.cuda_stream
 
     def is_stream_capturing(self):
-        # Paddle exposes only the process-wide capture state of its CUDA graph API.
+        # Paddle only exposes the process-wide CUDA graph capture state.
         return bool(paddle.base.core.is_cuda_graph_capturing())
 
     # -- introspection -------------------------------------------------------

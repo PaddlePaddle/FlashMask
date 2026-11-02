@@ -52,11 +52,8 @@ static __global__ void RsWaitFullKernel(
 }
 
 /**
- * @brief Wait (on stream) until all K producers of this stage committed.
- *   Exactly one call per segment per BWD, matching the producers' one add each.
- * @param rs_full_seg SignalBuffer::rs_full(seg)
- * @param rs_expected_seg SignalBuffer::rs_expected(seg)
- * @param num_producers K, the number of remote producers of this stage
+ * @brief Stream-ordered wait until the K producers of this stage committed.
+ *   Call once per segment per BWD (each producer adds once).
 */
 void consumer_wait_full(
     const uint64_t* const __restrict__ rs_full_seg,
@@ -84,7 +81,7 @@ __device__ void producer_wait_empty(
  * In hierarchical mode, the producers for my_pe are NOT a contiguous rank range.
  * For segment [logical_pos_base, logical_pos_base+num_chunks), PE X sends chunk c
  * to my_pe iff X == hier_sender_at_pos(logical_pos_base+c, my_pe, ...).
- * This kernel notifies each sender that the buffer slot is empty and ready to receive.
+ * Notifies each sender that its buffer slot is empty.
  *
  * Launch: <<<1, num_chunks>>>
  */
@@ -102,9 +99,6 @@ __global__ void HierFusedConsumerNotifyEmpty(
     gin::remote_store(semaphores + self_rank, int64_t(1), sender);
 }
 
-/**
- * Host wrapper: launch HierFusedConsumerNotifyEmpty.
- */
 void notify_consumer_empty_hier(
     int64_t* const semaphores,
     int segment_idx,

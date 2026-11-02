@@ -55,18 +55,17 @@ def _overlap_gate_bwd(
 ):
     """Wait for the split-AG work item covering this cluster-wide KV tile.
 
-    Only ``tidx == 0`` spins. Every lane of the (single) load warp must call this: after
-    the warp sync every lane, including the ``elect.sync`` lane that issues the K/V TMA
-    loads, runs the generic -> async proxy fence itself.
+    Only ``tidx == 0`` spins, but every lane of the load warp must call this so each
+    lane, including the TMA issuer, runs the proxy fence.
     """
     if tidx == 0:
         right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
         work_per_batch = seqlen_k // comm_rpb
         work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
         wait_flag_eq(work_done, Int32(work_id), Int32(1), spin_timeout_ns)
-    # Carries lane 0's acquire to every lane of the load warp.
+    # Share lane 0's acquire with the whole warp.
     cute.arch.sync_warp()
-    # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
+    # Order the acquire before this lane's TMA (async-proxy) reads.
     cute.arch.fence_proxy("async.global")
 
 
@@ -868,9 +867,8 @@ class FlashAttentionBackwardSm100:
                 overlap_dv_addr, overlap_b, overlap_s, overlap_h, overlap_d,
                 mQ.element_type, align=16,
             )
-        # 1-CTA skips the dKV epilogue of a key block with no unmasked query block.
-        # Plain dK/dV is allocated zeroed; the reused NCCL send slot is not, and the
-        # reduce-scatter sums every row of it, so those rows must be stored as zero.
+        # 1-CTA skips the dKV epilogue for fully masked key blocks. The reused NCCL send
+        # slot is not zeroed and the reduce-scatter sums all rows, so store zeros there.
         self.zero_skipped_dKV = const_expr(
             overlap_dk_addr is not None
             and not self.use_2cta_instrs
@@ -4438,8 +4436,8 @@ class FlashAttentionBackwardSm100:
                     and self.enable_flashmask
                     and not self.use_2cta_instrs
                 ):
-                    # A per-q-head mask can skip this tile for one q-head of a KV group
-                    # only; it must still take its turn in the dK/dV accumulate order.
+                    # A per-q-head mask may skip this tile for one q-head only; it must
+                    # still take its turn in the dK/dV accumulate order.
                     if zero_block:
                         self.pass_dKV_semaphore(
                             dp_idx, wg_idx, batch_idx, head_idx, n_block, mdV_semaphore
@@ -5147,11 +5145,7 @@ class FlashAttentionBackwardSm100:
         mdKV: cute.Tensor,
         K_or_V: cutlass.Constexpr[str],
     ):
-        """Zero this key block's dK or dV rows (MHA, 1-CTA).
-
-        Plain 128-bit stores from all compute threads, bounded by seqlen_k and the
-        real head_dim like the TMA epilogue.
-        """
+        """Zero this key block's dK or dV rows (MHA, 1-CTA), bounded by seqlen_k and head_dim."""
         assert K_or_V in ("K", "V")
         if const_expr(K_or_V == "K"):
             tile_hdim, check_hdim_oob = self.tile_hdim, self.check_hdim_oob
@@ -5195,11 +5189,9 @@ class FlashAttentionBackwardSm100:
         n_block: Int32,
         mdKV_semaphore: cute.Tensor,
     ):
-        """The deterministic dKV epilogue's semaphore handshake without the accumulate.
+        """Pass this q-head's dKV semaphore turn without accumulating.
 
-        Same flag and turn as epilogue_dK_or_dV_tma: one thread per warpgroup waits
-        for this q-head's turn and passes it on. The acquire -> release on one thread
-        keeps the previous q-heads' accumulates ordered before the next q-head.
+        The acquire -> release on one thread keeps earlier q-heads' accumulates ordered first.
         """
         mdKV_semaphore_cur = mdKV_semaphore[
             n_block, None, head_idx // self.qhead_per_kvhead, batch_idx

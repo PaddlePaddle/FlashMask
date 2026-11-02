@@ -55,23 +55,18 @@ def _overlap_gate(
     n_block_size: cutlass.Constexpr[int],
     kv_chunk_size: cutlass.Constexpr[int],
 ):
-    """FM-4 overlap gate: spin until the comm side has gathered the KV rows of tile ``nblk``.
+    """Spin until the comm side has gathered the KV rows of tile ``nblk``.
 
-    ``write_ptr`` is one batch-major row frontier scalar (atomicMax, right-to-left). A
-    negative ``reverse_row`` is the local chunk, written before the AG kernel and ordered
-    by the stream coordinator plus the kernel boundary, so no wait and no fence. Every lane
-    of the load warp calls this with warp-uniform arguments; ``tidx == 0`` spins, then all
-    lanes run the generic -> async proxy fence. Module scope keeps ``__closure__`` empty for
-    the DSL ``closure_check``.
+    All load-warp lanes must call this; the local chunk (``reverse_row < 0``) needs no wait.
     """
     reverse_row = s_total - nblk * n_block_size - kv_chunk_size
     if reverse_row >= 0:
         if tidx == 0:
             target = batch_idx * (s_total - kv_chunk_size) + reverse_row
             wait_write_ptr_ge(write_ptr, 0, Int32(target), spin_timeout_ns)
-        # Carries lane 0's acquire to every lane of the load warp.
+        # Share lane 0's acquire with the whole warp.
         cute.arch.sync_warp()
-        # Generic-proxy acquire -> this lane's async-proxy (TMA) reads of the gathered rows.
+        # Order the acquire before this lane's TMA (async-proxy) reads.
         cute.arch.fence_proxy("async.global")
 
 
@@ -2416,7 +2411,7 @@ class FlashAttentionForwardSm100:
             # FM-4 overlap gate: bound via partial (NOT a nested closure) so it has no
             # __closure__ and passes the DSL closure_check inside the dynamic load loop.
             if const_expr(self.enable_overlap):
-                # The gate's warp sync orders the TMA issuer only within one load warp.
+                # The gate's warp sync only covers one load warp.
                 assert len(self.load_warp_ids) == 1
                 gate_batch_idx = batch_idx
                 if const_expr(self.overlap_bhsd_layout):

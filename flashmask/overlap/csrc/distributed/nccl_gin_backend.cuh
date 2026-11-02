@@ -41,7 +41,7 @@ struct DeviceState {
     int rail_rank;
     int num_qps;
     bool use_rail;
-    unsigned long long spin_timeout_ns;   // 0: no time-based trap (see SpinWatchdog)
+    unsigned long long spin_timeout_ns;   // 0: no timeout trap
 };
 
 enum class Compare {
@@ -62,9 +62,7 @@ int rank(const Context& context);
 int nranks(const Context& context);
 int num_lsa_ranks(const Context& context);
 
-// Signal windows hold VA signals, which NCCL requires to be registered with
-// NCCL_WIN_STRICT_ORDERING once they are reached through GIN (cross-node meshes);
-// data windows (payload and putValue flags) use NCCL_WIN_DEFAULT.
+// Signal windows need NCCL_WIN_STRICT_ORDERING when reached through GIN; data windows don't.
 enum class WindowKind {
     Data,
     Signal,
@@ -74,12 +72,10 @@ void* alloc(Context& context, size_t bytes, WindowKind kind = WindowKind::Data);
 void free(Context& context, void* ptr);
 void free_noexcept(Context& context, void* ptr) noexcept;
 void barrier(Context& context);
-// Collective. On return, every put, putValue and signal that any rank issued before
-// the call has settled in its target's memory, so windows may be freed or rezeroed.
-// `drain_signal` is a VA-signal word reserved for this call and `drained` its current
-// cumulative count; returns the new count.
+// Collective: returns once all puts/signals issued before it have landed, so windows can be
+// freed or rezeroed. Returns the new cumulative count of `drain_signal`.
 uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained);
-// Sum of the requested sizes of every registered window.
+// Total requested size of all registered windows.
 size_t window_bytes(const Context& context);
 
 extern __device__ __constant__ DeviceState g_device_state;
@@ -174,13 +170,10 @@ __device__ __forceinline__ bool force_network_atomics() {
     return mesh_is_cross_node();
 }
 
-// VA signals. Every signal word lives in the communicator's signal window and only
-// ever counts up; it is touched only by the adds below, by the loads in
-// signal_wait_exact, and by the one-off zeroing before the first barrier. The waiter
-// knows the exact cumulative count it expects, so no word is ever reset.
+// VA signals only ever count up; waiters compare against the exact expected count, so no
+// signal word is ever reset.
 
-// Refcount add: orders nothing but the caller's own earlier accesses, so the weak
-// signal suffices.
+// Weak signal: refcount adds need no ordering with other puts.
 __device__ __forceinline__ void remote_add(uint64_t* sig, uint64_t value, int world_peer) {
     if (!force_network_atomics()) {
         if (auto* peer_sig = static_cast<uint64_t*>(get_lsa_ptr(sig, world_peer)); peer_sig != nullptr) {
@@ -212,11 +205,8 @@ static __device__ __noinline__ void network_strong_signal_add(
         ncclGinOptFlagsDefault);
 }
 
-// Data-ordering add: routed through the shared kOrderedPutContext (one QP per peer,
-// GPU-wide sharing) as a *strong* VA signal. Every per-CTA put also travels the
-// ordered context (see two_buffers_putmem_block), so the signal's arrival implies
-// that ALL preceding puts to this peer -- from any CTA -- have settled in remote
-// memory.
+// Strong signal on the shared ordered context, which all puts also use, so its arrival
+// implies every earlier put to this peer (from any CTA) has landed.
 __device__ __forceinline__ void remote_strong_add(uint64_t* sig, uint64_t value, int world_peer) {
     if (!force_network_atomics()) {
         if (auto* peer_sig = static_cast<uint64_t*>(get_lsa_ptr(sig, world_peer)); peer_sig != nullptr) {
@@ -258,16 +248,8 @@ __device__ __forceinline__ void remote_or(int64_t* ptr, int64_t value, int world
     atom.fetch_or(value, cuda::memory_order_release);
 }
 
-// ---------------------------------------------------------------------------
-// Spin watchdog. Every device-side spin in the comm runtime ticks one of these.
-// The budget (FLASHMASK_SPIN_TIMEOUT_S, read once at context init) must exceed the
-// longest legitimate rank skew, like a framework collective timeout, so a trip means
-// a lost signal or a peer that stopped participating.
-// Not covered: NIC error completions. They are handled inside NCCL's GIN wait, which
-// drops the status without an abort flag (the fetch counts as landed) or retries until
-// ncclCommAbort; DOCA only prints the error CQE. The compute-side gates
-// (flashmask/cute/barrier.py) apply the same budget.
-// ---------------------------------------------------------------------------
+// Spin watchdog: traps a device spin that exceeds FLASHMASK_SPIN_TIMEOUT_S (lost signal or
+// dead peer). The budget must exceed normal rank skew. NIC error completions are not caught.
 
 constexpr unsigned kSpinCheckInterval = 1024;   // polls between timer reads
 
@@ -282,8 +264,7 @@ static __device__ __noinline__ void spin_trap(const char* site, const char* reas
     __trap();
 }
 
-// Returns the spin's start time. It is taken lazily on the first check, so a wait
-// that ends within one interval never reads the timer.
+// Returns the spin's start time, read lazily so short waits never read the timer.
 static __device__ __noinline__ unsigned long long spin_watchdog_check(
         unsigned long long start_ns, const char* site, const void* addr,
         unsigned long long expected, unsigned long long actual) {
@@ -314,9 +295,8 @@ struct SpinWatchdog {
     }
 };
 
-// Spins until done(*ptr). Polls with relaxed system-scope loads, which do not
-// invalidate L1 per poll, then re-reads once with an acquire load; that load is what
-// orders the caller's later accesses. Returns the acquired value, for which done holds.
+// Spins until done(*ptr) with relaxed loads, then re-reads with acquire to order later
+// accesses. Returns the acquired value.
 template <typename T, typename Done>
 __device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* site,
                                         unsigned long long expected) {
@@ -336,8 +316,7 @@ __device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* sit
     }
 }
 
-// Flag wait. Out of line so the watchdog state stays out of the register-capped comm
-// kernel frames (see network_get_two_buffers in gin_copy_utils.cuh).
+// Out of line to keep watchdog state out of the register-capped comm kernels.
 static __device__ __noinline__ void wait_until(
         const int64_t* ptr, Compare compare, int64_t value, const char* site) {
     spin_until(ptr, [=](int64_t current) {
@@ -346,12 +325,8 @@ static __device__ __noinline__ void wait_until(
     }, site, value);
 }
 
-// Waits until a monotonic signal counter reaches `want`, the exact cumulative number
-// of adds the protocol issued to it (rolling compare, as ncclGin::waitSignal). The
-// loads are those of ncclGin::readSignal on a VA signal (gin__funcs.h: a system-scope
-// cuda::atomic_ref load), relaxed while polling and acquire for the final read. A count
-// past `want` is a duplicated or misrouted signal: trap instead of releasing the waiter
-// early.
+// Waits until a monotonic signal counter reaches exactly `want`; traps on overshoot
+// (duplicated or misrouted signal).
 static __device__ __noinline__ void signal_wait_exact(
         const uint64_t* sig, uint64_t want, const char* site) {
     const uint64_t got = spin_until(sig, [=](uint64_t current) {

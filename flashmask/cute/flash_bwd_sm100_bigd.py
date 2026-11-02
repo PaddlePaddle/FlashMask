@@ -770,9 +770,8 @@ class FlashAttentionBackwardSm100BigD:
         self.num_d_chunks = self.tile_hdim // d_chunk
         self.num_dv_chunks = self.tile_hdimv // dv_chunk
         assert 1 <= d_chunks_resident <= self.num_d_chunks
-        # head_dim slicing of the fp32 accumulators, so the shared postprocess can run
-        # at head_dim = slice (one launch, slices folded into the head axis). Public:
-        # ops/bwd.py reads these to build that postprocess view.
+        # fp32 accumulator slice widths; slices fold into the head axis so one postprocess
+        # launch covers them. Read by ops/bwd.py.
         self.accum_slice_d = accum_slice_width(self.tile_hdim, d_chunk)
         self.accum_slice_dv = accum_slice_width(self.tile_hdimv, dv_chunk)
 
@@ -1401,8 +1400,7 @@ class FlashAttentionBackwardSm100BigD:
         # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
         # capsule, so rebuild the views from the raw segment addresses. The dims must
         # stay runtime Int32 -- a static layout specializes the TMA descriptor
-        # differently and reads the wrong bytes. head_dim > 256 here, so the
-        # communicator's SRBuffer is always BSHD (its BHSD transpose caps D at 256).
+        # differently and reads the wrong bytes. head_dim > 256 here, so SRBuffer is BSHD.
         if cutlass.const_expr(overlap_k_addr is not None):
             mK = utils.make_contiguous_bshd_from_addr(
                 overlap_k_addr,
@@ -3280,10 +3278,8 @@ class FlashAttentionBackwardSm100BigD:
             )
             # gmem accumulator for this CTA's block. Two levels of blocking:
             #   [head_dim slice][row block][4-col group][row][4 cols]
-            # The outer slice exists so the shared postprocess can run with
-            # head_dim = accum_slice: each slice is a contiguous region that looks
-            # exactly like a head_dim=accum_slice accumulator, so the host folds the
-            # slices into the head axis and covers them all in one launch.
+            # Each outer slice looks like a head_dim=accum_slice accumulator, so the host
+            # folds slices into the head axis for one postprocess launch.
             # dK / dV are indexed by the key block (the grid's x), dQ by the m
             # iteration.
             num_n_block = cute.ceil_div(seqlen_k, self.tile_n)

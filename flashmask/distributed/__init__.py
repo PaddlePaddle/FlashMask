@@ -28,8 +28,7 @@ def get_dist(name):
         if name not in _IMPLS:
             raise ValueError(f"unknown framework {name!r}; expected one of {sorted(_IMPLS)}")
         submodule, cls_name = _IMPLS[name]
-        # Imported by flashmask.frontend.<name>; read, not imported, for the same
-        # reason as flashmask.backend._backend_class.
+        # Bound by flashmask.frontend.<name>; see flashmask.backend._backend_class.
         module = globals().get(submodule)
         if module is None:
             raise RuntimeError(

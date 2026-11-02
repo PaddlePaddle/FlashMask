@@ -276,10 +276,9 @@ def _detect_nccl_version(nccl_home):
 
 
 def _detect_cuda_arch():
-    """sm arch list for -gencode, ';'-joined: FM4_OVERLAP_CUDA_ARCH, else the local GPU.
+    """';'-joined sm arch list for -gencode: FM4_OVERLAP_CUDA_ARCH, else the local GPU.
 
-    FM4_OVERLAP_CUDA_ARCH takes one arch or a ','/';' list (e.g. '100a;103a'); the
-    CMake builds SASS for each into one .so. The local GPU maps 10.3 -> '103a'.
+    The env var takes one arch or a ','/';' list, e.g. '100a;103a'.
     """
     env = os.environ.get('FM4_OVERLAP_CUDA_ARCH')
     if env:
@@ -475,9 +474,8 @@ if BUILD_UTILS:
 # --- overlap bridge: NCCL GIN + sm_90a/sm_100, built via standalone sub-CMake ---
 # Built when 'all' or 'ovl' is requested (BUILD_OVL); targets H/B only. NCCL
 # install and target arch are auto-detected; NCCL_HOME/NCCL_ROOT and
-# FM4_OVERLAP_CUDA_ARCH (one arch or a list) override. Missing NCCL or cutlass
-# is a build error when 'ovl' is named explicitly; under 'all' it warns and
-# skips the bridge, and the CuTe DSL core keeps working.
+# FM4_OVERLAP_CUDA_ARCH override. Missing NCCL or cutlass fails the build under
+# 'ovl'; under 'all' it only skips the bridge.
 if BUILD_OVL:
     _ovl_csrc = os.path.join(FLASHMASK_DIR, 'overlap', 'csrc')
     _ovl_pkg_dir = os.path.join(FLASHMASK_DIR, 'overlap')
@@ -504,8 +502,7 @@ if BUILD_OVL:
                         "is too old; requires NCCL >= 2.30.5")
 
     if _ovl_missing is not None and 'ovl' in requested_components:
-        # Named explicitly: a wheel without the bridge would only fail at the
-        # first overlap call, on every rank of the job.
+        # Fail now; otherwise every rank fails at its first overlap call.
         raise RuntimeError(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD} requests "
                            f"'ovl', but the overlap bridge cannot be built: {_ovl_missing}.")
     if _ovl_missing is not None:

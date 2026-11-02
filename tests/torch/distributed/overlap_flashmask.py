@@ -8,9 +8,8 @@ the CP ``group`` are handed to the FA-v4 SM100 in-library kernel, which gathers
 remote K/V internally (sparse all-gather) while computing, overlapping comm with
 compute, and reduce-scatters dK/dV back to the local share.
 
-The mask is handed to both passes in group-rank KV-chunk order (chunk r = rank r's
-local K/V, i.e. dual-chunk preprocessed + ``rearrange_blocks``); the library
-permutes it into its own SRBuffer order (circular or hierarchical).
+The mask is handed to both passes in group-rank chunk order (dual-chunk
+preprocessed + ``rearrange_blocks``); the library reorders it internally.
 """
 
 import torch
@@ -79,7 +78,7 @@ def _forward(query, key, value, startend_row_indices, group, causal):
 
 
 def _backward(query, key, value, startend_row_indices, output, log_sum_exp, output_grad, group, causal):
-    # dK/dV come back already reduce-scattered to the local share.
+    # dK/dV are already reduce-scattered to the local share.
     query_grad, key_grad, value_grad, _ = _flash_attn_bwd(
         query,
         key,

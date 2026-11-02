@@ -31,14 +31,12 @@ __device__ __forceinline__ bf16x4 to_bf16x4(float4 in) {
     return out;
 }
 
-// One component (dK or dV) of a reduce step. All pointers address (B, nc * S_chunk, H, D)
-// recv-slot layouts except out, which is (B, S_chunk, H, D).
-//   home      recv(0): read by the first step (kFoldHome); chunk 0 holds the low 8 bytes
-//             of every fp32 quad of the running sum
-//   home_hi   high 8 bytes: recv(0) chunk 1 when nc >= 2, recv(1) chunk 0 when nc == 1
-//   recv      recv(s) of this step; null for an absent component (kv_shared dV)
-// Not __restrict__: home_hi aliases home, and recv aliases home (kZero, which reads only
-// recv) or home_hi (nc == 1).
+// One component (dK or dV) of a reduce step. Pointers are (B, nc * S_chunk, H, D) recv slots;
+// out is (B, S_chunk, H, D).
+//   home      recv(0); chunk 0 holds the low 8 bytes of each fp32 quad of the running sum
+//   home_hi   high 8 bytes: recv(0) chunk 1 if nc >= 2, else recv(1) chunk 0
+//   recv      this step's recv(s); null skips the component (kv_shared dV)
+// Not __restrict__: home_hi aliases home; recv may alias home or home_hi.
 struct ReduceOperand {
     bf16* home;
     bf16* home_hi;
@@ -54,12 +52,8 @@ enum class ReduceStart {
 };
 
 /**
- * fp32 reduce of the RS recv slots without a separate scratch: segment 1 (kFoldHome) sums
- * recv(0) and recv(1), later segments (kRunning) add recv(s), the last (is_last) rounds once
- * into out; a single segment (kZero) sums recv(0) alone. The fp32 running sum lives in the
- * home bytes of recv(0) (and recv(1) when nc == 1). Each (b, quad) belongs to one thread,
- * which loads its home bytes before storing them, so the add order equals a separate
- * scratch's: 0 + recv(0) chunks + recv(1) chunks + ...
+ * fp32 reduce of the RS recv slots; the running sum lives in the home bytes, not a scratch.
+ * One thread owns each (b, quad), so the add order is 0 + recv(0) chunks + recv(1) chunks + ...
 */
 template <int num_chunks = 4, ReduceStart start = ReduceStart::kFoldHome, bool is_last = true>
 __global__ __launch_bounds__(128, 8)
@@ -137,9 +131,8 @@ void ReducedKdVKernel(
     }
 
 /**
- * Reduce step of segment `segment_idx` >= 1, or of segment 0 when it is the only one
- * (see ReducedKdVKernel). A null dv.recv skips the dV operand entirely (kv_shared merges
- * dV into dK).
+ * Reduce step of segment `segment_idx` >= 1, or of a lone segment 0. A null dv.recv skips dV
+ * (kv_shared merges dV into dK).
 */
 void launch_dk_dv_reduce(
     const ReduceOperand& dk,

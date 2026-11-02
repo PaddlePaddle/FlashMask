@@ -25,9 +25,8 @@ __all__ = ["flashmask_attention"]
 def _frontend_for(tensor):
     """Return the frontend module owning ``tensor``, or raise.
 
-    Reads the frontends bound at import time below instead of importing: a host
-    that moves this package to another name in sys.modules after loading it
-    (paddlefleet_ops does) leaves nothing for an import statement to resolve.
+    Reads the frontends bound below instead of importing: hosts like
+    paddlefleet_ops rename the package in sys.modules.
     """
     framework = framework_of(tensor)
     if framework is None:
@@ -66,8 +65,7 @@ _paddle_frontend = None
 _paddle_import_error = None
 try:
     from .frontend import paddle as _paddle_frontend  # noqa: F401
-    # Binds flashmask.cute.flashmask_attention (see cute.__getattr__). Bound here,
-    # after the frontend, because cute itself importing it would be a cycle.
+    # Binds flashmask.cute.flashmask_attention here; importing it from cute is a cycle.
     from .cute import interface as _cute_interface  # noqa: F401
 
     _paddle_available = True

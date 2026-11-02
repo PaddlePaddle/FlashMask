@@ -5,8 +5,7 @@
  * Statistics: for extreme use case, CP16 N4
  *  K shape (1, 128K, 8, 128) -> CP -> (1, 8192, 8, 128)
  *
- * Each slot holds nc chunks of dK (+ dV); the window holds min(ns, 2) send slots and ns
- * recv slots, i.e. (min(ns, 2) + ns) * nc chunks per component.
+ * Window: min(ns, 2) send slots + ns recv slots, each nc chunks of dK (+ dV).
 */
 
 #include "sep_sr_buffer.cuh"

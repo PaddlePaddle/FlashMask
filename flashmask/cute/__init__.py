@@ -26,10 +26,8 @@ def __getattr__(name):
     Deferring also keeps `import flashmask.cute.<kernel>` free of any framework
     dependency: the kernel modules themselves import neither paddle nor torch.
 
-    The top-level package imports `interface` right after the paddle frontend,
-    which binds it in this namespace. It is read from there rather than imported:
-    a host that moves the package to another name in sys.modules after loading it
-    (paddlefleet_ops does) leaves nothing for an import statement to resolve.
+    `interface` is bound here by the top-level package and read from globals,
+    since hosts like paddlefleet_ops rename the package in sys.modules.
     """
     if name in __all__:
         interface = globals().get("interface")

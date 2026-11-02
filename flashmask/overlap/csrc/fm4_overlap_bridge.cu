@@ -19,8 +19,8 @@ inline cudaStream_t as_stream(uint64_t handle) {
     return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(handle));
 }
 
-// FM-4 does not run prepare_flashmask_kernel, so reset the persistent AG scheduler
-// counter, the forward frontier and the forward exit counter here before every gather.
+// Resets the AG scheduler counter, forward frontier and forward exit counter before each
+// gather (FM-4 has no prepare_flashmask_kernel to do it).
 __global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore, int* const write_ptr,
                                             int* const exit_count) {
     if (threadIdx.x == 0) {
@@ -30,22 +30,16 @@ __global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore, int*
     }
 }
 
-// Reset the scheduler/frontier on `stream` and record wptr_init; the next AG waits on it. The
-// caller has ordered `stream` behind the prior AG (ensure_ag_done), which still uses all three.
+// Resets the counters on `stream` and records wptr_init for the next AG. The caller must
+// have ordered `stream` after the prior AG, which still uses them.
 void reset_ag_counter(flashmask::OverlapCommunicator<bf16>& c, cudaStream_t stream) {
     fm4_reset_ag_counter_kernel<<<1, 32, 0, stream>>>(
         c.get_block_cnt_semaphore(), c.get_fwd_write_ptr(), c.get_fwd_exit_count());
     cudaEventRecord(c.wptr_init, stream);
 }
 
-// Common head of the fwd AG and the bwd segment-0 split AG. Issue order:
-//   compute: [record sr_usable] [wait ag_done + send slots] chunk-mask, reset, [record wptr_init],
-//            stream coordinator
-//   comm:    [wait sr_usable] AgWaitConsumed, local K/V copy, SetFull, [wait wptr_init], AG
-// sr_usable is recorded before the chunk-mask kernel, whose waits and writes (copy_chunk_mask)
-// the comm-side SR writes do not depend on; the AG reads copy_chunk_mask behind wptr_init.
-// The reset needs no ensure_ag_done of its own: compute_chunk_mask just made the compute
-// stream wait on ag_done, and nothing records ag_done in between.
+// Shared start of the fwd AG and the bwd segment-0 split AG. The reset needs no
+// ensure_ag_done of its own: compute_chunk_mask already made `stream` wait on ag_done.
 void start_ag(flashmask::OverlapCommunicator<bf16>& c,
               uint64_t mask_ptr, int num_heads, int64_t batch_stride, int64_t head_stride,
               uint64_t k_ptr, uint64_t v_ptr, cudaStream_t stream, bool fwd) {
@@ -88,18 +82,15 @@ size_t fm4_overlap_unique_id_size() noexcept {
     return sizeof(ncclUniqueId);
 }
 
-// Chunks per backward segment the communicator picks for this K shape (the host
-// heuristic alone; no communicator needed), so check_inputs can reject a shape the
-// split AG / RS kernels are not instantiated for before any communication.
+// Chunks per backward segment for this K shape, computed without a communicator so
+// check_inputs can reject unsupported shapes early.
 int fm4_overlap_num_chunks_per_segment(int b_kv, int s_kv, int h_kv, int d_kv,
                                        int nranks) noexcept {
     return flashmask::get_num_chunk_per_segment(b_kv, s_kv, h_kv, d_kv, nranks);
 }
 
-// Create, rebuild (new UID = new group) or reconfigure (new shape) the singleton.
-// Only shape (b/s/h/d) + topology (rank/nranks/uid) are needed; the local-KV copy
-// happens later in fm4_overlap_start_ag. Returns comm::config_generation() (> 0): every
-// getter below returns the same value until the generation changes.
+// Creates, rebuilds (new UID) or reconfigures (new shape) the singleton. Returns
+// comm::config_generation() (> 0); getters below are stable until it changes.
 // kv_shared: K and V alias one tensor, so only K is transported.
 uint64_t fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
                           int rank, int nranks,
@@ -121,7 +112,7 @@ uint64_t fm4_overlap_work_done() noexcept {
     return reinterpret_cast<uint64_t>(
         flashmask::comm::singleton().get_work_done_ptr());
 }
-// Device int the forward compute gate spins on (row frontier of the forward AG).
+// Device int the forward compute gate spins on (forward AG row frontier).
 uint64_t fm4_overlap_fwd_write_ptr() noexcept {
     return reinterpret_cast<uint64_t>(
         flashmask::comm::singleton().get_fwd_write_ptr());
@@ -130,7 +121,7 @@ uint64_t fm4_overlap_fwd_write_ptr() noexcept {
 // Local seqlen chunk (S_local); after AG, S_total = s_local * nranks.
 int fm4_overlap_s_local() noexcept { return flashmask::comm::singleton().s_local(); }
 int fm4_overlap_nranks() noexcept { return flashmask::comm::singleton().nranks(); }
-// This process's rank in the communicator (= its CP group rank).
+// This process's rank in the communicator (its CP group rank).
 int fm4_overlap_rank() noexcept { return flashmask::comm::singleton().rank(); }
 // Size of the NCCL LSA domain; hierarchical iff nranks > gpus_per_node.
 int fm4_overlap_gpus_per_node() noexcept { return flashmask::comm::singleton().gpus_per_node(); }
@@ -163,18 +154,13 @@ uint64_t fm4_overlap_dv_send(int segment_idx) noexcept {
         flashmask::comm::singleton().dv_send(segment_idx));
 }
 
-// Total bytes of the registered symmetric windows (for memory accounting).
+// Total bytes of the registered symmetric windows.
 uint64_t fm4_overlap_symmetric_buffer_bytes() noexcept {
     return flashmask::comm::singleton().symmetric_buffer_bytes();
 }
 
-// Start one forward or backward pass's gather (see start_ag): refresh the per-chunk
-// sparsity mask (copy_chunk_mask) the AG and RS kernels read, stage the local K/V, launch
-// the forward AG (fwd != 0; the forward gate spins on fm4_overlap_fwd_write_ptr) or the split
-// AG of backward segment 0, then hold compute_stream until the AG kernel occupies its SMs.
-// mask is device int32 (B, H_mask, S_total, 2) [lt_start, ut_end] pairs (non-causal), each
-// pair contiguous and the base 16-byte aligned; batch_stride / head_stride are its strides in
-// int32 elements, multiples of 4.
+// Starts the forward AG (fwd != 0) or backward segment-0 split AG. mask: device int32
+// (B, H_mask, S_total, 2), 16-byte aligned; strides in int32 elements, multiples of 4.
 void fm4_overlap_start_ag(uint64_t mask_ptr, int num_heads,
                           int64_t batch_stride, int64_t head_stride,
                           uint64_t k_ptr, uint64_t v_ptr,

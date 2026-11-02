@@ -5,8 +5,7 @@
 """FM-4 CP overlap accuracy test.
 
 ONE mask per process: a process fixes the mask type and cycles head config
-(MQA/MHA/GQA) and batch size in-process, N reps each. Changing the mask content between
-calls no longer corrupts dK/dV (fixed in 647d699); one mask per process only splits the matrix.
+(MQA/MHA/GQA) and batch size in-process, N reps each.
 
 Split axes (separate processes): CP size x mask_type x head dim.
 In-process sweep: batch x hk, N reps each. The single DOC_PACKING sums to 32768 so it

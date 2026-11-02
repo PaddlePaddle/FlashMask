@@ -15,20 +15,15 @@ namespace flashmask {
 
 using SemaphoreType = int64_t;
 
-// Communicator-owned VA-signal words in one signal window:
-//   ag_refcnt[N]  index = data owner X: X's consumers (or a relay holder's same-node readers).
-//   rs_full[N]    index = RS segment; one add per producer on the consumer.
-//   drain         gin::quiesce only.
-// Words are only ever +1'd after the constructor zeroing (ordered by the first team barrier);
-// waiters compare with in-stream bumped expected counters, so graph replays stay exact.
-// Allocated once (fixed world size), so adds in flight across a reconfigure land in a live window.
+// VA-signal words: ag_refcnt indexed by data owner, rs_full by RS segment, drain for quiesce.
+// Only ever incremented; allocated once so in-flight adds survive a reconfigure.
 class SignalBuffer {
 private:
     gin::Context& _context;
     const int _nranks;
     uint64_t* _signals = nullptr;    // window: [ag_refcnt N][rs_full N][drain]
     uint64_t* _expected = nullptr;   // device: [ag_issued N][rs_expected N]
-    uint64_t _drained = 0;           // host: cumulative count of the drain word
+    uint64_t _drained = 0;           // host: cumulative drain count
 
     SignalBuffer(const SignalBuffer&) = delete;
     SignalBuffer& operator=(const SignalBuffer&) = delete;
@@ -62,7 +57,7 @@ public:
     uint64_t* ag_issued() const noexcept { return _expected; }
     uint64_t* rs_expected(int seg) const noexcept { return _expected + _nranks + seg; }
 
-    // Collective: settles all GIN traffic issued so far (see gin::quiesce).
+    // Collective: settles all GIN traffic issued so far.
     void quiesce() { _drained = gin::quiesce(_context, _signals + 2 * _nranks, _drained); }
 };
 
@@ -95,9 +90,8 @@ public:
         const size_t total_bytes = kv_components * numel * sizeof(KVType) +
                                    semaphore_size * sizeof(SemaphoreType);
         _k_sr = static_cast<KVType*>(gin::alloc(_context, total_bytes));
-        // ncclMemAlloc returns uninitialized memory. The compute side can load rows of
-        // skipped (never fetched) works, e.g. the 2-CTA keep-alive tile, and 0 * NaN
-        // garbage would poison dQ/dK; zeroing also clears the semaphores.
+        // ncclMemAlloc memory is uninitialized; compute may read never-fetched rows, and
+        // 0 * NaN garbage would poison dQ/dK. Also clears the semaphores.
         const cudaError_t memset_result = cudaMemset(_k_sr, 0, total_bytes);
         if (memset_result != cudaSuccess) {
             gin::free_noexcept(_context, _k_sr);
