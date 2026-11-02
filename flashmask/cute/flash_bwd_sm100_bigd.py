@@ -84,9 +84,9 @@ UMMA_MAX_N = 256
 # exist and their per-thread element order does not survive the bf16 packing
 # (measured on B200: exact for a constant A operand, ~7% off for A = m or A = n).
 UMMA_REQUIRED_M = 128
-# Slots used to reduce flashmask bounds before deriving per-m-block skip ranges. Two are
-# in use (max of the lower-tail starts, min of the ends); the rest are headroom for the
-# 4-bound form, which needs four.
+# Slots used to reduce flashmask bounds before deriving per-m-block skip ranges: the max of
+# the lower-tail starts and the min of their ends, plus, for the 4-bound form, the max of
+# the upper-tail starts and the min of their ends. The rest are headroom.
 FLASHMASK_META_SLOTS = 8
 
 
@@ -442,6 +442,20 @@ _MEASURED_CONFIG = {
 # capture variables once the kernel enters dynamic control flow (the warp-role
 # branches), so everything these need is passed in explicitly. `self` is the
 # kernel object (compile-time configuration only).
+@cute.jit
+def _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base):
+    """The m block of iteration `it`: the walk over [m_lo, m_hi) minus the two
+    fully masked bands, as three consecutive segments (see the skip range).
+
+    Every warp role -- load, mma, compute, drain -- calls this one function, so they
+    all visit the same blocks in the same order; a second copy of the expression that
+    drifts from this one would desynchronise the barrier phases."""
+    m_block = seg3_base + (it - n1 - n2)
+    m_block = seg2_base + (it - n1) if it < n1 + n2 else m_block
+    m_block = m_lo + it if it < n1 else m_block
+    return m_block
+
+
 @cute.jit
 def _bigd_make_out_drain(self, wg_tidx, tmem_ptr):
     """T2R machinery for draining the output scratch, built once per draining
@@ -1905,11 +1919,12 @@ class FlashAttentionBackwardSm100BigD:
         # ---------------------------------------------------------------- m skip range
         # An m block whose every element is masked contributes nothing (P == 0 => dV, and
         # dS = P * (dP - dPsum) == 0 => dK, dQ), so the m loop walks
-        #     [m_lo, m_hi) minus one contiguous band [b_lo, b_hi)
-        # instead of every block. The per-element mask further down stays the source of
-        # truth, which makes these bounds only need to be CONSERVATIVE: skipping less
-        # than possible costs time, skipping a block that still has an unmasked element
-        # is a wrong answer.
+        #     [m_lo, m_hi) minus two contiguous bands [a_lo, a_hi) and [b_lo, b_hi)
+        # instead of every block, with a_hi <= b_lo. The lower tail gives one band and,
+        # for the 4-bound form, the upper tail the other. The per-element mask further
+        # down stays the source of truth, which makes these bounds only need to be
+        # CONSERVATIVE: skipping less than possible costs time, skipping a block that
+        # still has an unmasked element is a wrong answer.
         #
         # At cta_group=2 the two CTAs of a pair own adjacent key blocks but share every
         # collective operation (the gemms below take cta_group=2, the loads are
@@ -1920,6 +1935,9 @@ class FlashAttentionBackwardSm100BigD:
         n_block_pair = (n_block // self.cta_group_size) * self.cta_group_size
         m_lo = Int32(0)
         m_hi = num_m_block
+        # Both bands start empty at the far end, which leaves [m_lo, m_hi) whole.
+        a_lo = num_m_block
+        a_hi = num_m_block
         b_lo = num_m_block
         b_hi = num_m_block
         if cutlass.const_expr(self.is_causal):
@@ -1943,12 +1961,12 @@ class FlashAttentionBackwardSm100BigD:
                 if cutlass.const_expr(overlap_segment_idx is not None)
                 else Int32(0)
             )
-        if cutlass.const_expr(self.fm_bound_num in (1, 2) and not self.deterministic):
+        if cutlass.const_expr(self.fm_bound_num in (1, 2, 4) and not self.deterministic):
             # `deterministic` excludes itself from this narrowing on purpose. The dQ
             # semaphore uses `lock_value = n_block`, which is only a valid arrival count
             # if the set of CTAs that write a given m block is a PREFIX {0..N} of the n
             # axis. The causal m_lo above is monotone in n_block, so it keeps that
-            # property; the flashmask-derived m_lo / m_hi / band below are not, and a hole
+            # property; the flashmask-derived m_lo / m_hi / bands below are not, and a hole
             # in the sequence hangs the counter forever. Giving up the skip only costs
             # time -- the per-element mask still zeroes the masked-out elements.
             #
@@ -1961,15 +1979,12 @@ class FlashAttentionBackwardSm100BigD:
             # deterministic; it means turning this drain's segment walk into a
             # walk-all-plus-predicate loop, so it is left as a follow-up.
             #
-            # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
-            # skip: it would need four reduced scalars (max/min of both tails' starts and
-            # ends) and the resulting iteration space is two bands rather than one, which
-            # the seg1 / seg2 walk below cannot express. Falling through leaves
-            # [0, num_m_block) and only costs time -- the per-element mask stays the
-            # source of truth.
+            # fm_bound_num == 4 (non-causal, both tails bounded) reduces four scalars --
+            # the max start and min end of each tail -- and drops two bands, one per
+            # tail; the three-segment walk below expresses both.
             #
-            # Reduce this key pair's per-column bounds to two scalars: the largest
-            # lower-tail start and the smallest end. One warp does it (32 lanes x 4
+            # Reduce this key pair's per-column bounds to two scalars per tail: the
+            # largest start and the smallest end. One warp does it (32 lanes x 4
             # columns + a butterfly reduce, so every lane ends up with the result and can
             # write the same value), then the CTA barrier publishes it to the load / mma /
             # compute warps -- they must all see the SAME range or they deadlock, so this
@@ -1979,12 +1994,14 @@ class FlashAttentionBackwardSm100BigD:
                 lane = tidx % cute.arch.WARP_SIZE
                 acc_ds = Int32(0)
                 acc_end = Int32(2**31 - 1)
+                acc_us = Int32(0)
+                acc_ue = Int32(2**31 - 1)
                 pair_cols = self.cta_group_size * self.tile_n
                 for j in cutlass.range_constexpr(pair_cols // cute.arch.WARP_SIZE):
                     col = n_block_pair * self.tile_n + j * cute.arch.WARP_SIZE + lane
                     # Columns past seqlen_k are masked for every m, so they must not
-                    # constrain the skip: ds = 0 and end = INT32_MAX are the neutral
-                    # elements of max(ds) and min(end). The same clamp covers a pair
+                    # constrain the skip: start = 0 and end = INT32_MAX are the neutral
+                    # elements of max(start) and min(end). The same clamp covers a pair
                     # whose second key block falls entirely past seqlen_k.
                     in_range = col < seqlen_k
                     safe_col = fm_row_offset + cutlass.min(col, seqlen_k - 1)
@@ -1998,38 +2015,75 @@ class FlashAttentionBackwardSm100BigD:
                             if in_range
                             else Int32(2**31 - 1),
                         )
+                    if cutlass.const_expr(self.fm_bound_num == 4):
+                        acc_us = cutlass.max(
+                            acc_us, mFM[fm_b, fm_h, safe_col, 2] if in_range else Int32(0)
+                        )
+                        acc_ue = cutlass.min(
+                            acc_ue,
+                            mFM[fm_b, fm_h, safe_col, 3]
+                            if in_range
+                            else Int32(2**31 - 1),
+                        )
                 acc_ds = utils.warp_reduce(acc_ds, lambda a, b: cutlass.max(a, b))
                 acc_end = utils.warp_reduce(acc_end, lambda a, b: cutlass.min(a, b))
                 sFM_red[0] = acc_ds
                 sFM_red[1] = acc_end
+                if cutlass.const_expr(self.fm_bound_num == 4):
+                    acc_us = utils.warp_reduce(acc_us, lambda a, b: cutlass.max(a, b))
+                    acc_ue = utils.warp_reduce(acc_ue, lambda a, b: cutlass.min(a, b))
+                    sFM_red[2] = acc_us
+                    sFM_red[3] = acc_ue
             cute.arch.barrier()
             max_ds = sFM_red[0]
             min_end = sFM_red[1]
             # Which m blocks are fully masked, from the reference semantics in
             # generate_startend_row_indices.py, evaluated for ALL columns at once
-            # via max(ds) / min(end):
+            # via max(start) / min(end):
             #   lower tail [ds, de) or [ds, seqlen_q)  -> block j masked if max_ds <= j*tm
             #   upper tail [0, ue)                     -> block j masked if (j+1)*tm <= min_ue
+            #   upper tail [us, ue)                    -> both conditions, on us and ue
             first_masked = cute.ceil_div(max_ds, self.tile_m)
             if cutlass.const_expr(self.is_causal):
                 if cutlass.const_expr(self.fm_bound_num == 2):
                     # band [ds, de): a middle range of m blocks drops out
-                    b_lo = first_masked
-                    b_hi = cutlass.max(b_lo, min_end // self.tile_m)
+                    a_lo = first_masked
+                    a_hi = cutlass.max(a_lo, min_end // self.tile_m)
                 else:
                     # band [ds, seqlen_q): everything from first_masked on drops out
                     m_hi = cutlass.min(m_hi, first_masked)
+            elif cutlass.const_expr(self.fm_bound_num == 4):
+                # Two bands, [ds, de) and [us, ue), each a middle range of m blocks.
+                # As in flash_bwd_sm100.py's fm_skip_info: order them by their start and
+                # merge them when they touch, so that a_hi <= b_lo. A block covered by
+                # the lower tail for some keys and the upper tail for the others is
+                # fully masked but kept, which is conservative.
+                l_lo = first_masked
+                l_hi = cutlass.max(l_lo, min_end // self.tile_m)
+                u_lo = cute.ceil_div(sFM_red[2], self.tile_m)
+                u_hi = cutlass.max(u_lo, sFM_red[3] // self.tile_m)
+                u_first = u_lo <= l_lo
+                a_lo = u_lo if u_first else l_lo
+                a_hi = u_hi if u_first else l_hi
+                b_lo = l_lo if u_first else u_lo
+                b_hi = l_hi if u_first else u_hi
+                b_lo = cutlass.max(b_lo, a_hi)
+                b_hi = cutlass.max(b_hi, b_lo)
             else:
                 # [0, ue) at the front and [ds, seqlen_q) at the back. Conservative:
                 # different columns may be covered by different clauses, which two
                 # scalars cannot express, so only the two ends are trimmed.
                 m_lo = cutlass.max(m_lo, min_end // self.tile_m)
                 m_hi = cutlass.min(m_hi, first_masked)
-        # Iteration space: seg1 = below the band, seg2 = above it. b_hi >= b_lo is
-        # guaranteed above, so the two segments can neither overlap nor leave a gap.
-        seg1 = cutlass.max(Int32(0), cutlass.min(b_lo, m_hi) - m_lo)
-        seg2_base = cutlass.max(m_lo, b_hi)
-        num_iters = seg1 + cutlass.max(Int32(0), m_hi - seg2_base)
+        # Iteration space: three segments, below band a, between the bands, and above
+        # band b. a_hi >= a_lo, b_lo >= a_hi and b_hi >= b_lo hold by construction, so
+        # the segments can neither overlap nor leave a gap; with band b empty at the far
+        # end this is exactly the previous two-segment walk.
+        n1 = cutlass.max(Int32(0), cutlass.min(a_lo, m_hi) - m_lo)
+        seg2_base = cutlass.max(m_lo, a_hi)
+        n2 = cutlass.max(Int32(0), cutlass.min(b_lo, m_hi) - seg2_base)
+        seg3_base = cutlass.max(seg2_base, b_hi)
+        num_iters = n1 + n2 + cutlass.max(Int32(0), m_hi - seg3_base)
 
         # gmem tiles: mK/mQ/mV/mdO are (s, d, h, b) after the transpose.
         mK_cur = mK[None, None, head_idx_kv, batch_idx]
@@ -2089,8 +2143,8 @@ class FlashAttentionBackwardSm100BigD:
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
                 # The iteration counter drives the barrier phases; m_iter is the actual
-                # block index, which skips the fully masked band (see the skip range).
-                m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                # block index, which skips the fully masked bands (see the skip range).
+                m_iter = _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base)
 
                 def wait_after(rec, empty_bars):
                     """Wait for the gemm that last read the buffer this fetch overwrites.
@@ -2378,8 +2432,8 @@ class FlashAttentionBackwardSm100BigD:
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
                 # The iteration counter drives the barrier phases; m_iter is the actual
-                # block index, which skips the fully masked band (see the skip range).
-                m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                # block index, which skips the fully masked bands (see the skip range).
+                m_iter = _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base)
                 tSrK = tiled_mma_S.make_fragment_A(sK)
                 tSrQ = tiled_mma_S.make_fragment_B(sQ)
                 if cutlass.const_expr(self.kv_shared):
@@ -2671,8 +2725,8 @@ class FlashAttentionBackwardSm100BigD:
             phase = Int32(0)
             for it in cutlass.range(num_iters, unroll=1):
                 # The iteration counter drives the barrier phases; m_iter is the actual
-                # block index, which skips the fully masked band (see the skip range).
-                m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                # block index, which skips the fully masked bands (see the skip range).
+                m_iter = _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base)
                 # The S -> P -> dP -> dS round trip runs in chunks of
                 # softmax_chunk_m columns instead of over the whole tile at once.
                 #
@@ -3185,7 +3239,7 @@ class FlashAttentionBackwardSm100BigD:
                 # warpgroup's; the pre-split path below is what the configs that
                 # cannot split (no kv_shared) still take.
                 for it in cutlass.range(num_iters, unroll=1):
-                    m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                    m_iter = _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base)
                     _bigd_drain_wg_iteration(
                         self,
                         phase,
@@ -3257,7 +3311,7 @@ class FlashAttentionBackwardSm100BigD:
                     # Same iteration mapping as the mma / compute warps: the counter
                     # drives the barrier phases, m_iter is the actual block index (it
                     # indexes dQ's accumulator, so it must match exactly).
-                    m_iter = m_lo + it if it < seg1 else seg2_base + (it - seg1)
+                    m_iter = _bigd_m_block(it, m_lo, n1, seg2_base, n2, seg3_base)
                     # Iterated with range_constexpr, not `for ... in outputs`: a bare
                     # Python for over a tuple is rewritten by the DSL into a dynamic loop
                     # region and then it tries to flatten the tuple's contents.
