@@ -84,9 +84,9 @@ UMMA_MAX_N = 256
 # exist and their per-thread element order does not survive the bf16 packing
 # (measured on B200: exact for a constant A operand, ~7% off for A = m or A = n).
 UMMA_REQUIRED_M = 128
-# Slots used to reduce flashmask bounds before deriving per-m-block skip ranges: the max of
-# the lower-tail starts and the min of their ends, plus, for the 4-bound form, the max of
-# the upper-tail starts and the min of their ends. The rest are headroom.
+# Slots used to reduce flashmask bounds once per key pair. 0-1 give the m skip range's
+# lower-tail band (max of the starts, min of the ends), 2-3 its upper-tail band for the
+# 4-bound form; 4-7 give the unmasked-block test (min / max of each bound column).
 FLASHMASK_META_SLOTS = 8
 
 
@@ -1961,6 +1961,94 @@ class FlashAttentionBackwardSm100BigD:
                 if cutlass.const_expr(overlap_segment_idx is not None)
                 else Int32(0)
             )
+        if cutlass.const_expr(self.fm_bound_num > 0):
+            # Reduce this key pair's per-column bounds to a few scalars. One warp does it
+            # (32 lanes x 4 columns + a butterfly reduce, so every lane ends up with the
+            # result and can write the same value), then the CTA barrier publishes them to
+            # the load / mma / compute warps -- they must all see the SAME m range or they
+            # deadlock, so this is computed once and read, never recomputed per warp.
+            #
+            # Two groups of scalars come out of it:
+            #   - max(start) and min(end) of each tail give the fully masked bands, i.e.
+            #     the m skip range below (only for the widths that range supports);
+            #   - min / max of every bound column give the unmasked test of
+            #     fm_need_mask in the compute warp, which lets an m block that no key of
+            #     the pair masks skip the per-element flashmask predicate. That test only
+            #     changes how a visited block is computed, never which blocks are visited
+            #     or how many iterations run, so it is safe under `deterministic` and for
+            #     all widths, unlike the skip range.
+            assert self.tile_n % cute.arch.WARP_SIZE == 0
+            if warp_idx == self.load_warp_id:
+                lane = tidx % cute.arch.WARP_SIZE
+                int_max = Int32(2**31 - 1)
+                int_min = Int32(-(2**31))
+                acc_ds = Int32(0)
+                acc_end = int_max
+                acc_us = Int32(0)
+                acc_ue = int_max
+                min_c0 = int_max
+                max_c1 = int_min
+                min_c2 = int_max
+                max_c3 = int_min
+                pair_cols = self.cta_group_size * self.tile_n
+                for j in cutlass.range_constexpr(pair_cols // cute.arch.WARP_SIZE):
+                    col = n_block_pair * self.tile_n + j * cute.arch.WARP_SIZE + lane
+                    # Columns past seqlen_k are masked for every m by n_oob, so they must
+                    # not constrain anything: each reduction uses its neutral element
+                    # there. The same clamp covers a pair whose second key block falls
+                    # entirely past seqlen_k.
+                    in_range = col < seqlen_k
+                    safe_col = fm_row_offset + cutlass.min(col, seqlen_k - 1)
+                    c0 = mFM[fm_b, fm_h, safe_col, 0]
+                    acc_ds = cutlass.max(acc_ds, c0 if in_range else Int32(0))
+                    min_c0 = cutlass.min(min_c0, c0 if in_range else int_max)
+                    if cutlass.const_expr(self.fm_bound_num >= 2):
+                        c1 = mFM[fm_b, fm_h, safe_col, 1]
+                        acc_end = cutlass.min(acc_end, c1 if in_range else int_max)
+                        max_c1 = cutlass.max(max_c1, c1 if in_range else int_min)
+                    if cutlass.const_expr(self.fm_bound_num == 4):
+                        c2 = mFM[fm_b, fm_h, safe_col, 2]
+                        c3 = mFM[fm_b, fm_h, safe_col, 3]
+                        acc_us = cutlass.max(acc_us, c2 if in_range else Int32(0))
+                        acc_ue = cutlass.min(acc_ue, c3 if in_range else int_max)
+                        min_c2 = cutlass.min(min_c2, c2 if in_range else int_max)
+                        max_c3 = cutlass.max(max_c3, c3 if in_range else int_min)
+                acc_ds = utils.warp_reduce(acc_ds, lambda a, b: cutlass.max(a, b))
+                acc_end = utils.warp_reduce(acc_end, lambda a, b: cutlass.min(a, b))
+                min_c0 = utils.warp_reduce(min_c0, lambda a, b: cutlass.min(a, b))
+                max_c1 = utils.warp_reduce(max_c1, lambda a, b: cutlass.max(a, b))
+                sFM_red[0] = acc_ds
+                sFM_red[1] = acc_end
+                sFM_red[4] = min_c0
+                sFM_red[5] = max_c1
+                if cutlass.const_expr(self.fm_bound_num == 4):
+                    acc_us = utils.warp_reduce(acc_us, lambda a, b: cutlass.max(a, b))
+                    acc_ue = utils.warp_reduce(acc_ue, lambda a, b: cutlass.min(a, b))
+                    min_c2 = utils.warp_reduce(min_c2, lambda a, b: cutlass.min(a, b))
+                    max_c3 = utils.warp_reduce(max_c3, lambda a, b: cutlass.max(a, b))
+                    sFM_red[2] = acc_us
+                    sFM_red[3] = acc_ue
+                    sFM_red[6] = min_c2
+                    sFM_red[7] = max_c3
+            cute.arch.barrier()
+            # Bounds of the union of every key's masked rows, per band, for the unmasked
+            # test. The semantics are the per-element mask's (has_end below):
+            #   lower band [c0, c1) if has_end else [c0, seqlen_q)
+            #   upper band (non-causal) [c2, c3) if has_end else [0, c1)
+            # An m block [m0, m1) is untouched by a band if m1 <= its min start or
+            # m0 >= its max end. Mixed cases (some keys below, some above) count as
+            # touched, which is conservative.
+            fm_has_end = cutlass.const_expr(
+                (self.is_causal and self.fm_bound_num == 2)
+                or (not self.is_causal and self.fm_bound_num == 4)
+            )
+            fm_lo_start_min = sFM_red[4]
+            fm_lo_end_max = sFM_red[5] if cutlass.const_expr(fm_has_end) else seqlen_q
+            if cutlass.const_expr(not self.is_causal):
+                if cutlass.const_expr(fm_has_end):
+                    fm_up_start_min, fm_up_end_max = sFM_red[6], sFM_red[7]
+                else:
+                    fm_up_start_min, fm_up_end_max = Int32(0), sFM_red[5]
         if cutlass.const_expr(self.fm_bound_num in (1, 2, 4) and not self.deterministic):
             # `deterministic` excludes itself from this narrowing on purpose. The dQ
             # semaphore uses `lock_value = n_block`, which is only a valid arrival count
@@ -1983,58 +2071,7 @@ class FlashAttentionBackwardSm100BigD:
             # the max start and min end of each tail -- and drops two bands, one per
             # tail; the three-segment walk below expresses both.
             #
-            # Reduce this key pair's per-column bounds to two scalars per tail: the
-            # largest start and the smallest end. One warp does it (32 lanes x 4
-            # columns + a butterfly reduce, so every lane ends up with the result and can
-            # write the same value), then the CTA barrier publishes it to the load / mma /
-            # compute warps -- they must all see the SAME range or they deadlock, so this
-            # is computed once and read, never recomputed per warp.
-            assert self.tile_n % cute.arch.WARP_SIZE == 0
-            if warp_idx == self.load_warp_id:
-                lane = tidx % cute.arch.WARP_SIZE
-                acc_ds = Int32(0)
-                acc_end = Int32(2**31 - 1)
-                acc_us = Int32(0)
-                acc_ue = Int32(2**31 - 1)
-                pair_cols = self.cta_group_size * self.tile_n
-                for j in cutlass.range_constexpr(pair_cols // cute.arch.WARP_SIZE):
-                    col = n_block_pair * self.tile_n + j * cute.arch.WARP_SIZE + lane
-                    # Columns past seqlen_k are masked for every m, so they must not
-                    # constrain the skip: start = 0 and end = INT32_MAX are the neutral
-                    # elements of max(start) and min(end). The same clamp covers a pair
-                    # whose second key block falls entirely past seqlen_k.
-                    in_range = col < seqlen_k
-                    safe_col = fm_row_offset + cutlass.min(col, seqlen_k - 1)
-                    acc_ds = cutlass.max(
-                        acc_ds, mFM[fm_b, fm_h, safe_col, 0] if in_range else Int32(0)
-                    )
-                    if cutlass.const_expr(self.fm_bound_num >= 2):
-                        acc_end = cutlass.min(
-                            acc_end,
-                            mFM[fm_b, fm_h, safe_col, 1]
-                            if in_range
-                            else Int32(2**31 - 1),
-                        )
-                    if cutlass.const_expr(self.fm_bound_num == 4):
-                        acc_us = cutlass.max(
-                            acc_us, mFM[fm_b, fm_h, safe_col, 2] if in_range else Int32(0)
-                        )
-                        acc_ue = cutlass.min(
-                            acc_ue,
-                            mFM[fm_b, fm_h, safe_col, 3]
-                            if in_range
-                            else Int32(2**31 - 1),
-                        )
-                acc_ds = utils.warp_reduce(acc_ds, lambda a, b: cutlass.max(a, b))
-                acc_end = utils.warp_reduce(acc_end, lambda a, b: cutlass.min(a, b))
-                sFM_red[0] = acc_ds
-                sFM_red[1] = acc_end
-                if cutlass.const_expr(self.fm_bound_num == 4):
-                    acc_us = utils.warp_reduce(acc_us, lambda a, b: cutlass.max(a, b))
-                    acc_ue = utils.warp_reduce(acc_ue, lambda a, b: cutlass.min(a, b))
-                    sFM_red[2] = acc_us
-                    sFM_red[3] = acc_ue
-            cute.arch.barrier()
+            # max(start) and min(end) per tail were reduced and published above.
             max_ds = sFM_red[0]
             min_end = sFM_red[1]
             # Which m blocks are fully masked, from the reference semantics in
@@ -2976,6 +3013,18 @@ class FlashAttentionBackwardSm100BigD:
                             fm_us, fm_ue = fm_row[2], fm_row[3]
                         else:
                             fm_us, fm_ue = Int32(0), fm_row[1]
+                    # Per m block, uniform across the CTA: does any key of the pair mask
+                    # any row of this block? If not, the block is unmasked and the
+                    # per-element flashmask predicate below is skipped (causal and
+                    # out-of-range masking still apply). The bounds are the union bounds
+                    # published at the top level; see the reduction there.
+                    m_end_blk = m_base + self.tile_m
+                    fm_clear = m_end_blk <= fm_lo_start_min or m_base >= fm_lo_end_max
+                    if cutlass.const_expr(not self.is_causal):
+                        fm_clear = fm_clear and (
+                            m_end_blk <= fm_up_start_min or m_base >= fm_up_end_max
+                        )
+                    fm_need_mask = not fm_clear
 
                 # S^T, then P = exp2(S * scale_log2 - lse[m]). S^T is (n, m) = (key,
                 # query), and softmax normalizes over keys, so LSE and dPsum are
@@ -3034,11 +3083,17 @@ class FlashAttentionBackwardSm100BigD:
                         bad = n_oob or m_global >= seqlen_q
                         if cutlass.const_expr(self.is_causal):
                             bad = bad or m_global < causal_m_min
-                        if cutlass.const_expr(self.fm_bound_num > 0):
-                            bad = bad or (m_global >= fm_ds and m_global < fm_de)
-                            if cutlass.const_expr(not self.is_causal):
-                                bad = bad or (m_global >= fm_us and m_global < fm_ue)
                         tSrP[i] = 0.0 if bad else p
+                    if cutlass.const_expr(self.fm_bound_num > 0):
+                        # Flashmask predicate, only for partially masked m blocks. A
+                        # separate pass over P keeps the unmasked blocks free of it.
+                        if fm_need_mask:
+                            for i in cutlass.range_constexpr(frag_len):
+                                m_fm = m_base + cutlass.const_expr(tScS[i][1] + m_off)
+                                fm_bad = m_fm >= fm_ds and m_fm < fm_de
+                                if cutlass.const_expr(not self.is_causal):
+                                    fm_bad = fm_bad or (m_fm >= fm_us and m_fm < fm_ue)
+                                tSrP[i] = 0.0 if fm_bad else tSrP[i]
 
                     # dP^T, then dS^T = P * (dP - dPsum[m]). The wait sits after the
                     # FIRST chunk's P pass so that pass still overlaps the mma warp's
