@@ -329,17 +329,17 @@ def _flash_attn_bwd(
 
     # dq: dq_accum -> dq postprocess always writes the full m_block range, so empty_like
     # is safe on fixed-seqlen path and avoids a redundant bf16 fill.
-    # dk/dv: only safe to skip the zero-fill when postprocess writes every row, i.e.
-    # when dk_accum/dv_accum is in use (qhead_per_kvhead > 1 or big-d). In the
-    # GQA-ratio==1 path the main bwd kernel writes dk/dv directly, and
-    # FlashMask can skip whole n_blocks (no Q rows attend) — those rows would stay
-    # garbage with empty_like and break correctness. Fall back to zeros_like there.
+    # dk/dv: empty_like is safe when every row is written: by the postprocess when
+    # dk_accum/dv_accum is in use (qhead_per_kvhead > 1 or big-d), or, on SM100, by the
+    # main kernel itself. Its 2-CTA epilogue runs for every KV tile, and the 1-CTA path
+    # zero-fills the key blocks FlashMask skips (zero_skipped_dKV in flash_bwd_sm100.py).
+    # SM90 makes no such guarantee and keeps the zero-fill.
     kv_postprocess_full = (
         (qhead_per_kvhead > 1) or is_bigd_bwd
     )
     dq = be.empty_like(q)
     # Native RS also writes the final local dK/dV directly into these tensors.
-    kv_write_full = enable_overlap or kv_postprocess_full
+    kv_write_full = enable_overlap or kv_postprocess_full or compute_capability == 10
     dk = be.empty_like(k) if kv_write_full else be.zeros_like(k)
     # kv_shared: dk carries dK + dV and nothing writes dv, so it is the zero gradient.
     dv = be.empty_like(v) if kv_write_full and not kv_shared else be.zeros_like(v)

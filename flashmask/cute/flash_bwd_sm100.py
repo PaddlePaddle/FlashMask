@@ -867,11 +867,13 @@ class FlashAttentionBackwardSm100:
                 overlap_dv_addr, overlap_b, overlap_s, overlap_h, overlap_d,
                 mQ.element_type, align=16,
             )
-        # 1-CTA skips the dKV epilogue for fully masked key blocks. The reused NCCL send
-        # slot is not zeroed and the reduce-scatter sums all rows, so store zeros there.
+        # 1-CTA skips the dKV epilogue for fully masked key blocks, so with an MHA direct
+        # store (no dKV postprocess) those rows have to be written as zeros here: neither
+        # the overlap NCCL send slot (reduce-scatter sums all rows) nor the host dk / dv
+        # (allocated with empty_like) are pre-zeroed. 2-CTA always runs the epilogue (a
+        # fully masked tile keeps one masked iteration, see fm_skip_info).
         self.zero_skipped_dKV = const_expr(
-            overlap_dk_addr is not None
-            and not self.use_2cta_instrs
+            not self.use_2cta_instrs
             and not self.dKV_postprocess
         )
         self.q_dtype = mQ.element_type
