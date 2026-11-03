@@ -16,12 +16,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from flashmask.cute import copy_utils
+from . import copy_utils
 
 # Import data structures from block_sparsity
-from flashmask.cute.block_sparsity import BlockSparseTensors
-from flashmask.cute.named_barrier import NamedBarrierBwd
-from flashmask.cute.seqlen_info import SeqlenInfoQK
+from .block_sparsity import BlockSparseTensors
+from .named_barrier import NamedBarrierBwd
+from .seqlen_info import SeqlenInfoQK
 
 
 @cute.jit

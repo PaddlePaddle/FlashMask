@@ -7,12 +7,7 @@
 # process (2 reps). S_local = 32768/CP so S_total=32768 (the DOC_PACKING fits exactly).
 # CP16 needs two nodes and is intentionally left out of this single-node gate.
 #
-# ONE mask per launch is deliberate: the overlap singleton carries dK/dV state
-# across calls, so switching mask *content* mid-process (e.g. document ->
-# prefix_lm) leaves a stale dK/dV buffer and corrupts the second mask's gradients.
-# This sweep gives each mask its own torchrun group, which is why it covers the
-# full document+prefix_lm matrix safely (a single run_cp_overlap.sh with a
-# comma-joined MASKS would not).
+# One torchrun group per mask keeps the launches independent.
 #
 # Usage (single node, just run it):
 #   bash run_cp_overlap_sweep.sh

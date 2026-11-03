@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from flashmask.cute import copy_utils
+from . import copy_utils
 
 
 """

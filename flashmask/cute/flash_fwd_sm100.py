@@ -15,33 +15,33 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-import flashmask.cute.utils as utils
-from flashmask.cute import copy_utils
-from flashmask.cute.barrier import wait_write_ptr_ge
-import flashmask.cute.pipeline as pipeline
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.softmax import SoftmaxSm100
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute.block_sparsity import BlockSparseTensors
-from flashmask.cute.block_sparse_utils import (
+from . import utils
+from . import copy_utils
+from .barrier import wait_write_ptr_ge
+from . import pipeline
+from .mask import AttentionMask
+from .softmax import SoftmaxSm100
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flashmask.cute.pack_gqa import PackGQA
-from flashmask.cute import mma_sm100_desc as sm100_desc
-from flashmask.cute import blackwell_helpers as sm100_utils
+from .pack_gqa import PackGQA
+from . import mma_sm100_desc as sm100_desc
+from . import blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
-from flashmask.cute.tile_scheduler import (
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     ParamsBase,
 )
-from flashmask.cute.flashmask_utils import FlashMaskInfo, OverlapInfo
+from .flashmask_utils import FlashMaskInfo, OverlapInfo
 
 
 @cute.jit
@@ -51,26 +51,23 @@ def _overlap_gate(
     s_total: Int32,
     batch_idx: Int32,
     write_ptr: cute.Pointer,
+    spin_timeout_ns: cutlass.Int64,
     n_block_size: cutlass.Constexpr[int],
     kv_chunk_size: cutlass.Constexpr[int],
 ):
-    """FM-4 overlap gate: spin the elected load-warp thread until the comm side has
-    gathered the remote KV rows for the tile at ``nblk``.
+    """Spin until the comm side has gathered the KV rows of tile ``nblk``.
 
-    ``write_ptr`` is a per-batch ROW index advanced by atomicMax on the comm side; the
-    reverse-row math mirrors the comm kernel's reversed traversal (seqlen_offset =
-    s_total - s_local). A negative ``reverse_row`` means the tile is in the local chunk
-    (last ``kv_chunk_size`` rows of SRBuffer), which is never remote-fetched, so no wait.
-    Only ``tidx == 0`` spins, the same one-thread convention as the bwd dQ/dKV semaphores.
-
-    At module scope (not a nested closure) so its ``__closure__`` is empty and the DSL
-    ``closure_check`` accepts it inside dynamic control flow.
+    All load-warp lanes must call this; the local chunk (``reverse_row < 0``) needs no wait.
     """
-    if tidx == 0:
-        reverse_row = s_total - nblk * n_block_size - kv_chunk_size
-        if reverse_row >= 0:
+    reverse_row = s_total - nblk * n_block_size - kv_chunk_size
+    if reverse_row >= 0:
+        if tidx == 0:
             target = batch_idx * (s_total - kv_chunk_size) + reverse_row
-            wait_write_ptr_ge(write_ptr, 0, Int32(target))
+            wait_write_ptr_ge(write_ptr, 0, Int32(target), spin_timeout_ns)
+        # Share lane 0's acquire with the whole warp.
+        cute.arch.sync_warp()
+        # Order the acquire before this lane's TMA (async-proxy) reads.
+        cute.arch.fence_proxy("async.global")
 
 
 class NamedBarrierFwd(enum.IntEnum):
@@ -720,6 +717,7 @@ class FlashAttentionForwardSm100:
         overlap_s: Optional[cutlass.Int32] = None,
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_kv_chunk_size: cutlass.Constexpr = None,
         overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -743,7 +741,7 @@ class FlashAttentionForwardSm100:
         self.has_lt_end = const_expr(flashmask_info is not None and flashmask_info.LTE_nblock_max is not None)
         self.has_ut_start = const_expr(flashmask_info is not None and flashmask_info.UTS_nblock_max is not None)
         self.has_ut_end = const_expr(flashmask_info is not None and flashmask_info.UTE_nblock_max is not None)
-        # FM-4 overlap: K/V live in the NVSHMEM SRBuffer (no Paddle tensor / dlpack
+        # FM-4 overlap: K/V live in the NCCL-window SRBuffer (no Paddle tensor / dlpack
         # capsule), so they arrive as a raw addr + the gathered (B, S_total, H, D)
         # dims as RUNTIME Int32 scalars. Build the views HERE -- make_*_from_addr
         # needs this jit body's MLIR Context, and the Int32 dims give a dynamic
@@ -790,11 +788,13 @@ class FlashAttentionForwardSm100:
                     mQ.element_type,
                     align=16,
                 )
+            assert overlap_spin_timeout_ns is not None
             overlap_info = OverlapInfo(
                 utils.make_gmem_tensor_from_addr(
                     overlap_write_ptr_addr, (1,), (1,), cutlass.Int32, align=4
                 ),
                 overlap_kv_chunk_size,
+                overlap_spin_timeout_ns,
             )
         else:
             overlap_info = None
@@ -2411,6 +2411,8 @@ class FlashAttentionForwardSm100:
             # FM-4 overlap gate: bound via partial (NOT a nested closure) so it has no
             # __closure__ and passes the DSL closure_check inside the dynamic load loop.
             if const_expr(self.enable_overlap):
+                # The gate's warp sync only covers one load warp.
+                assert len(self.load_warp_ids) == 1
                 gate_batch_idx = batch_idx
                 if const_expr(self.overlap_bhsd_layout):
                     gate_batch_idx = (
@@ -2422,6 +2424,7 @@ class FlashAttentionForwardSm100:
                     s_total=seqlen.seqlen_k,
                     batch_idx=gate_batch_idx,
                     write_ptr=overlap_info.write_ptr.iterator,
+                    spin_timeout_ns=overlap_info.spin_timeout_ns,
                     n_block_size=self.n_block_size,
                     kv_chunk_size=overlap_info.kv_chunk_size,
                 )

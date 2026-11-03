@@ -17,26 +17,29 @@ Neither framework is a hard dependency: the paddle names below only appear if
 paddle imports, and likewise for torch.
 """
 
+from .backend import framework_of
+
 __all__ = ["flashmask_attention"]
 
 
 def _frontend_for(tensor):
-    """Return the frontend module owning ``tensor``, or raise."""
-    from .backend import framework_of
+    """Return the frontend module owning ``tensor``, or raise.
 
+    Reads the frontends bound below instead of importing: hosts like
+    paddlefleet_ops rename the package in sys.modules.
+    """
     framework = framework_of(tensor)
-    if framework == "paddle":
-        from .frontend import paddle as frontend
-
-        return frontend, frontend.flashmask_attention
-    if framework == "torch":
-        from .frontend import torch as frontend
-
-        return frontend, frontend.flashmask_attention
-    raise TypeError(
-        f"expected a paddle or torch tensor, got {type(tensor).__name__}. "
-        "Note that the owning framework must already be imported."
-    )
+    if framework is None:
+        raise TypeError(
+            f"expected a paddle or torch tensor, got {type(tensor).__name__}. "
+            "Note that the owning framework must already be imported."
+        )
+    frontend = globals()[f"_{framework}_frontend"]
+    if frontend is None:
+        raise ImportError(
+            f"the flashmask {framework} frontend failed to import"
+        ) from globals()[f"_{framework}_import_error"]
+    return frontend, frontend.flashmask_attention
 
 
 def flashmask_attention(query, key, value, *args, **kwargs):
@@ -58,9 +61,12 @@ def flashmask_attention(query, key, value, *args, **kwargs):
 # Paddle frontend (optional)
 # ============================================================
 _paddle_available = False
+_paddle_frontend = None
 _paddle_import_error = None
 try:
     from .frontend import paddle as _paddle_frontend  # noqa: F401
+    # Binds flashmask.cute.flashmask_attention here; importing it from cute is a cycle.
+    from .cute import interface as _cute_interface  # noqa: F401
 
     _paddle_available = True
 except ImportError as exc:
@@ -72,6 +78,7 @@ except ImportError as exc:
 # Torch frontend (optional)
 # ============================================================
 _torch_available = False
+_torch_frontend = None
 _torch_import_error = None
 try:
     from .frontend import torch as _torch_frontend  # noqa: F401

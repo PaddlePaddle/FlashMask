@@ -7,10 +7,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <vector>
-
-#if defined(FLASHMASK_GIN_DEVICE_API)
 
 #include <cuda/atomic>
 #include <nccl.h>
@@ -20,11 +19,7 @@
 #error "FlashMask overlap requires NCCL 2.30.5 or newer"
 #endif
 
-#endif  // FLASHMASK_GIN_DEVICE_API
-
 namespace flashmask::gin {
-
-#if defined(FLASHMASK_GIN_DEVICE_API)
 
 constexpr int kMaxRegions = 4;
 constexpr int kDefaultNumQPs = 17;
@@ -46,12 +41,10 @@ struct DeviceState {
     int rail_rank;
     int num_qps;
     bool use_rail;
+    unsigned long long spin_timeout_ns;   // 0: no timeout trap
 };
 
-#endif  // FLASHMASK_GIN_DEVICE_API
-
 enum class Compare {
-    Equal,
     NotEqual,
     GreaterThan,
 };
@@ -64,23 +57,26 @@ struct ContextDeleter {
 
 using ContextPtr = std::unique_ptr<Context, ContextDeleter>;
 
-std::vector<uint8_t> get_unique_id();
-ContextPtr create_context(
-    const uint8_t* unique_id, int rank, int nranks, bool request_hierarchical);
+ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks);
 int rank(const Context& context);
 int nranks(const Context& context);
 int num_lsa_ranks(const Context& context);
-int lsa_rank(const Context& context);
-bool use_rail(const Context& context);
 
-void* alloc(Context& context, size_t bytes);
+// Signal windows need NCCL_WIN_STRICT_ORDERING when reached through GIN; data windows don't.
+enum class WindowKind {
+    Data,
+    Signal,
+};
+
+void* alloc(Context& context, size_t bytes, WindowKind kind = WindowKind::Data);
 void free(Context& context, void* ptr);
 void free_noexcept(Context& context, void* ptr) noexcept;
 void barrier(Context& context);
-void barrier_on_stream(Context& context, cudaStream_t stream);
-void wait_until_on_stream(int64_t* ptr, Compare compare, int64_t value, cudaStream_t stream);
-
-#if defined(FLASHMASK_GIN_DEVICE_API)
+// Collective: returns once all puts/signals issued before it have landed, so windows can be
+// freed or rezeroed. Returns the new cumulative count of `drain_signal`.
+uint64_t quiesce(Context& context, uint64_t* drain_signal, uint64_t drained);
+// Total requested size of all registered windows.
+size_t window_bytes(const Context& context);
 
 extern __device__ __constant__ DeviceState g_device_state;
 
@@ -174,61 +170,52 @@ __device__ __forceinline__ bool force_network_atomics() {
     return mesh_is_cross_node();
 }
 
-template <typename T>
-__device__ __forceinline__ void remote_add(T* ptr, T value, int world_peer) {
+// VA signals only ever count up; waiters compare against the exact expected count, so no
+// signal word is ever reset.
+
+// Weak signal: refcount adds need no ordering with other puts.
+__device__ __forceinline__ void remote_add(uint64_t* sig, uint64_t value, int world_peer) {
     if (!force_network_atomics()) {
-        if (auto* peer_ptr = static_cast<T*>(get_lsa_ptr(ptr, world_peer)); peer_ptr != nullptr) {
-            cuda::atomic_ref<T, cuda::thread_scope_system> atom(*peer_ptr);
-            atom.fetch_add(value, cuda::memory_order_release);
+        if (auto* peer_sig = static_cast<uint64_t*>(get_lsa_ptr(sig, world_peer)); peer_sig != nullptr) {
+            cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*peer_sig)
+                .fetch_add(value, cuda::memory_order_release);
             return;
         }
     }
 
-    static_assert(sizeof(T) == sizeof(uint64_t), "GIN VA signal add requires a 64-bit value");
-    const auto& region = find_region(ptr);
-    auto transport = make_gin();
-    transport.signal(
+    const auto& region = find_region(sig);
+    make_gin().signal(
         network_team(), team_peer(world_peer),
-        ncclGin_VASignalAdd{region.window, region_offset(region, ptr), static_cast<uint64_t>(value)},
+        ncclGin_WeakVASignalAdd{region.window, region_offset(region, sig), value},
         ncclCoopThread(), ncclGin_None(),
         cuda::thread_scope_thread, cuda::thread_scope_device,
         ncclGinOptFlagsDefault);
 }
-
 
 // Out of line: see network_get_two_buffers in gin_copy_utils.cuh. Called from
 // the RS put kernel's commit path, which is register-starved for the same reason.
-template <typename T>
-static __device__ __noinline__ void network_strong_signal_add(T* ptr, T value, int world_peer) {
-    static_assert(sizeof(T) == sizeof(uint64_t), "GIN VA signal add requires a 64-bit value");
-    const auto& region = find_region(ptr);
-    auto transport = make_gin_ordered();
-    transport.signal(
+static __device__ __noinline__ void network_strong_signal_add(
+        uint64_t* sig, uint64_t value, int world_peer) {
+    const auto& region = find_region(sig);
+    make_gin_ordered().signal(
         network_team(), team_peer(world_peer),
-        ncclGin_StrongVASignalAdd{
-            region.window, region_offset(region, ptr), static_cast<uint64_t>(value)},
+        ncclGin_StrongVASignalAdd{region.window, region_offset(region, sig), value},
         ncclCoopThread(), ncclGin_None(),
         cuda::thread_scope_thread, cuda::thread_scope_device,
         ncclGinOptFlagsDefault);
 }
 
-// Ordered variant of remote_add: routes the aggregate signal through the shared
-// kOrderedPutContext (one QP per peer, GPU-wide sharing) and uses a *strong* VA
-// signal. Because every per-CTA put also travels the ordered context (see
-// two_buffers_putmem_block), the strong signal's arrival guarantees that ALL
-// preceding puts to this peer -- from any CTA -- have settled in remote memory.
-// This is the cross-CTA, cross-node ordering that gin::fence() (a GPU-local
-// __threadfence_system) could never provide on the RDMA path.
-template <typename T>
-__device__ __forceinline__ void remote_strong_add(T* ptr, T value, int world_peer) {
+// Strong signal on the shared ordered context, which all puts also use, so its arrival
+// implies every earlier put to this peer (from any CTA) has landed.
+__device__ __forceinline__ void remote_strong_add(uint64_t* sig, uint64_t value, int world_peer) {
     if (!force_network_atomics()) {
-        if (auto* peer_ptr = static_cast<T*>(get_lsa_ptr(ptr, world_peer)); peer_ptr != nullptr) {
-            cuda::atomic_ref<T, cuda::thread_scope_system> atom(*peer_ptr);
-            atom.fetch_add(value, cuda::memory_order_release);
+        if (auto* peer_sig = static_cast<uint64_t*>(get_lsa_ptr(sig, world_peer)); peer_sig != nullptr) {
+            cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*peer_sig)
+                .fetch_add(value, cuda::memory_order_release);
             return;
         }
     }
-    network_strong_signal_add(ptr, value, world_peer);
+    network_strong_signal_add(sig, value, world_peer);
 }
 
 template <typename T>
@@ -261,26 +248,93 @@ __device__ __forceinline__ void remote_or(int64_t* ptr, int64_t value, int world
     atom.fetch_or(value, cuda::memory_order_release);
 }
 
-__device__ __forceinline__ int64_t load_acquire(const int64_t* ptr) {
-    cuda::atomic_ref<const int64_t, cuda::thread_scope_system> atom(*ptr);
-    return atom.load(cuda::memory_order_acquire);
+// Spin watchdog: traps a device spin that exceeds FLASHMASK_SPIN_TIMEOUT_S (lost signal or
+// dead peer). The budget must exceed normal rank skew. NIC error completions are not caught.
+
+constexpr unsigned kSpinCheckInterval = 1024;   // polls between timer reads
+
+static __device__ __noinline__ void spin_trap(const char* site, const char* reason,
+        const void* addr, unsigned long long expected, unsigned long long actual,
+        unsigned long long waited_ns) {
+    printf("[FlashMask spin] %s: %s, rank %d/%d block %d thread %d addr %p "
+           "expected %llu actual %llu waited %llu ms\n",
+           site, reason, g_device_state.world_rank, g_device_state.world_size,
+           static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), addr,
+           expected, actual, waited_ns / 1000000ull);
+    __trap();
 }
 
-__device__ __forceinline__ void wait_until(const int64_t* ptr, Compare compare, int64_t value) {
-    while (true) {
-        const int64_t current = load_acquire(ptr);
-        if ((compare == Compare::Equal && current == value) ||
-            (compare == Compare::NotEqual && current != value) ||
-            (compare == Compare::GreaterThan && current > value)) {
-            return;
+// Returns the spin's start time, read lazily so short waits never read the timer.
+static __device__ __noinline__ unsigned long long spin_watchdog_check(
+        unsigned long long start_ns, const char* site, const void* addr,
+        unsigned long long expected, unsigned long long actual) {
+    const unsigned long long budget_ns = g_device_state.spin_timeout_ns;
+    if (budget_ns == 0) {
+        return start_ns;
+    }
+    unsigned long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if (start_ns == 0) {
+        return now;
+    }
+    if (now - start_ns > budget_ns) {
+        spin_trap(site, "timeout", addr, expected, actual, now - start_ns);
+    }
+    return start_ns;
+}
+
+struct SpinWatchdog {
+    unsigned long long start_ns = 0;
+    unsigned steps = 0;
+
+    __device__ __forceinline__ void tick(const char* site, const void* addr,
+                                         unsigned long long expected, unsigned long long actual) {
+        if (++steps % kSpinCheckInterval == 0) {
+            start_ns = spin_watchdog_check(start_ns, site, addr, expected, actual);
         }
+    }
+};
+
+// Spins until done(*ptr) with relaxed loads, then re-reads with acquire to order later
+// accesses. Returns the acquired value.
+template <typename T, typename Done>
+__device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* site,
+                                        unsigned long long expected) {
+    SpinWatchdog watchdog;
+    for (;;) {
+        const T seen = cuda::atomic_ref<const T, cuda::thread_scope_system>(*ptr)
+            .load(cuda::memory_order_relaxed);
+        if (done(seen)) {
+            const T acquired = cuda::atomic_ref<const T, cuda::thread_scope_system>(*ptr)
+                .load(cuda::memory_order_acquire);
+            if (done(acquired)) {
+                return acquired;
+            }
+            continue;
+        }
+        watchdog.tick(site, ptr, expected, static_cast<unsigned long long>(seen));
     }
 }
 
-__device__ __forceinline__ void fence() {
-    __threadfence_system();
+// Out of line to keep watchdog state out of the register-capped comm kernels.
+static __device__ __noinline__ void wait_until(
+        const int64_t* ptr, Compare compare, int64_t value, const char* site) {
+    spin_until(ptr, [=](int64_t current) {
+        return (compare == Compare::NotEqual && current != value) ||
+               (compare == Compare::GreaterThan && current > value);
+    }, site, value);
 }
 
-#endif  // FLASHMASK_GIN_DEVICE_API
+// Waits until a monotonic signal counter reaches exactly `want`; traps on overshoot
+// (duplicated or misrouted signal).
+static __device__ __noinline__ void signal_wait_exact(
+        const uint64_t* sig, uint64_t want, const char* site) {
+    const uint64_t got = spin_until(sig, [=](uint64_t current) {
+        return static_cast<int64_t>(current - want) >= 0;
+    }, site, want);
+    if (got != want) {
+        spin_trap(site, "overshoot", sig, want, got, 0);
+    }
+}
 
 }  // namespace flashmask::gin

@@ -7,7 +7,6 @@
 #include "sr_buffer.cuh"
 #include "sep_sr_buffer.cuh"
 #include "hierarchical_rank_map.cuh"
-#include "overlap_feature_flags.cuh"
 #include "cutlass/bfloat16.h"
 
 namespace flashmask {
@@ -18,16 +17,17 @@ struct OverlapConfig {
     int B = 0;
     int S_local = 0;       // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
     int H = 0;
-    int H_mask = 0;
     int D = 0;
     int nranks = 0;        // communicator size; changes require a rebuild
-    bool overlap_rs = false;
-    bool use_bhsd = false;     // SR buffer uses (B,H,S,D) layout instead of (B,S,H,D)
+    bool use_bhsd = false;     // SR buffer is (B,H,S,D); set from bhsd_for(D)
+
+    // BHSD puts D in a TMA box dimension, which caps at 256 elements.
+    static constexpr int kMaxBhsdHeadDim = 256;
+    static bool bhsd_for(int d) { return d <= kMaxBhsdHeadDim; }
 
     bool operator==(const OverlapConfig& other) const {
         return B == other.B && S_local == other.S_local && H == other.H
-            && H_mask == other.H_mask && D == other.D && nranks == other.nranks
-            && overlap_rs == other.overlap_rs && use_bhsd == other.use_bhsd;
+            && D == other.D && nranks == other.nranks && use_bhsd == other.use_bhsd;
     }
     bool operator!=(const OverlapConfig& other) const { return !(*this == other); }
 
@@ -40,14 +40,6 @@ struct OverlapConfig {
     size_t cp_chunk_size() const {
         return static_cast<size_t>(S_local) * H * D;
     }
-
-    std::string to_string() const {
-        return "B=" + std::to_string(B) + ", S_local=" + std::to_string(S_local)
-            + ", H=" + std::to_string(H) + ", H_mask=" + std::to_string(H_mask)
-            + ", D=" + std::to_string(D) + ", nranks=" + std::to_string(nranks)
-            + ", overlap_rs=" + std::to_string(int(overlap_rs))
-            + ", use_bhsd=" + std::to_string(int(use_bhsd));
-    }
 };
 
 /**
@@ -56,13 +48,13 @@ struct OverlapConfig {
  * An RAII object managing CP-groups / comm stream / buffer lifetimes automatically
  *
  * Call the constructor of this communicator, and call `run_overlap_ag_kernel` before
- * the main attention kernel, make sure the lifetime of the instance outlast the main kernel
- * Then you should be able to get async remote get, costing only 4 SMs.
+ * the main attention kernel, make sure the lifetime of the instance outlast the main kernel.
+ * The comm kernels run on a separate stream with a fixed grid of comm CTAs.
  *
- * Dynamic reconfiguration: when B/H/D/mask_head/S_local change between calls,
+ * Dynamic reconfiguration: when B/H/D/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
  * S_local is dispatched at compile time: supported values are {4096, 8192, 16384, 32768, 65536, 131072}.
- * RS-overlap is automatically enabled when H_k >= rs_overlap_min_h_k and nranks > 1.
+ * Backward always runs the split AG plus the dK/dV RS overlap (nranks > 1).
 */
 template <typename KVType>
 class OverlapCommunicator {
@@ -72,52 +64,33 @@ private:
 
 public:
     OverlapCommunicator(
-        const KVType* const k_data,
-        const KVType* const v_data,
         int b_kv,
         int s_kv,
         int h_kv,
         int d_kv,
         int rank,
         int nranks,
-        const uint8_t* unique_id_ptr = nullptr,
-        int mask_head = 0,
-        bool overlap_rs = false,
+        const uint8_t* unique_id_ptr,
         bool kv_shared = false
     );
 
     ~OverlapCommunicator();
 
     /**
-     * Check if reconfiguration is needed given new params, and perform it if so.
-     * Returns true if reconfiguration happened.
+     * Reconfigure if the shape changed; returns true if it did.
+     * UID changes go through init_singleton_instance, which rebuilds.
      * S_local must be one of {4096, 8192, 16384, 32768, 65536, 131072}.
     */
     bool reconfigure_if_needed(
         int new_b, int new_s_local, int new_h, int new_d,
-        int rank, int nranks, int new_mask_head, bool new_overlap_rs, bool kv_shared,
-        const uint8_t* unique_id_ptr = nullptr
+        int nranks, bool kv_shared
     );
 
-    OverlapConfig current_config() const { return _config; }
+    // Forward AG on comm_stream; progress is published through fwd_write_ptr.
+    void run_overlap_ag_kernel();
 
-    /**
-     * run the overlap kernel asynchronously
-     * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
-     *      After the execution of this function, S will be set to `S * nranks`
-     * TODO(heqianyue): extend to more mask types!
-    */
-    void run_overlap_ag_kernel(
-        int* const write_ptr,
-        int& S,
-        const bool fwd = true
-    );
-
-    // only used when use_rs_overlap and in the bwd
-    void run_overlap_splitted_ag_kernel(
-        int* const write_ptr,
-        int segment_idx
-    );
+    // Backward AG of one segment, on comm_stream.
+    void run_overlap_splitted_ag_kernel(int segment_idx);
 
     void run_overlap_rs_kernel(
         KVType* const dk_accum,
@@ -127,23 +100,20 @@ public:
     );
 
     void wait_wptr_init();
-    void barrier() { gin::barrier(*gin_context_); }
-
-    // Legacy diagnostic helper. The active FM-4 forward and split backward paths
-    // use per-tile/per-work readiness and do not call this host synchronization.
-    void sync_comm_stream() { cudaStreamSynchronize(comm_stream); }
+    // Collective; call before freeing or rezeroing any window (see gin::quiesce).
+    void quiesce() { sig_buffer->quiesce(); }
 
     void* k_data() const { return kv_buffer->k_data(); }
     // Shared K/V leaves the V region ungathered, so consumers must read K instead.
     void* v_data() const { return _kv_shared ? kv_buffer->k_data() : kv_buffer->v_data(); }
     void* segment_k_data(int segment_idx) const {
-        const size_t offset = _flags.use_hierarchical
+        const size_t offset = _use_hierarchical
             ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
             : 0;
         return kv_buffer->k_data() + offset;
     }
     void* segment_v_data(int segment_idx) const {
-        const size_t offset = _flags.use_hierarchical
+        const size_t offset = _use_hierarchical
             ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
             : 0;
         return (_kv_shared ? kv_buffer->k_data() : kv_buffer->v_data()) + offset;
@@ -151,7 +121,6 @@ public:
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
     // so that the output of post-proc kernel can be directly sent
-    // DO NOT call the following methods, if overlap_rs = false
     void* dk_send(int seg_idx) const { return dkv_buffer->k_send(seg_idx); }
     void* dv_send(int seg_idx) const { return _kv_shared ? nullptr : dkv_buffer->v_send(seg_idx); }
 
@@ -164,12 +133,8 @@ public:
         const bool fwd = true
     );
 
-    int dkv_buffer_stage() const;
-
-    // A send slot is read by its put kernel on p_stream, and reused both within a pass
-    // (capacity < num_segments) and across passes (per-stage). comp_stream must not run
-    // the dK/dV epilogue into it before release_buffer's event. On the first pass the
-    // events are unrecorded, which makes cudaStreamWaitEvent a no-op.
+    // Send slots (ring of min(ns, 2)) are reused across segments and passes: wait for
+    // release_buffer's event before writing the dK/dV epilogue into one.
     void wait_dkv_buffer(int segment_idx, cudaStream_t stream) const {
         dkv_buffer->wait_buffer(segment_idx, stream);
     }
@@ -179,16 +144,18 @@ public:
         cudaStreamWaitEvent(stream, reduce_done);
     }
 
+    // mask: int32 (B, num_heads, S_total, 2) [lt_start, ut_end] pairs, 16-byte aligned;
+    // strides in int32 elements, multiples of 4.
     void compute_chunk_mask(
-        const int* const lt_start_ptr,
-        const int* const lt_end_ptr,
-        const int* const ut_start_ptr,
-        const int* const ut_end_ptr,
+        const int* const mask,
+        const int num_heads,
+        const int64_t batch_stride,
+        const int64_t head_stride,
         cudaStream_t stream,
         const bool fwd = true
     );
 
-    // in `USE_SEMAPHORES` mode, call this function before calling `updayte_kv_buffer`
+    // call this function before calling `update_kv_buffer`
     // to make sure other PEs have finished reading the local KV data in our SR buffer
     // also, barriers the remote_get `comm_kernel`
     void wait_sr_buffer_empty(cudaStream_t stream);
@@ -197,9 +164,18 @@ public:
         return block_cnt_semaphore;
     }
 
+    // Forward AG frontier the compute gate spins on; reset with block_cnt_semaphore.
+    int* get_fwd_write_ptr() const {
+        return fwd_write_ptr;
+    }
+
+    // Forward AG exit counter; its last CTA publishes INT_MAX.
+    int* get_fwd_exit_count() const {
+        return fwd_exit_count;
+    }
+
     // Ensure previous AG kernel on comm_stream has completed before comp_stream
-    // resets block_cnt_semaphore (via prepare_flashmask). Prevents race where
-    // block_cnt_semaphore is reset while the AG kernel is still using it.
+    // resets the AG counters or overwrites copy_chunk_mask, which that kernel still uses.
     void ensure_ag_done(cudaStream_t stream) {
         cudaStreamWaitEvent(stream, ag_done);
     }
@@ -210,12 +186,16 @@ public:
         return block_work_ids;
     }
 
-    // row_per_block used by comm kernel = num_warps * RDMA_ROW_PER_WARP.
-    // Returns 0 if per-work mode should not be used.
+    // Rows per comm work item (always 512); the bwd gate waits on the item holding
+    // a cluster tile's last row.
     int get_comm_rpb() const;
 
     int nranks() const {
         return _total_n_pes;
+    }
+
+    int rank() const {
+        return _my_pe;
     }
 
     int s_local() const {
@@ -225,29 +205,22 @@ public:
     int gpus_per_node() const {
         return _gpus_per_node;
     }
-    int my_pe_node() const {
-        return _my_pe_node;
-    }
-    int num_nodes() const {
-        return _num_nodes;
-    }
     bool use_hierarchical() const {
-        return _flags.use_hierarchical;
+        return _use_hierarchical;
     }
     bool use_bhsd_layout() const {
-        return _flags.use_bhsd_layout;
+        return _config.use_bhsd;
     }
-    bool per_stage_buffer() const {
-        return _flags.per_stage_buffer;
+    bool kv_shared() const {
+        return _kv_shared;
     }
 
-    // this function is only called in the bwd
-    int seqlen_scale() const;
     int num_segments() const;
     // for RS overlap, returns number of chunks per segment
     int chunk_per_seg() const;
-    int overlap_sm_margin() const;
-    void prepare_dkv_buffer(cudaStream_t stream);
+
+    // Bytes of all registered symmetric windows.
+    size_t symmetric_buffer_bytes() const { return gin::window_bytes(*gin_context_); }
 
     // ── Cross-stream synchronization events ──────────────────────────────
     //
@@ -255,21 +228,18 @@ public:
     //  ─────────────  ───────────────────────────────  ──────────────────────────────────────
     //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
     //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
-    //  ag_done        comm_stream → comp_stream        AG kernel finished; safe to reset block_cnt_semaphore
-    //  bwd_done       comp_stream → aux_{p,c}_stream   BWD post-proc done, dK/dV send buffers ready  (RS-overlap only)
-    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready          (RS-overlap only)
-    //  local_moved    aux_p_stream → aux_c_stream      Segment-0 local dKV memcpy d2d completed       (RS-overlap only)
+    //  ag_done        comm_stream → comp_stream        AG kernel done with copy_chunk_mask and the AG counters
+    //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready
+    //  local_moved    put_streams[0] → aux_c_stream    Segment-0 local dKV memcpy d2d completed
     //
     cudaEvent_t wptr_init;
     cudaEvent_t sr_usable;
     cudaEvent_t ag_done;
-    cudaEvent_t bwd_done;       // RS-overlap only
-    cudaEvent_t reduce_done;    // RS-overlap only
-    cudaEvent_t local_moved;    // RS-overlap only
+    cudaEvent_t reduce_done;
+    cudaEvent_t local_moved;
     /**
-     * If overlap_rs is set, dkv_buffer will be populated.
-     * and since the fwd AG buffer is always bigger than bwd AG
-     * (due to the fact that bwd AG is splitted), fwd kv_buffer
+     * dK/dV send/recv slots of the backward RS overlap; always allocated (nranks > 1).
+     * The fwd kv_buffer is at least as big as one bwd AG segment, so it
      * can be reused (carefully).
     */
     std::unique_ptr<SepSRBuffer<KVType>> dkv_buffer;
@@ -293,36 +263,48 @@ private:
     inline KVType* local_v_data() const {
         return kv_buffer->v_data() + _total_numel - B * _local_batch_stride;
     }
+    // Backward keeps local KV at the SR base (no tail backup) when hierarchical or
+    // single-segment: no segment re-gathers over it. The split AG kernel matches this.
+    bool bwd_local_kv_at_base() const { return _use_hierarchical || num_segments() == 1; }
 
-    // Semaphore accessors for hierarchical dual-array protocol:
+    // Hierarchical semaphore accessors (LSA flags only; refcounts live in sig_buffer):
     //   sema_inter [0..num_nodes-1]: cross-node data-ready flags (0/1)
-    //   sema_intra [total_n_pes ranks x batch_ready_words(B*H) words]: word 0 is the refcount,
-    //     all words carry the per-batch intra-node consumption signals
+    //   sema_intra [total_n_pes x batch_ready_words(B*H)]: per-batch intra-node ready bits
     // Non-hierarchical: sema_inter_size=0, sema_intra() == semaphores()
     inline int64_t* sema_inter() const { return kv_buffer->semaphores(); }
     inline int64_t* sema_intra() const { return kv_buffer->semaphores() + _sema_inter_size; }
 
     // BHSD folds heads into the batch dimension: every (b,h) pair is an independent batch.
-    inline int num_effective_batch() const { return _flags.use_bhsd_layout ? B * H : B; }
+    inline int num_effective_batch() const { return _config.use_bhsd ? B * H : B; }
 
-    // Helper to (re)allocate block_work_ids and derived pointers
-    void reallocate_block_work_ids();
-    // Helper to create or recreate the dkv_buffer for RS-overlap
-    void setup_dkv_buffer(bool need_rs, int cp_team);
+    // Grow-only block_work_ids sizing; offsets move only on growth, which device-syncs first.
+    void size_block_work_ids();
+    // (Re)create dkv_buffer and its per-segment streams for the current shape
+    void setup_dkv_buffer();
+    // dK/dV slots too small or laid out for another num_chunks
+    bool dkv_needs_recreate() const {
+        return B * _local_batch_stride > _dkv_single_k_numel_capacity || num_chunks != _dkv_num_chunks;
+    }
+    // Opt this shape's split AG / RS put kernels into their dynamic smem; throws if the
+    // device can't. Call before the shape is committed.
+    void reserve_comm_kernel_smem(int s_local, int nc, int effective_batch, int b) const;
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
+    // Zero recv(segment_idx) and tell its producers it is empty, on aux_c_stream.
+    void recycle_recv_slot(int segment_idx);
+    void notify_recv_empty(int segment_idx);
 
 private:
+    // Allocated once, before the data windows; world size is fixed.
+    std::unique_ptr<SignalBuffer> sig_buffer;
     std::unique_ptr<SRBuffer<KVType>> kv_buffer;
     cudaStream_t comm_stream;
-    cudaStream_t aux_p_stream;      // RS-overlap: producer (put) stream
-    cudaStream_t aux_c_stream;      // RS-overlap: consumer (reduce) stream
+    cudaStream_t aux_c_stream;      // RS consumer (reduce) stream
 
     // Shape parameters (non-const to allow dynamic reconfiguration)
     int B;
     int S_local;            // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
     int H;
-    int H_mask;             // mask head
     int D;
     int num_chunks;
 
@@ -333,60 +315,52 @@ private:
 
     // Hierarchical overlap topology
     int _gpus_per_node;     // Number of ranks in the NCCL LSA team
-    int _my_pe_node;        // This rank's index within the NCCL LSA team
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
-    OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
+    bool _use_hierarchical;      // CP spans more than one LSA domain
     bool _kv_shared = false;     // K and V alias one tensor: transport K only
     // Whether the buffers hold V/dV regions. Sticky: shared K/V allocates without them,
     // and the first non-shared pass grows them back once.
     bool _kv_alloc_v = true;
     int kv_components() const { return _kv_alloc_v ? 2 : 1; }
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
-    int _sema_count;        // allocated int64 semaphore slots
+    int _sema_count;        // int64 semaphore slots of the current layout
+    int _sema_capacity;     // allocated int64 semaphore slots (grow-only)
 
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;
     size_t _sr_buffer_capacity;             // allocated SRBuffer numel capacity
-    size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
-    int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
+    size_t _dkv_single_k_numel_capacity = 0;    // allocated SepSRBuffer single_k_numel capacity
+    int _dkv_num_chunks = 0;                    // SepSRBuffer's chunks_per_seg (layout-defining)
 
-    // RS-overlap: fp32 scratch holding the cross-segment dK/dV sum (dK half | dV half),
-    // so the only bf16 rounding is the last segment's store into dk_ptr / dv_ptr.
-    // Allocated lazily (grow-only) in prepare_dkv_buffer, and only when num_segments > 1.
-    float* dkv_f32_accum;
-    size_t _dkv_f32_numel;                  // allocated float count of dkv_f32_accum (0 when unallocated)
-
-    // dV half of the scratch; null when K/V are shared, which drops the dV half entirely.
-    float* dkv_f32_dv() const {
-        return _kv_shared ? nullptr : dkv_f32_accum + _dkv_f32_numel / 2;
-    }
-
-    int _num_copy_chunks;                   // block_work_ids array size tracking
-    int _bitmap_region_size;                // bitmap region size (work_done + frontier)
+    int _bitmap_region_size;                // bitmap entries the current shape uses (work_done + frontier)
+    int _bwi_head_capacity = 0;             // allocated head region (>= num_blocks and the bitmap)
+    int _bwi_copy_capacity = 0;             // allocated copy_chunk_mask entries
+    int _bwi_batch_capacity = 0;            // allocated effective batches of rank_empty_counters
 
     // ── Compound device allocation (single cudaMalloc) ───────────────────
     //
     //  Offset (int elements)                       Field
     //  ──────────────────────────────────────────   ──────────────────────────────
-    //  [0 .. bitmap_region)                        block_work_ids  (= work_done bitmap + frontier)
-    //  [bitmap_region .. bitmap_region+1)          block_cnt_semaphore
-    //  [bitmap_region+1 .. bitmap_region+1+N)      copy_chunk_mask  (N = _num_copy_chunks)
-    //  [bitmap_region+1+N .. bitmap_region+2+N)    stream_coordinator
-    //  [bitmap_region+2+N .. bitmap_region+2+2N)   rank_commit_counters  (RS-overlap: per-rank)
-    //  [bitmap_region+2+2N .. bitmap_region+2+3N)  rank_empty_counters   (RS-overlap: per-rank)
+    //  [0 .. head_region)                          block_work_ids  (fwd: per-CTA work ids, bwd: work_done bitmap)
+    //  [head_region .. +N)                         copy_chunk_mask  (N = _bwi_copy_capacity)
+    //  [+N .. +N+4)                                block_cnt_semaphore, fwd_write_ptr, stream_coordinator, fwd_exit_count
+    //  [+N+4 .. +N+4+nranks)                       rank_commit_counters
+    //  [.. + effective_batch * nranks)             rank_empty_counters
     //
     int* block_work_ids;
     int* block_cnt_semaphore;
     int* copy_chunk_mask;
+    int* fwd_write_ptr;
     int* stream_coordinator;        // make sure comm kernel is scheduled to GPU before computation kernel
+    int* fwd_exit_count;            // forward AG CTAs past their last work
     int* rank_commit_counters;      // per-rank put completion counters for P2P RS commit
     int* rank_empty_counters;       // per-rank get completion counters for P2P AG empty notify
 
-    // RS multi-stream: per-segment producer resources (USE_DYNAMIC_CAPACITY only)
-    cudaStream_t* put_streams;      // [num_segments], nullptr if single-stream
-    cudaEvent_t* bwd_done_events;   // [num_segments], nullptr if single-stream
-    int* rs_block_cnt;              // device memory [num_segments], nullptr if single-stream
-    int _num_put_streams;           // 0 = single-stream mode
+    // RS per-segment producer resources
+    cudaStream_t* put_streams;      // [num_segments]
+    cudaEvent_t* bwd_done_events;   // [num_segments]
+    int* rs_block_cnt;              // device memory [num_segments]
+    int _num_put_streams;
 };
 
 namespace comm {
@@ -396,10 +370,8 @@ namespace comm {
 
 // init or reconfigure instance (mutable ref), used in fwd.
 // On first call: creates the singleton.
-// On subsequent calls: checks if params changed and reconfigures if needed.
+// Later calls: rebuild on a UID change, else reconfigure if the shape changed.
 OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
-    const cutlass::bfloat16_t* const k_data,
-    const cutlass::bfloat16_t* const v_data,
     int b_kv,
     int s_kv,
     int h_kv,
@@ -407,22 +379,16 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int rank,
     int nranks,
     const uint8_t* unique_id_ptr,
-    int mask_head = 1,
     bool kv_shared = false
 );
 
-// get instance (mutable ref), make sure the instance is initialized, used in both fwd and bwd
+// The live instance; throws std::logic_error before init_singleton_instance.
+// Lives until static destruction at process exit.
 OverlapCommunicator<cutlass::bfloat16_t>& singleton();
 
-// check whether the singleton unique_ptr is nullptr
-bool is_singleton_null();
-
-// Destroy the singleton for topology refresh.
-// After calling this, the next init_singleton_instance() will re-create from scratch.
-// IMPORTANT: communicator generation changes require a full destroy/rebuild when
-// rank/nranks remain the same. This function is intended for refreshing
-// transport-level resources (e.g., after node migration), not for changing topology.
-void destroy_singleton();
+// Bumped on every create, rebuild, reconfigure and kv_shared flip. Getter results
+// (sizes, topology, window addresses) stay fixed while it is unchanged. Never 0 once created.
+uint64_t config_generation();
 
 }   // namespace comm
 

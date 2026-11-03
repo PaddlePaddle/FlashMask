@@ -15,8 +15,8 @@ import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashmask.backend import Tensor, get_backend
-from flashmask.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from ...backend import Tensor, get_backend
+from ..flash_fwd_combine import FlashAttentionForwardCombine
 
 __all__ = ["_flash_attn_fwd_combine"]
 

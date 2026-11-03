@@ -140,26 +140,21 @@ __device__ __host__ inline int hier_position_in_src_pe(
 }
 
 /**
- * Compute seqlen_id for a given logical chunk position and direction.
+ * Forward seqlen_id for a logical chunk position (SR buffer filled right to left).
  */
 __device__ __host__ inline int hier_seqlen_id(
     int logical_pos,
     int row_within_chunk,
     int row_per_block,
     int nranks,
-    int S_chunk,
-    bool bwd
+    int S_chunk
 ) {
-    if (bwd) {
-        return logical_pos * S_chunk + row_within_chunk * row_per_block;
-    } else {
-        return (nranks - 1 - logical_pos) * S_chunk + row_within_chunk * row_per_block;
-    }
+    return (nranks - 1 - logical_pos) * S_chunk + row_within_chunk * row_per_block;
 }
 
 /**
- * Compute the source chunk's seqlen offset in src_pe's SR buffer.
- * Phase 1: src_pe's local chunk (always at position 0 for BWD, nranks-1 for FWD).
+ * Forward: seqlen offset of the source chunk in src_pe's SR buffer.
+ * Phase 1: src_pe's local chunk, at position nranks-1.
  * Phase 2: position of target_rank's data in src_pe's SR buffer.
  */
 __device__ __host__ inline int hier_src_chunk_offset(
@@ -167,14 +162,37 @@ __device__ __host__ inline int hier_src_chunk_offset(
     int nranks,
     int S_chunk,
     int total_n_pes,
-    int gpus_per_node,
-    bool bwd
+    int gpus_per_node
 ) {
     if (info.is_phase1 || info.is_local) {
-        return bwd ? 0 : (nranks - 1) * S_chunk;
+        return (nranks - 1) * S_chunk;
     }
     int src_chunk_pos = hier_position_in_src_pe(info.target_rank, info.src_pe, total_n_pes, gpus_per_node);
-    return bwd ? src_chunk_pos * S_chunk : (nranks - 1 - src_chunk_pos) * S_chunk;
+    return (nranks - 1 - src_chunk_pos) * S_chunk;
+}
+
+/** Location of a chunk in the backward split-AG SR buffer: [segment][batch][chunk][row]. */
+struct HierBwdChunk {
+    int segment;        // segment region, each num_batch * num_chunks * S_chunk rows
+    int chunk;          // chunk within the segment's batch row block
+};
+
+/**
+ * Backward: where the source chunk sits in src_pe's split-AG SR buffer.
+ * Phase 1 / local: segment 0, chunk 0.
+ * Phase 2: logical position p maps to segment p / num_chunks, chunk p % num_chunks.
+ */
+__device__ __host__ inline HierBwdChunk hier_bwd_src_chunk(
+    const HierRankInfo& info,
+    int num_chunks,
+    int total_n_pes,
+    int gpus_per_node
+) {
+    if (info.is_phase1 || info.is_local) {
+        return {0, 0};
+    }
+    const int src_chunk_pos = hier_position_in_src_pe(info.target_rank, info.src_pe, total_n_pes, gpus_per_node);
+    return {src_chunk_pos / num_chunks, src_chunk_pos % num_chunks};
 }
 
 /**

@@ -10,8 +10,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 
 
-from flashmask.cute import layout_utils
-import flashmask.cute.utils as utils
+from . import layout_utils
+from . import utils
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):

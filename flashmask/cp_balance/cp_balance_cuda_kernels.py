@@ -15,7 +15,7 @@ import os
 
 import numpy as np
 
-from flashmask.backend import get_backend
+from ..backend import get_backend
 
 _LIB = None
 

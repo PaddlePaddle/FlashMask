@@ -276,10 +276,19 @@ def _detect_nccl_version(nccl_home):
 
 
 def _detect_cuda_arch():
-    """sm arch for -gencode: FM4_OVERLAP_CUDA_ARCH, else the local GPU (10.3 -> 103a)."""
+    """';'-joined sm arch list for -gencode: FM4_OVERLAP_CUDA_ARCH, else the local GPU.
+
+    The env var takes one arch or a ','/';' list, e.g. '100a;103a'.
+    """
     env = os.environ.get('FM4_OVERLAP_CUDA_ARCH')
     if env:
-        return env
+        archs = [a for a in re.split(r'[,;\s]+', env.strip()) if a]
+        bad = [a for a in archs if not re.fullmatch(r'\d+a?', a)]
+        assert archs and not bad, (
+            f"Invalid FM4_OVERLAP_CUDA_ARCH={env!r}: expected sm archs like "
+            f"'100a' or '100a;103a', got {bad or archs}"
+        )
+        return ';'.join(archs)
     try:
         out = subprocess.check_output(
             ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
@@ -465,8 +474,8 @@ if BUILD_UTILS:
 # --- overlap bridge: NCCL GIN + sm_90a/sm_100, built via standalone sub-CMake ---
 # Built when 'all' or 'ovl' is requested (BUILD_OVL); targets H/B only. NCCL
 # install and target arch are auto-detected; NCCL_HOME/NCCL_ROOT and
-# FM4_OVERLAP_CUDA_ARCH override. Missing NCCL or cutlass warns and skips the
-# optional bridge; the CuTe DSL core keeps working.
+# FM4_OVERLAP_CUDA_ARCH override. Missing NCCL or cutlass fails the build under
+# 'ovl'; under 'all' it only skips the bridge.
 if BUILD_OVL:
     _ovl_csrc = os.path.join(FLASHMASK_DIR, 'overlap', 'csrc')
     _ovl_pkg_dir = os.path.join(FLASHMASK_DIR, 'overlap')
@@ -478,21 +487,26 @@ if BUILD_OVL:
     )
     _cutlass_inc = _detect_cutlass_inc()
 
+    _ovl_missing = None
     if not _nccl_home or not os.path.isdir(_nccl_home):
-        print(f"[flashmask] overlap: no NCCL install found ({_nccl_home}); "
-              "skipping overlap bridge. Install nvidia-nccl-cu13 into this "
-              "interpreter, or set NCCL_HOME.")
+        _ovl_missing = (f"no NCCL install found ({_nccl_home}). Install "
+                        "nvidia-nccl-cu13 into this interpreter, or set NCCL_HOME")
     elif _cutlass_inc is None:
-        print("[flashmask] overlap: cutlass/bfloat16.h not found "
-              "(set FM4_OVERLAP_CUTLASS_INC or install nvidia-cutlass); "
-              "skipping overlap bridge.")
+        _ovl_missing = ("cutlass/bfloat16.h not found (set FM4_OVERLAP_CUTLASS_INC "
+                        "or install nvidia-cutlass)")
     elif _nccl_version is None:
-        print(f"[flashmask] overlap: NCCL version not found in "
-              f"{os.path.join(_nccl_home, 'include', 'nccl.h')}; "
-              "skipping overlap bridge.")
+        _ovl_missing = ("NCCL version not found in "
+                        f"{os.path.join(_nccl_home, 'include', 'nccl.h')}")
     elif _nccl_version < (2, 30, 5):
-        print(f"[flashmask] overlap: NCCL {'.'.join(map(str, _nccl_version))} "
-              "is too old; requires NCCL >= 2.30.5. Skipping overlap bridge.")
+        _ovl_missing = (f"NCCL {'.'.join(map(str, _nccl_version))} at {_nccl_home} "
+                        "is too old; requires NCCL >= 2.30.5")
+
+    if _ovl_missing is not None and 'ovl' in requested_components:
+        # Fail now; otherwise every rank fails at its first overlap call.
+        raise RuntimeError(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD} requests "
+                           f"'ovl', but the overlap bridge cannot be built: {_ovl_missing}.")
+    if _ovl_missing is not None:
+        print(f"[flashmask] overlap: {_ovl_missing}; skipping overlap bridge.")
     else:
         _ovl_arch = _detect_cuda_arch()
         print(f"[flashmask] overlap: NCCL_HOME={_nccl_home}  "

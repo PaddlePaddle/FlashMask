@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from flashmask.cute import utils
+from . import utils
 
 
 class FlashAttentionBackwardDsink:

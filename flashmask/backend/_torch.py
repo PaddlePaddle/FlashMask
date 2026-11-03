@@ -52,6 +52,12 @@ class TorchBackend(BackendBase):
     def cuda_stream(self):
         return torch.cuda.current_stream(self.device).cuda_stream
 
+    def is_stream_capturing(self):
+        if not torch.cuda.is_initialized():
+            return False  # nothing can be capturing before CUDA is initialized
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
     # -- introspection -------------------------------------------------------
 
     def strides(self, x):
@@ -135,6 +141,9 @@ class TorchBackend(BackendBase):
 
     def repeat_interleave(self, x, repeats, axis=None):
         return torch.repeat_interleave(x, repeats, dim=axis)
+
+    def roll(self, x, shifts, axis):
+        return torch.roll(x, shifts, dims=axis)
 
     def split(self, x, num_or_sections, axis=0):
         if isinstance(num_or_sections, int):

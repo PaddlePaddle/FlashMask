@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The FlashMask Authors. All rights reserved.
 
 #include "overlap_comm.cuh"
+#include "cp_heuristic.cuh"
 #include "cutlass/bfloat16.h"
 
 #include <cstdint>
@@ -18,10 +19,43 @@ inline cudaStream_t as_stream(uint64_t handle) {
     return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(handle));
 }
 
-// FM-4 does not run prepare_flashmask_kernel, so reset the persistent AG
-// scheduler counter here before every forward or backward gather.
-__global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore) {
-    if (threadIdx.x == 0) { *block_cnt_semaphore = 1; }
+// Resets the AG scheduler counter, forward frontier and forward exit counter before each
+// gather (FM-4 has no prepare_flashmask_kernel to do it).
+__global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore, int* const write_ptr,
+                                            int* const exit_count) {
+    if (threadIdx.x == 0) {
+        *block_cnt_semaphore = 1;
+        *write_ptr = 0;
+        *exit_count = 0;
+    }
+}
+
+// Resets the counters on `stream` and records wptr_init for the next AG. The caller must
+// have ordered `stream` after the prior AG, which still uses them.
+void reset_ag_counter(flashmask::OverlapCommunicator<bf16>& c, cudaStream_t stream) {
+    fm4_reset_ag_counter_kernel<<<1, 32, 0, stream>>>(
+        c.get_block_cnt_semaphore(), c.get_fwd_write_ptr(), c.get_fwd_exit_count());
+    cudaEventRecord(c.wptr_init, stream);
+}
+
+// Shared start of the fwd AG and the bwd segment-0 split AG. The reset needs no
+// ensure_ag_done of its own: compute_chunk_mask already made `stream` wait on ag_done.
+void start_ag(flashmask::OverlapCommunicator<bf16>& c,
+              uint64_t mask_ptr, int num_heads, int64_t batch_stride, int64_t head_stride,
+              uint64_t k_ptr, uint64_t v_ptr, cudaStream_t stream, bool fwd) {
+    c.wait_sr_buffer_empty(stream);
+    c.compute_chunk_mask(reinterpret_cast<const int*>(static_cast<uintptr_t>(mask_ptr)),
+                         num_heads, batch_stride, head_stride, stream, fwd);
+    c.update_kv_buffer(reinterpret_cast<const bf16*>(static_cast<uintptr_t>(k_ptr)),
+                       reinterpret_cast<const bf16*>(static_cast<uintptr_t>(v_ptr)), fwd);
+    reset_ag_counter(c, stream);
+    c.wait_wptr_init();
+    if (fwd) {
+        c.run_overlap_ag_kernel();
+    } else {
+        c.run_overlap_splitted_ag_kernel(0);
+    }
+    c.wait_reset_stream_coordinator(stream);
 }
 
 }  // namespace
@@ -48,18 +82,23 @@ size_t fm4_overlap_unique_id_size() noexcept {
     return sizeof(ncclUniqueId);
 }
 
-// Create or reconfigure the singleton. Only shape (b/s/h/d) + topology
-// (rank/nranks/uid) are needed; the ctor stores but never derefs k/v, so we pass
-// nullptr (the local-KV copy happens later in fm4_overlap_update_kv). Returns 1.
+// Chunks per backward segment for this K shape, computed without a communicator so
+// check_inputs can reject unsupported shapes early.
+int fm4_overlap_num_chunks_per_segment(int b_kv, int s_kv, int h_kv, int d_kv,
+                                       int nranks) noexcept {
+    return flashmask::get_num_chunk_per_segment(b_kv, s_kv, h_kv, d_kv, nranks);
+}
+
+// Creates, rebuilds (new UID) or reconfigures (new shape) the singleton. Returns
+// comm::config_generation() (> 0); getters below are stable until it changes.
 // kv_shared: K and V alias one tensor, so only K is transported.
-int fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
-                     int rank, int nranks,
-                     const uint8_t* unique_id, int mask_head,
-                     int kv_shared) noexcept {
+uint64_t fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
+                          int rank, int nranks,
+                          const uint8_t* unique_id,
+                          int kv_shared) noexcept {
     flashmask::comm::init_singleton_instance(
-        static_cast<const bf16*>(nullptr), static_cast<const bf16*>(nullptr),
-        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, mask_head, kv_shared != 0);
-    return 1;
+        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, kv_shared != 0);
+    return flashmask::comm::config_generation();
 }
 
 // SRBuffer K/V base pointers as raw uint64 (wrapped into cute tensors in Python).
@@ -73,10 +112,19 @@ uint64_t fm4_overlap_work_done() noexcept {
     return reinterpret_cast<uint64_t>(
         flashmask::comm::singleton().get_work_done_ptr());
 }
+// Device int the forward compute gate spins on (forward AG row frontier).
+uint64_t fm4_overlap_fwd_write_ptr() noexcept {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().get_fwd_write_ptr());
+}
 
 // Local seqlen chunk (S_local); after AG, S_total = s_local * nranks.
 int fm4_overlap_s_local() noexcept { return flashmask::comm::singleton().s_local(); }
 int fm4_overlap_nranks() noexcept { return flashmask::comm::singleton().nranks(); }
+// This process's rank in the communicator (its CP group rank).
+int fm4_overlap_rank() noexcept { return flashmask::comm::singleton().rank(); }
+// Size of the NCCL LSA domain; hierarchical iff nranks > gpus_per_node.
+int fm4_overlap_gpus_per_node() noexcept { return flashmask::comm::singleton().gpus_per_node(); }
 int fm4_overlap_use_bhsd_layout() noexcept {
     return flashmask::comm::singleton().use_bhsd_layout() ? 1 : 0;
 }
@@ -106,55 +154,28 @@ uint64_t fm4_overlap_dv_send(int segment_idx) noexcept {
         flashmask::comm::singleton().dv_send(segment_idx));
 }
 
-// Copy local K/V into the SRBuffer on the internal comm_stream (cudaMemcpyAsync).
-void fm4_overlap_update_kv(uint64_t k_ptr, uint64_t v_ptr, int fwd) noexcept {
-    flashmask::comm::singleton().update_kv_buffer(
-        reinterpret_cast<const bf16*>(static_cast<uintptr_t>(k_ptr)),
-        reinterpret_cast<const bf16*>(static_cast<uintptr_t>(v_ptr)), fwd != 0);
+// Total bytes of the registered symmetric windows.
+uint64_t fm4_overlap_symmetric_buffer_bytes() noexcept {
+    return flashmask::comm::singleton().symmetric_buffer_bytes();
 }
 
-// Compute the per-chunk sparsity mask (copy_chunk_mask) so the AG kernel can skip
-// fully-masked chunks. MUST precede fm4_overlap_run_ag (the kernel reads the mask
-// at remote_get_kernel.cuh:383; it is uninitialized otherwise). lt_start/ut_end
-// are device int32 (B, H_mask, S_total); lt_end/ut_start are null (non-causal).
-// Pass the compute stream so the write is ordered before the AG kernel picks it
-// up via the wait_sr_buffer_empty handshake.
-void fm4_overlap_compute_chunk_mask(uint64_t lt_start_ptr, uint64_t ut_end_ptr,
-                                    uint64_t stream, int fwd) noexcept {
-    flashmask::comm::singleton().compute_chunk_mask(
-        reinterpret_cast<const int*>(static_cast<uintptr_t>(lt_start_ptr)),
-        nullptr, nullptr,
-        reinterpret_cast<const int*>(static_cast<uintptr_t>(ut_end_ptr)),
-        as_stream(stream), fwd != 0);
-}
-
-// Launch the all-gather remote-get kernel on the internal comm_stream. write_ptr
-// is the caller's device int the gate spins on. The communicator rewrites S to
-// S_local * nranks; returned via s_total_out.
-void fm4_overlap_run_ag(uint64_t write_ptr_dev, int* s_total_out, int fwd) noexcept {
-    int S = 0;
-    flashmask::comm::singleton().run_overlap_ag_kernel(
-        reinterpret_cast<int*>(static_cast<uintptr_t>(write_ptr_dev)), S, fwd != 0);
-    if (s_total_out) { *s_total_out = S; }
-}
-
-// compute_stream notifies comm_stream that the local SRBuffer chunk may be reused.
-void fm4_overlap_wait_sr_buffer_empty(uint64_t compute_stream) noexcept {
-    flashmask::comm::singleton().wait_sr_buffer_empty(as_stream(compute_stream));
-}
-
-void fm4_overlap_prepare_dkv_buffer(uint64_t compute_stream) noexcept {
-    flashmask::comm::singleton().prepare_dkv_buffer(as_stream(compute_stream));
+// Starts the forward AG (fwd != 0) or backward segment-0 split AG. mask: device int32
+// (B, H_mask, S_total, 2), 16-byte aligned; strides in int32 elements, multiples of 4.
+void fm4_overlap_start_ag(uint64_t mask_ptr, int num_heads,
+                          int64_t batch_stride, int64_t head_stride,
+                          uint64_t k_ptr, uint64_t v_ptr,
+                          uint64_t compute_stream, int fwd) noexcept {
+    start_ag(flashmask::comm::singleton(), mask_ptr, num_heads, batch_stride, head_stride,
+             k_ptr, v_ptr, as_stream(compute_stream), fwd != 0);
 }
 
 void fm4_overlap_start_bwd_segment(int segment_idx, uint64_t compute_stream) noexcept {
     auto& c = flashmask::comm::singleton();
     cudaStream_t stream = as_stream(compute_stream);
     c.ensure_ag_done(stream);
-    fm4_reset_ag_counter_kernel<<<1, 32, 0, stream>>>(c.get_block_cnt_semaphore());
-    cudaEventRecord(c.wptr_init, stream);
+    reset_ag_counter(c, stream);
     c.wait_wptr_init();
-    c.run_overlap_splitted_ag_kernel(nullptr, segment_idx);
+    c.run_overlap_splitted_ag_kernel(segment_idx);
     c.wait_reset_stream_coordinator(stream);
 }
 
@@ -172,33 +193,6 @@ void fm4_overlap_run_rs(uint64_t dk_ptr, uint64_t dv_ptr, int segment_idx,
 
 void fm4_overlap_wait_reduce_done(uint64_t compute_stream) noexcept {
     flashmask::comm::singleton().wait_reduce_done(as_stream(compute_stream));
-}
-
-// Reset the AG scheduler on the compute stream; pairs with
-// fm4_overlap_wait_wptr_init on the comm stream.
-void fm4_overlap_reset_ag_counter(uint64_t compute_stream) noexcept {
-    auto& c = flashmask::comm::singleton();
-    cudaStream_t s = as_stream(compute_stream);
-    c.ensure_ag_done(s);
-    fm4_reset_ag_counter_kernel<<<1, 32, 0, s>>>(c.get_block_cnt_semaphore());
-    cudaEventRecord(c.wptr_init, s);
-}
-
-// comm_stream waits on wptr_init so the remote-get kernel reads the counter only
-// after the reset lands. Pairs with fm4_overlap_reset_ag_counter.
-void fm4_overlap_wait_wptr_init() noexcept {
-    flashmask::comm::singleton().wait_wptr_init();
-}
-
-// compute stream waits until the comm kernel is actually scheduled onto SMs.
-void fm4_overlap_wait_reset_stream_coordinator(uint64_t stream) noexcept {
-    flashmask::comm::singleton().wait_reset_stream_coordinator(as_stream(stream));
-}
-
-// Legacy host-sync entry point retained for ABI compatibility. Active FM-4
-// forward and split backward paths use asynchronous readiness handshakes instead.
-void fm4_overlap_sync_comm_stream() noexcept {
-    flashmask::comm::singleton().sync_comm_stream();
 }
 
 }  // extern "C"

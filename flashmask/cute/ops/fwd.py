@@ -16,16 +16,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flashmask.backend import Tensor, get_backend
-from flashmask.cute import utils
-from flashmask.cute.block_sparsity import (
+from ...backend import Tensor, get_backend
+from .. import utils
+from ..barrier import spin_timeout_ns_from_env
+from ..block_sparsity import (
     BlockSparseTensorsPaddle,
     normalize_block_sparse_tensors,
     to_cute_block_sparse_tensors,
 )
-from flashmask.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flashmask.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flashmask.cute.flashmask_utils import (
+from ..flash_fwd_sm90 import FlashAttentionForwardSm90
+from ..flash_fwd_sm100 import FlashAttentionForwardSm100
+from ..flashmask_utils import (
     FlashMaskInfoPaddle,
     build_flashmask_block_lists,
     prepare_block_maxmin,
@@ -98,6 +99,8 @@ def _flash_attn_fwd(
             garbage; do not pass an uninitialized / reused buffer.
         block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
             the kernel's n_block_size. Ignored when block_logit is None.
+        group: CP group enabling FM-4 overlap. If size > 1, k/v are the local S_local shard and
+            the mask key axis has length S_local * group_size (chunk r = rank r); pass it unshifted.
     """
     be = get_backend(q, k, v)
 
@@ -217,7 +220,7 @@ def _flash_attn_fwd(
     # handled by a CTA *pair*, so it covers cta_group_size * q_stage * m_block_size rows.
     fwd_m_tile_rows = q_stage * m_block_size * fwd_cta_group_size
     # FM-4 overlap: when a CP `group` is given, K/V come in LOCAL (B, S_local, H, D)
-    # and the gathered KV lives in the NVSHMEM SRBuffer. Bootstrap+init the comm
+    # and the gathered KV lives in the NCCL-window SRBuffer. Bootstrap+init the comm
     # singleton once, run the sparse all-gather on the internal comm_stream, then
     # below swap the K/V cute tensors for SRBuffer-backed views with
     # seqlen_k = S_local*nranks. The SM100 load warp gates each K/V tile on the
@@ -225,22 +228,17 @@ def _flash_attn_fwd(
 
     # A paddle Group exposes .world_size, a torch ProcessGroup does not;
     # ask the collective adapter instead of duck-typing the handle.
-    enable_overlap = group is not None and _dist_world_size(be, group) > 1
+    overlap_nranks = _dist_world_size(be, group) if group is not None else 1
+    enable_overlap = overlap_nranks > 1
     if enable_overlap and compute_capability != 10:
         raise NotImplementedError("FM-4 overlap fwd is only supported on SM100")
     overlap_view_args = None
     overlap_bhsd_layout = None
     if enable_overlap:
         overlap_runtime = _get_overlap_runtime()
-        assert startend_row_indices is not None, (
-            "overlap mode requires startend_row_indices (the post-AG mask)"
+        overlap_runtime.check_inputs(
+            q, k, v, startend_row_indices, causal, overlap_nranks, be
         )
-        assert k.dtype == be.bfloat16, "overlap SRBuffer is bf16"
-        # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
-        # the comm-side compute_chunk_mask requires a non-null ut_end; FM-3 overlap
-        # forbids causal for the same reason. Guarding here keeps the col mapping in
-        # _sparse_chunk_mask_cols exact.
-        assert not causal, "overlap mode does not support causal yet"
         # One storage for K and V makes the gathered V region a bit-for-bit copy of the
         # gathered K region, so the comm layer transports K only and hands out the K region
         # for V. _same_storage stays last: it raises rather than guess.
@@ -251,17 +249,16 @@ def _flash_attn_fwd(
             and tuple(be.strides(k)) == tuple(be.strides(v))
             and _same_storage(k, v)
         )
-        overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1],
-            kv_shared=overlap_kv_shared,
-        )
+        overlap_runtime.ensure_initialized(k, group, kv_shared=overlap_kv_shared)
+        # The kernel indexes gathered K/V in this rank's SRBuffer order; reorder the mask to match.
+        startend_row_indices = overlap_runtime.sr_order_mask(startend_row_indices, fwd=True)
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle(be)
         # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
         # drives host-side validation and the runtime-dimension kernel arguments.
-        overlap_ag_args = overlap_runtime.start_forward_ag(
-            k, v, startend_row_indices, overlap_stream
-        )
+        # One AG with all acks on the comm stream: an exception after it leaves nothing half-booked.
+        overlap_runtime.start_forward_ag(k, v, startend_row_indices, overlap_stream)
+        overlap_ag_args = overlap_runtime.forward_ag_args()
         overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
@@ -303,9 +300,6 @@ def _flash_attn_fwd(
         # from overlap_view_args) carries the gathered shape into the kernel.
         assert num_head_kv == overlap_view_args.shape[2]
         assert head_dim == overlap_view_args.shape[3]
-        # The V view is built from K's overlap_d, so an unequal head_dim_v would read
-        # the wrong bytes rather than fail.
-        assert head_dim_v == head_dim, "overlap requires head_dim_v == head_dim"
     else:
         assert list(k.shape) == [batch_size, seqlen_k, num_head_kv, head_dim], (
             f"expect k with shape {[batch_size, seqlen_k, num_head_kv, head_dim]}, received {k.shape=}"
@@ -524,7 +518,7 @@ def _flash_attn_fwd(
         for t in (q, out if not is_split_kv else out_partial)
     ]
     if enable_overlap:
-        # K/V live in the NVSHMEM SRBuffer (gathered device memory), so there is no
+        # K/V live in the NCCL-window SRBuffer (gathered device memory), so there is no
         # dlpack capsule to wrap; the kernel builds the views from their addr instead.
         k_tensor = None
         v_tensor = None
@@ -616,13 +610,14 @@ def _flash_attn_fwd(
         overlap_view = overlap_ag_args.view
         overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
         overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
-        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr.data_ptr())
+        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr_addr)
         _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
         overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
+        overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
     else:
         overlap_k_addr = None
         overlap_v_addr = None
@@ -632,6 +627,7 @@ def _flash_attn_fwd(
         overlap_h = None
         overlap_d = None
         overlap_kv_chunk_size = None
+        overlap_spin_timeout_ns = None
         overlap_bhsd_layout = None
 
     compile_key = (
@@ -737,6 +733,7 @@ def _flash_attn_fwd(
                     "overlap_s": overlap_s,
                     "overlap_h": overlap_h,
                     "overlap_d": overlap_d,
+                    "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
                     "overlap_kv_chunk_size": overlap_kv_chunk_size,
                     "overlap_bhsd_layout": overlap_bhsd_layout,
                 }
@@ -777,6 +774,7 @@ def _flash_attn_fwd(
                 "overlap_s": overlap_s,
                 "overlap_h": overlap_h,
                 "overlap_d": overlap_d,
+                "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
             }
             if enable_overlap
             else {}

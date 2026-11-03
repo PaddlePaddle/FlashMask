@@ -40,6 +40,10 @@ class PaddleBackend(BackendBase):
     def cuda_stream(self):
         return paddle.device.current_stream().stream_base.cuda_stream
 
+    def is_stream_capturing(self):
+        # Paddle only exposes the process-wide CUDA graph capture state.
+        return bool(paddle.base.core.is_cuda_graph_capturing())
+
     # -- introspection -------------------------------------------------------
 
     def strides(self, x):
@@ -112,6 +116,9 @@ class PaddleBackend(BackendBase):
 
     def repeat_interleave(self, x, repeats, axis=None):
         return paddle.repeat_interleave(x, repeats, axis)
+
+    def roll(self, x, shifts, axis):
+        return paddle.roll(x, shifts, axis)
 
     def split(self, x, num_or_sections, axis=0):
         return paddle.split(x, num_or_sections, axis)

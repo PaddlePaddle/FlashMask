@@ -7,7 +7,7 @@ __version__ = "4.0.0"
 
 import cutlass.cute as cute
 
-from flashmask.cute.cute_dsl_utils import cute_compile_patched
+from .cute_dsl_utils import cute_compile_patched
 
 # Patch cute.compile to optionally dump SASS
 cute.compile = cute_compile_patched
@@ -19,15 +19,21 @@ __all__ = [
 
 
 def __getattr__(name):
-    """Resolve the two public entry points on first access.
+    """Resolve the public entry point on first access.
 
-    They live in the paddle frontend, which imports this package -- binding them
+    It lives in the paddle frontend, which imports this package -- binding it
     eagerly here is a cycle (`flashmask.cute` -> frontend -> `flashmask.cute`).
     Deferring also keeps `import flashmask.cute.<kernel>` free of any framework
     dependency: the kernel modules themselves import neither paddle nor torch.
+
+    `interface` is bound here by the top-level package and read from globals,
+    since hosts like paddlefleet_ops rename the package in sys.modules.
     """
     if name in __all__:
-        from flashmask.cute import interface
-
+        interface = globals().get("interface")
+        if interface is None:
+            raise AttributeError(
+                f"{__name__}.{name} needs the paddle frontend, which failed to import"
+            )
         return getattr(interface, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

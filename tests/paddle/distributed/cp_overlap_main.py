@@ -5,10 +5,7 @@
 """FM-4 CP overlap accuracy test.
 
 ONE mask per process: a process fixes the mask type and cycles head config
-(MQA/MHA/GQA) and batch size in-process, N reps each. Changing the mask *content*
-between two consecutive overlap calls at a live buffer is a known-unsafe operation
-(stale dK/dV), so the mask is held constant per process; hk and B only change the KV
-shape (mask content is unchanged for hk, and per-batch identical for B), which is safe.
+(MQA/MHA/GQA) and batch size in-process, N reps each.
 
 Split axes (separate processes): CP size x mask_type x head dim.
 In-process sweep: batch x hk, N reps each. The single DOC_PACKING sums to 32768 so it
@@ -24,9 +21,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-
-os.environ.setdefault("FM4_CP_LAYOUT", "dual_chunk")
-os.environ.setdefault("FM4_CP_LAYOUT_BASE", "dual_chunk")
 
 import numpy as np
 import paddle

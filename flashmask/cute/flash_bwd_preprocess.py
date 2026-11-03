@@ -14,11 +14,11 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
 
-from flashmask.cute import copy_utils, layout_utils
+from . import copy_utils, layout_utils
 
-from flashmask.cute import utils
-from flashmask.cute.seqlen_info import SeqlenInfo
-from flashmask.cute.tile_scheduler import (
+from . import utils
+from .seqlen_info import SeqlenInfo
+from .tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     TileSchedulerArguments,

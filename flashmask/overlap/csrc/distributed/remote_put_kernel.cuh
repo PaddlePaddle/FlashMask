@@ -21,12 +21,12 @@ namespace flashmask {
  * actually an all-gather op implemented by an A2A op, the buffer cannot be reused the same way as the
  * all-gather overlap.
  *
- * P2P commit: when the last CTA finishes all puts to a given rank, it fences and signals
- * to notify that specific remote consumer immediately — no blocking quiet or group commit needed.
+ * P2P commit: the last CTA done with a rank signals that consumer at once (strong add on
+ * SignalBuffer::rs_full); no quiet or group commit.
 */
 template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
     int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVChunkRemotePutKernel(
+__global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
     const T* const __restrict__ v_send,                 // V src addr (local)
     T* const __restrict__ k_recv,                       // K dst addr (remote)
@@ -40,16 +40,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     const int segment_idx,
     const int num_batch,                // B
     const int S_stride,                 // H * D
-    int64_t* const __restrict__ semaphores,
+    int64_t* const __restrict__ semaphores,          // empty flags, written by the consumers
+    uint64_t* const __restrict__ rs_full_seg,        // SignalBuffer::rs_full(segment_idx)
     const int num_segments = 4,
-    const int gpus_per_node = 1,        // hierarchical only
-    const bool per_stage_buffer = false
+    const int gpus_per_node = 1         // hierarchical only
 ) {
-#ifdef FLASHMASK_DEBUG
-    if (threadIdx.x == 0) {
-       DEBUG_PRINT("Remote put starts, blockIdx: %d, self rank: %d, segment_idx: %d / %d\n", blockIdx.x, my_pe, segment_idx, num_segments);
-    }
-#endif  // FLASHMASK_DEBUG
     // segment has only a local chunk, nothing to remote-put. Return immediately.
     if constexpr (has_local_chunk && num_chunk == 1) {
         return;
@@ -99,8 +94,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
     };
 
-    // this lambda ensures correct visibility to the change of block_work_idx and
-    // the last CTA will correctly set the wptr to be INT_MAX to notify completion
+    // Thread blockIdx.x claims the CTA's next work id; __syncthreads shares it. No frontier, unlike the AG.
     auto update_work_id_sync = [&]() {
         if (threadIdx.x == blockIdx.x) {
             // Note: block_cnt_semaphore for remote_put starts from 0 (for remote get, starts from 1)
@@ -112,29 +106,23 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     };
 
     // P2P commit: after completing a work, check if all works for that rank are done.
-    // If so, fence + signal that specific consumer rank.
+    // If so, signal that specific consumer rank.
     // target_rank is passed in to avoid recomputing it (already computed at loop top).
     auto try_commit_rank = [&](int seg_chunk_id, int target_rank) {
         if (threadIdx.x == 0) {
             // chunk_offset maps seg_chunk_id back to the counter index for remote chunks
             int counter_idx = seg_chunk_id - chunk_offset;
-            int prev = atomicAdd(&rank_commit_counters[counter_idx], 1);
+            // acq_rel: the winner must acquire every CTA's puts before its release add below.
+            int prev = cuda::atomic_ref<int, cuda::thread_scope_device>(rank_commit_counters[counter_idx])
+                .fetch_add(1, cuda::memory_order_acq_rel);
             if (prev + 1 == works_per_rank) {
                 // wait before reset, in-case all chunks are skipped and we reset before remote put
                 sema::rs::producer_wait_empty(semaphores, target_rank);
-                // Last CTA to finish work for this rank.
+                // Last CTA to finish work for this rank: consume the empty flag.
                 semaphores[target_rank] = 0;
                 // Strong VA signal on the shared ordered context settles every
-                // preceding put to target_rank (from ANY CTA, cross-node) before
-                // it lands -- replacing the old gin::fence() (a GPU-local
-                // __threadfence_system that gave no RDMA ordering).
-                // P2P notify: same semantics as ProducerNotifyFull but for one rank only
-                if (per_stage_buffer) {
-                    gin::remote_strong_add(semaphores + target_rank, int64_t(1), target_rank);
-                } else {
-                    const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
-                    gin::remote_strong_add(semaphores + target_rank, clear_mask, target_rank);
-                }
+                // preceding put to target_rank (from ANY CTA, cross-node) before it lands.
+                gin::remote_strong_add(rs_full_seg, 1, target_rank);
             }
         }
     };
@@ -193,11 +181,6 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     if (threadIdx.x == 0 && gin::mesh_is_cross_node()) {
         gin::flush_ordered();
     }
-#ifdef FLASHMASK_DEBUG
-    if (threadIdx.x == 0) {
-       DEBUG_PRINT("Remote put quits, blockIdx: %d, self rank: %d, segment_idx: %d\n", blockIdx.x, my_pe, segment_idx);
-    }
-#endif  // FLASHMASK_DEBUG
 }
 
 }   // namespace flashmask

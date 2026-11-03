@@ -18,33 +18,33 @@ from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 
-from flashmask.cute import copy_utils
-from flashmask.cute import layout_utils
-from flashmask.cute import hopper_helpers as sm90_utils
+from . import copy_utils
+from . import layout_utils
+from . import hopper_helpers as sm90_utils
 
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-import flashmask.cute.utils as utils
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.softmax import Softmax
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute.block_sparsity import BlockSparseTensors
-from flashmask.cute.block_sparse_utils import (
+from .cute_dsl_utils import assume_tensor_aligned
+from . import utils
+from .mask import AttentionMask
+from .softmax import Softmax
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from flashmask.cute import pipeline as pipeline_custom
-from flashmask.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
-from flashmask.cute.named_barrier import NamedBarrierFwd
-from flashmask.cute.tile_scheduler import (
+from . import pipeline as pipeline_custom
+from .pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
+from .named_barrier import NamedBarrierFwd
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,
     ParamsBase,
 )
 
-from flashmask.cute.flash_fwd import FlashAttentionForwardBase
-from flashmask.cute.flashmask_utils import FlashMaskInfo
+from .flash_fwd import FlashAttentionForwardBase
+from .flashmask_utils import FlashMaskInfo
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):

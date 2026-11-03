@@ -17,7 +17,7 @@ Importing this module pulls in paddle, by definition of what it re-exports.
 Torch callers should use `flashmask.frontend.torch` instead.
 """
 
-from flashmask.cute.ops._common import (
+from .ops._common import (
     BwdConfig,
     _check_cutedsl_supported,
     _get_compute_capability,
@@ -28,13 +28,13 @@ from flashmask.cute.ops._common import (
     maybe_contiguous,
     num_splits_heuristic,
 )
-from flashmask.cute.ops.bwd import _flash_attn_bwd
-from flashmask.cute.ops.combine import _flash_attn_fwd_combine
-from flashmask.cute.ops.fwd import _flash_attn_fwd
-from flashmask.frontend.paddle import (
+from .ops.bwd import _flash_attn_bwd
+from .ops.combine import _flash_attn_fwd_combine
+from .ops.fwd import _flash_attn_fwd
+from ..frontend.paddle import (
     flashmask_attention,
 )
-from flashmask.frontend.paddle.autograd import (
+from ..frontend.paddle.autograd import (
     FlashMaskFunc,
 )
 

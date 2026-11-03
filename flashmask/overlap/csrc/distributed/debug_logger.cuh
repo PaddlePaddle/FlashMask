@@ -4,13 +4,9 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdio>
-
-#define LOG_LV_NONE 0
-#define LOG_LV_DEBUG 1
-#define LOG_LV_WARN 2
-#define LOG_LV_ERROR 3
-
-#define DEBUG_LOGGING LOG_LV_NONE
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 // #define FLASHMASK_DEBUG
 
@@ -23,66 +19,24 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
     exit(1);
 }
 
+// The release build still evaluates the wrapped call; only FLASHMASK_DEBUG checks it.
 #if defined(FLASHMASK_DEBUG)
 #define CUDA_DEBUG_CHECK(value) CheckCudaErrorAux(__FILE__, __LINE__, #value, value)
 #else
 #define CUDA_DEBUG_CHECK(value) (value)
 #endif
 
-#if DEBUG_LOGGING > 0
-    // print directly
-    #define DEBUG_PRINT(fmt, ...) printf("[Debug] " fmt, ##__VA_ARGS__)
+namespace flashmask {
 
-    // print with stream sync
-    #define DEBUG_PRINT_SYNC(stream, fmt, ...) CUDA_DEBUG_CHECK(cudaStreamSynchronize(stream)); printf("[Debug] " fmt, ##__VA_ARGS__)
-    #if DEBUG_LOGGING > 1
-        // print directly
-        #define WARN_PRINT(fmt, ...) printf("[Warn] " fmt, ##__VA_ARGS__)
+// Checks host setup calls that later launches depend on. Throws; the noexcept bridge
+// entry points turn that into std::terminate, which prints what().
+inline void check_cuda(cudaError_t err, const char* call) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("[FlashMask Overlap] ") + call + " failed: "
+            + cudaGetErrorString(err));
+    }
+}
 
-        // print with stream sync
-        #define WARN_PRINT_SYNC(stream, fmt, ...) CUDA_DEBUG_CHECK(cudaStreamSynchronize(stream)); printf("[Warn] " fmt, ##__VA_ARGS__) 
-        #if DEBUG_LOGGING > 2
-            // print directly
-            #define ERROR_PRINT(fmt, ...) printf("[Error] " fmt, ##__VA_ARGS__)
+}  // namespace flashmask
 
-            // print with stream sync
-            #define ERROR_PRINT_SYNC(stream, fmt, ...) CUDA_DEBUG_CHECK(cudaStreamSynchronize(stream)); printf("[Error] " fmt, ##__VA_ARGS__) 
-        #else
-            // Do nothing since log level is Warn
-            #define ERROR_PRINT(fmt, ...) ((void)0)
-
-            // Do nothing since log level is Warn
-            #define ERROR_PRINT_SYNC(fmt, ...) ((void)0)
-        #endif // ERROR
-    #else
-        // Do nothing since log level is Debug
-        #define ERROR_PRINT(fmt, ...) ((void)0)
-
-        // Do nothing since log level is Debug
-        #define ERROR_PRINT_SYNC(fmt, ...) ((void)0)
-
-        // Do nothing since log level is Debug
-        #define WARN_PRINT(fmt, ...) ((void)0)
-
-        // Do nothing since log level is Debug
-        #define WARN_PRINT_SYNC(fmt, ...) ((void)0)
-    #endif // WARN
-#else
-    // Do nothing since log level is None
-    #define ERROR_PRINT(fmt, ...) ((void)0)
-
-    // Do nothing since log level is None
-    #define ERROR_PRINT_SYNC(fmt, ...) ((void)0)
-
-    // Do nothing since log level is None
-    #define WARN_PRINT(fmt, ...) ((void)0)
-
-    // Do nothing since log level is None
-    #define WARN_PRINT_SYNC(fmt, ...) ((void)0)
-
-    // Do nothing since log level is None
-    #define DEBUG_PRINT(fmt, ...) ((void)0)
-
-    // Do nothing since log level is None
-    #define DEBUG_PRINT_SYNC(fmt, ...) ((void)0)
-#endif // DEBUG_LOGGING
+#define FM_CUDA_CHECK(call) ::flashmask::check_cuda((call), #call)

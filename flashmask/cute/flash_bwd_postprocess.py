@@ -15,16 +15,16 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
-from flashmask.cute import copy_utils
-from flashmask.cute import layout_utils
-from flashmask.cute import hopper_helpers as sm90_utils
+from . import copy_utils
+from . import layout_utils
+from . import hopper_helpers as sm90_utils
 
-from flashmask.cute import utils
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-from flashmask.cute import ampere_helpers as sm80_utils
-from flashmask.cute.seqlen_info import SeqlenInfoQK
+from . import utils
+from .cute_dsl_utils import assume_tensor_aligned
+from . import ampere_helpers as sm80_utils
+from .seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from flashmask.cute.tile_scheduler import (
+from .tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     TileSchedulerArguments,
@@ -214,15 +214,11 @@ class FlashAttentionBackwardPostprocess:
                     self.dtype, align=16,
                 )
             else:
+                s64, h64, sd64 = utils.int64_dims(raw_s, raw_h, raw_storage_d)
                 mdQ = utils.make_gmem_tensor_from_addr(
                     raw_output_addr,
                     (raw_b, raw_s, raw_h, raw_d),
-                    (
-                        raw_s * raw_h * raw_storage_d,
-                        raw_h * raw_storage_d,
-                        raw_storage_d,
-                        1,
-                    ),
+                    (s64 * h64 * sd64, h64 * sd64, sd64, 1),
                     self.dtype,
                     align=16,
                 )

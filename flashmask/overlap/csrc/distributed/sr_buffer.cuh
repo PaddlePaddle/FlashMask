@@ -7,12 +7,59 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #include "nccl_gin_backend.cuh"
 
 namespace flashmask {
 
 using SemaphoreType = int64_t;
+
+// VA-signal words: ag_refcnt indexed by data owner, rs_full by RS segment, drain for quiesce.
+// Only ever incremented; allocated once so in-flight adds survive a reconfigure.
+class SignalBuffer {
+private:
+    gin::Context& _context;
+    const int _nranks;
+    uint64_t* _signals = nullptr;    // window: [ag_refcnt N][rs_full N][drain]
+    uint64_t* _expected = nullptr;   // device: [ag_issued N][rs_expected N]
+    uint64_t _drained = 0;           // host: cumulative drain count
+
+    SignalBuffer(const SignalBuffer&) = delete;
+    SignalBuffer& operator=(const SignalBuffer&) = delete;
+    SignalBuffer(SignalBuffer&&) = delete;
+    SignalBuffer& operator=(SignalBuffer&&) = delete;
+
+public:
+    SignalBuffer(gin::Context& context, int nranks) : _context(context), _nranks(nranks) {
+        const size_t signal_bytes = (2 * static_cast<size_t>(nranks) + 1) * sizeof(uint64_t);
+        const size_t expected_bytes = 2 * static_cast<size_t>(nranks) * sizeof(uint64_t);
+        _signals = static_cast<uint64_t*>(
+            gin::alloc(_context, signal_bytes, gin::WindowKind::Signal));
+        cudaError_t result = cudaMalloc(&_expected, expected_bytes);
+        if (result == cudaSuccess) result = cudaMemset(_signals, 0, signal_bytes);
+        if (result == cudaSuccess) result = cudaMemset(_expected, 0, expected_bytes);
+        if (result != cudaSuccess) {
+            cudaFree(_expected);
+            gin::free_noexcept(_context, _signals);
+            throw std::runtime_error(
+                std::string("SignalBuffer: allocation failed: ") + cudaGetErrorString(result));
+        }
+    }
+
+    ~SignalBuffer() noexcept {
+        gin::free_noexcept(_context, _signals);
+        cudaFree(_expected);
+    }
+
+    uint64_t* ag_refcnt() const noexcept { return _signals; }
+    uint64_t* rs_full(int seg) const noexcept { return _signals + _nranks + seg; }
+    uint64_t* ag_issued() const noexcept { return _expected; }
+    uint64_t* rs_expected(int seg) const noexcept { return _expected + _nranks + seg; }
+
+    // Collective: settles all GIN traffic issued so far.
+    void quiesce() { _drained = gin::quiesce(_context, _signals + 2 * _nranks, _drained); }
+};
 
 template <typename KVType>
 class SRBuffer {
@@ -43,6 +90,14 @@ public:
         const size_t total_bytes = kv_components * numel * sizeof(KVType) +
                                    semaphore_size * sizeof(SemaphoreType);
         _k_sr = static_cast<KVType*>(gin::alloc(_context, total_bytes));
+        // ncclMemAlloc memory is uninitialized; compute may read never-fetched rows, and
+        // 0 * NaN garbage would poison dQ/dK. Also clears the semaphores.
+        const cudaError_t memset_result = cudaMemset(_k_sr, 0, total_bytes);
+        if (memset_result != cudaSuccess) {
+            gin::free_noexcept(_context, _k_sr);
+            throw std::runtime_error(
+                std::string("SRBuffer: zeroing failed: ") + cudaGetErrorString(memset_result));
+        }
         // Shared K/V has no V region; null so that a stray V access faults instead of
         // silently landing in the semaphores.
         _v_sr = kv_components == 2 ? _k_sr + numel : nullptr;
@@ -59,9 +114,6 @@ public:
     }
 
     void team_bar() const { gin::barrier(_context); }
-    void team_bar_on_stream(cudaStream_t stream) const {
-        gin::barrier_on_stream(_context, stream);
-    }
 
     void release() {
         if (_allocated && _k_sr != nullptr) {
@@ -75,12 +127,6 @@ public:
     KVType* k_data() const noexcept { return _k_sr; }
     KVType* v_data() const noexcept { return _v_sr; }
     SemaphoreType* semaphores() const noexcept { return _semaphores; }
-
-    bool is_valid() const noexcept {
-        return _allocated && _k_sr != nullptr && _semaphores != nullptr;
-    }
-
-    size_t capacity() const noexcept { return _numel; }
 
 private:
     void reset() noexcept {

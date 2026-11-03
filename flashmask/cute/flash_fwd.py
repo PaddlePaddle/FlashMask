@@ -11,12 +11,12 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 
-from flashmask.cute import copy_utils
-from flashmask.cute import layout_utils
-from flashmask.cute import utils
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.pack_gqa import PackGQA
-from flashmask.cute.named_barrier import NamedBarrierFwd
+from . import copy_utils
+from . import layout_utils
+from . import utils
+from .seqlen_info import SeqlenInfoQK
+from .pack_gqa import PackGQA
+from .named_barrier import NamedBarrierFwd
 
 
 class FlashAttentionForwardBase:

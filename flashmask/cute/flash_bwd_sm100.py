@@ -16,19 +16,19 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
-from flashmask.cute import utils
-from flashmask.cute import layout_utils
-from flashmask.cute.cute_dsl_utils import assume_tensor_aligned
-from flashmask.cute import copy_utils
-from flashmask.cute.barrier import wait_flag_eq
-from flashmask.cute import pipeline
-from flashmask.cute import blackwell_helpers as sm100_utils
-from flashmask.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from flashmask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
-from flashmask.cute.mask import AttentionMask
-from flashmask.cute.seqlen_info import SeqlenInfoQK
-from flashmask.cute.block_info import BlockInfo
-from flashmask.cute.tile_scheduler import (
+from . import utils
+from . import layout_utils
+from .cute_dsl_utils import assume_tensor_aligned
+from . import copy_utils
+from .barrier import wait_flag_eq
+from . import pipeline
+from . import blackwell_helpers as sm100_utils
+from .blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from .blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
@@ -36,9 +36,9 @@ from flashmask.cute.tile_scheduler import (
     ParamsBase,
 )
 
-from flashmask.cute import barrier
-from flashmask.cute.named_barrier import NamedBarrierBwdSm100
-from flashmask.cute.flashmask_utils import FlashMaskInfo
+from . import barrier
+from .named_barrier import NamedBarrierBwdSm100
+from .flashmask_utils import FlashMaskInfo
 
 
 @cute.jit
@@ -48,16 +48,25 @@ def _overlap_gate_bwd(
     seqlen_k: Int32,
     batch_idx: Int32,
     work_done: cute.Pointer,
+    spin_timeout_ns: cutlass.Int64,
     comm_rpb: cutlass.Constexpr[int],
     cta_group_size: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
 ):
-    """Wait for the split-AG work item covering this cluster-wide KV tile."""
+    """Wait for the split-AG work item covering this cluster-wide KV tile.
+
+    Only ``tidx == 0`` spins, but every lane of the load warp must call this so each
+    lane, including the TMA issuer, runs the proxy fence.
+    """
     if tidx == 0:
         right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
         work_per_batch = seqlen_k // comm_rpb
         work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
-        wait_flag_eq(work_done, Int32(work_id), Int32(1))
+        wait_flag_eq(work_done, Int32(work_id), Int32(1), spin_timeout_ns)
+    # Share lane 0's acquire with the whole warp.
+    cute.arch.sync_warp()
+    # Order the acquire before this lane's TMA (async-proxy) reads.
+    cute.arch.fence_proxy("async.global")
 
 
 class FlashAttentionBackwardSm100:
@@ -785,6 +794,7 @@ class FlashAttentionBackwardSm100:
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[cutlass.Int32] = None,
         overlap_dk_addr: Optional[cutlass.Int64] = None,
         overlap_dv_addr: Optional[cutlass.Int64] = None,
@@ -797,7 +807,7 @@ class FlashAttentionBackwardSm100:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # FM-4 split-AG overlap: the segment K/V live in the NVSHMEM SRBuffer
+        # FM-4 split-AG overlap: the segment K/V live in the NCCL-window SRBuffer
         # (no Paddle tensor / dlpack capsule), so they arrive as a raw addr plus
         # the segment (B, S_segment, H, D) dims as RUNTIME Int32 scalars. Rebuild the
         # views HERE in this jit body's MLIR Context (make_*_from_addr requires it),
@@ -806,6 +816,9 @@ class FlashAttentionBackwardSm100:
         # This mirrors the forward SRBuffer view construction. Readiness is gated
         # per communication work item in the load warp below.
         self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
+        assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
+            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
+        )
         if const_expr(overlap_k_addr is not None):
             if const_expr(overlap_bhsd_layout):
                 mK = utils.make_bhsd_storage_bshd_from_addr(
@@ -854,6 +867,13 @@ class FlashAttentionBackwardSm100:
                 overlap_dv_addr, overlap_b, overlap_s, overlap_h, overlap_d,
                 mQ.element_type, align=16,
             )
+        # 1-CTA skips the dKV epilogue for fully masked key blocks. The reused NCCL send
+        # slot is not zeroed and the reduce-scatter sums all rows, so store zeros there.
+        self.zero_skipped_dKV = const_expr(
+            overlap_dk_addr is not None
+            and not self.use_2cta_instrs
+            and not self.dKV_postprocess
+        )
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -1361,6 +1381,7 @@ class FlashAttentionBackwardSm100:
             tma_atom_dK,
             flashmask_info,
             overlap_work_done_addr,
+            overlap_spin_timeout_ns,
             overlap_segment_idx,
             overlap_comm_rpb,
             self.sQ_layout,
@@ -1430,6 +1451,7 @@ class FlashAttentionBackwardSm100:
         tma_atom_dK: Optional[cute.CopyAtom],
         flashmask_info: Optional[FlashMaskInfo],
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
@@ -1891,6 +1913,7 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 flashmask_info,
                 overlap_work_done_addr,
+                overlap_spin_timeout_ns,
                 overlap_segment_idx,
                 overlap_comm_rpb,
                 sStartEndRowIndices,
@@ -2157,6 +2180,7 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         flashmask_info: FlashMaskInfo,
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
@@ -2228,6 +2252,7 @@ class FlashAttentionBackwardSm100:
                     seqlen.seqlen_k,
                     gate_batch_idx,
                     work_done,
+                    overlap_spin_timeout_ns,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,
@@ -4397,6 +4422,29 @@ class FlashAttentionBackwardSm100:
                         mdK_semaphore,
                         "K",
                     )
+                if const_expr(self.zero_skipped_dKV):
+                    if zero_block:
+                        self.store_zero_dK_or_dV(
+                            tidx, batch_idx, head_idx, n_block, seqlen.seqlen_k, mdV, "V"
+                        )
+                        self.store_zero_dK_or_dV(
+                            tidx, batch_idx, head_idx, n_block, seqlen.seqlen_k, mdK, "K"
+                        )
+                if const_expr(
+                    self.deterministic
+                    and self.dKV_postprocess
+                    and self.enable_flashmask
+                    and not self.use_2cta_instrs
+                ):
+                    # A per-q-head mask may skip this tile for one q-head only; it must
+                    # still take its turn in the dK/dV accumulate order.
+                    if zero_block:
+                        self.pass_dKV_semaphore(
+                            dp_idx, wg_idx, batch_idx, head_idx, n_block, mdV_semaphore
+                        )
+                        self.pass_dKV_semaphore(
+                            dp_idx, wg_idx, batch_idx, head_idx, n_block, mdK_semaphore
+                        )
                 if const_expr(self.enable_flashmask):
                     flashmask_phase ^= 1
 
@@ -5085,6 +5133,73 @@ class FlashAttentionBackwardSm100:
             )
 
         return dQ_consumer_state, dQ_tma_store_producer_state
+
+    @cute.jit
+    def store_zero_dK_or_dV(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        seqlen_k: Int32,
+        mdKV: cute.Tensor,
+        K_or_V: cutlass.Constexpr[str],
+    ):
+        """Zero this key block's dK or dV rows (MHA, 1-CTA), bounded by seqlen_k and head_dim."""
+        assert K_or_V in ("K", "V")
+        if const_expr(K_or_V == "K"):
+            tile_hdim, check_hdim_oob = self.tile_hdim, self.check_hdim_oob
+        else:
+            tile_hdim, check_hdim_oob = self.tile_hdimv, self.check_hdim_v_oob
+        dtype = mdKV.element_type
+        num_copy_elems = 128 // dtype.width
+        gmem_tiled_copy = copy_utils.tiled_copy_2d(
+            dtype,
+            tile_hdim // num_copy_elems,
+            cute.arch.WARP_SIZE * len(self.compute_warp_ids),
+            num_copy_elems,
+        )
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        gdKV = cute.local_tile(
+            mdKV[None, None, head_idx, batch_idx], (self.tile_n, tile_hdim), (n_block, 0)
+        )
+        cdKV = cute.make_identity_tensor((self.tile_n, tile_hdim))
+        tdKVgdKV = gmem_thr_copy.partition_D(gdKV)
+        tdKVcdKV = gmem_thr_copy.partition_S(cdKV)
+        t0dKVcdKV = gmem_tiled_copy.get_slice(0).partition_S(cdKV)
+        tdKVpdKV = utils.predicate_k(tdKVcdKV, limit=mdKV.shape[1])
+        tdKVrdKV = cute.make_rmem_tensor_like(tdKVgdKV)
+        tdKVrdKV.fill(0.0)
+        for rest_m in cutlass.range_constexpr(cute.size(tdKVrdKV.shape[1])):
+            if t0dKVcdKV[0, rest_m, 0][0] < seqlen_k - n_block * self.tile_n - tdKVcdKV[0][0]:
+                cute.copy(
+                    gmem_tiled_copy,
+                    tdKVrdKV[None, rest_m, None],
+                    tdKVgdKV[None, rest_m, None],
+                    pred=tdKVpdKV[None, rest_m, None] if const_expr(check_hdim_oob) else None,
+                )
+
+    @cute.jit
+    def pass_dKV_semaphore(
+        self,
+        tidx: Int32,
+        wg_idx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        mdKV_semaphore: cute.Tensor,
+    ):
+        """Pass this q-head's dKV semaphore turn without accumulating.
+
+        The acquire -> release on one thread keeps earlier q-heads' accumulates ordered first.
+        """
+        mdKV_semaphore_cur = mdKV_semaphore[
+            n_block, None, head_idx // self.qhead_per_kvhead, batch_idx
+        ]
+        barrier.wait_eq(
+            mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
+        )
+        barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
     @cute.jit
     def epilogue_dKV(

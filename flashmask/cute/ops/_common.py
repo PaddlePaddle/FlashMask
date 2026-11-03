@@ -13,54 +13,30 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from flashmask.cute.cute_dsl_utils import make_fake_tensor
+from ...distributed import get_dist
+from ..cute_dsl_utils import make_fake_tensor
 
-_OVERLAP_RUNTIME = None
+# Import eagerly: a call-time import fails once a host renames the package in sys.modules.
+# Wheels built without 'ovl' lack flashmask.overlap; only overlap calls report that.
+try:
+    from ...overlap import overlap_runtime as _overlap_runtime
+    _overlap_import_error = None
+except ImportError as exc:
+    _overlap_runtime = None
+    _overlap_import_error = exc
+
 
 def _get_overlap_runtime():
-    """ Fix raw package import (import flashmask.*)
-        and paddlefleet_ops import (import paddlefleet_ops.flashmask.*)
-        with cached module to accelerate import
-    """
-    global _OVERLAP_RUNTIME
-    if _OVERLAP_RUNTIME is not None:
-        return _OVERLAP_RUNTIME
-
-    import importlib
-    import sys
-
-    registered = next(
-        (
-            name
-            for name, module in list(sys.modules.items())
-            if getattr(module, "__dict__", None) is globals()
-        ),
-        None,
-    )
-    if registered is None:
-        raise RuntimeError(f"{__file__} is not registered in sys.modules")
-    # Split on the ".cute." segment rather than counting components from the
-    # right: this module has moved deeper than the old ".cute.interface" and a
-    # fixed rsplit count would silently resolve to the wrong root package.
-    root = registered.split(".cute.")[0]
-    try:
-        _OVERLAP_RUNTIME = importlib.import_module(f"{root}.overlap.overlap_runtime")
-    except ImportError as exc:
+    if _overlap_runtime is None:
         raise RuntimeError(
-            f"failed to import {root}.overlap.overlap_runtime; the 'ovl' build "
-            f"component may not have been built: {exc}"
-        ) from exc
-    return _OVERLAP_RUNTIME
+            "flashmask.overlap.overlap_runtime failed to import; the 'ovl' build "
+            f"component may not have been built: {_overlap_import_error}"
+        ) from _overlap_import_error
+    return _overlap_runtime
 
 
 def _dist_world_size(be, group):
-    """World size of ``group``, via the collective adapter.
-
-    Imported lazily so that a single-GPU attention call never touches
-    ``torch.distributed`` / ``paddle.distributed``.
-    """
-    from flashmask.distributed import get_dist
-
+    """World size of ``group``, via the collective adapter."""
     return get_dist(be.name).world_size(group)
 
 

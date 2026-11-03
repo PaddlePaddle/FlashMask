@@ -65,11 +65,11 @@ from cutlass.utils.layout import LayoutEnum
 from cutlass import Float32, Int32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from flashmask.cute import blackwell_helpers as sm100_utils
-from flashmask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
-from flashmask.cute import barrier, copy_utils, layout_utils, utils
-from flashmask.cute.flash_bwd_sm100 import _overlap_gate_bwd
-from flashmask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
+from . import blackwell_helpers as sm100_utils
+from .blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
+from . import barrier, copy_utils, layout_utils, utils
+from .flash_bwd_sm100 import _overlap_gate_bwd
+from .tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
 SM100_TMEM_CAPACITY_COLUMNS = 512
@@ -770,9 +770,8 @@ class FlashAttentionBackwardSm100BigD:
         self.num_d_chunks = self.tile_hdim // d_chunk
         self.num_dv_chunks = self.tile_hdimv // dv_chunk
         assert 1 <= d_chunks_resident <= self.num_d_chunks
-        # head_dim slicing of the fp32 accumulators, so the shared postprocess can be
-        # called once per slice. Public: interface.py reads these to drive the
-        # postprocess loop.
+        # fp32 accumulator slice widths; slices fold into the head axis so one postprocess
+        # launch covers them. Read by ops/bwd.py.
         self.accum_slice_d = accum_slice_width(self.tile_hdim, d_chunk)
         self.accum_slice_dv = accum_slice_width(self.tile_hdimv, dv_chunk)
 
@@ -1350,6 +1349,7 @@ class FlashAttentionBackwardSm100BigD:
         overlap_k_addr=None,
         overlap_v_addr=None,
         overlap_work_done_addr=None,
+        overlap_spin_timeout_ns=None,
         overlap_segment_idx=None,
         overlap_dk_addr=None,
         overlap_dv_addr=None,
@@ -1358,7 +1358,6 @@ class FlashAttentionBackwardSm100BigD:
         overlap_h=None,
         overlap_d=None,
         overlap_comm_rpb: cutlass.Constexpr = None,
-        overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter.
         stream=None,
     ):
@@ -1395,18 +1394,15 @@ class FlashAttentionBackwardSm100BigD:
             "dK / dV always leave this kernel through the fp32 accumulators, so the "
             "overlap send buffers are filled by the postprocess, not here"
         )
+        assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
+            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
+        )
         # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
         # capsule, so rebuild the views from the raw segment addresses. The dims must
         # stay runtime Int32 -- a static layout specializes the TMA descriptor
-        # differently and reads the wrong bytes.
-        self.overlap_bhsd_layout = cutlass.const_expr(overlap_bhsd_layout)
+        # differently and reads the wrong bytes. head_dim > 256 here, so SRBuffer is BSHD.
         if cutlass.const_expr(overlap_k_addr is not None):
-            from_addr = (
-                utils.make_bhsd_storage_bshd_from_addr
-                if cutlass.const_expr(overlap_bhsd_layout)
-                else utils.make_contiguous_bshd_from_addr
-            )
-            mK = from_addr(
+            mK = utils.make_contiguous_bshd_from_addr(
                 overlap_k_addr,
                 overlap_b,
                 overlap_s,
@@ -1415,7 +1411,7 @@ class FlashAttentionBackwardSm100BigD:
                 mQ.element_type,
                 align=16,
             )
-            mV = from_addr(
+            mV = utils.make_contiguous_bshd_from_addr(
                 overlap_v_addr,
                 overlap_b,
                 overlap_s,
@@ -1447,6 +1443,7 @@ class FlashAttentionBackwardSm100BigD:
             mdK_semaphore=mdK_semaphore,
             mdV_semaphore=mdV_semaphore,
             overlap_work_done_addr=overlap_work_done_addr,
+            overlap_spin_timeout_ns=overlap_spin_timeout_ns,
             overlap_segment_idx=overlap_segment_idx,
             overlap_comm_rpb=overlap_comm_rpb,
         )
@@ -1469,6 +1466,7 @@ class FlashAttentionBackwardSm100BigD:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[Int32] = None,
         overlap_comm_rpb: cutlass.Constexpr = None,
     ):
@@ -1600,6 +1598,7 @@ class FlashAttentionBackwardSm100BigD:
             self.sKt_layout,
             softmax_scale_log2,
             overlap_work_done_addr,
+            overlap_spin_timeout_ns,
             overlap_segment_idx,
             overlap_comm_rpb,
         ).launch(
@@ -1647,6 +1646,7 @@ class FlashAttentionBackwardSm100BigD:
         sKt_layout: cute.ComposedLayout,
         softmax_scale_log2: Float32,
         overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[Int32],
         overlap_comm_rpb: cutlass.Constexpr,
     ):
@@ -2140,20 +2140,18 @@ class FlashAttentionBackwardSm100BigD:
             # ahead of the K prologue covers the whole CTA. There is no tile scheduler
             # here: a CTA owns one n block for its lifetime.
             if cutlass.const_expr(overlap_work_done_addr is not None):
-                gate_batch_idx = batch_idx
-                if cutlass.const_expr(self.overlap_bhsd_layout):
-                    gate_batch_idx = batch_idx * cute.size(mK.shape[2]) + head_idx_kv
                 _overlap_gate_bwd(
                     n_block,
                     tidx % cute.arch.WARP_SIZE,
                     seqlen_k,
-                    gate_batch_idx,
+                    batch_idx,
                     cute.make_ptr(
                         Int32,
                         overlap_work_done_addr,
                         cute.AddressSpace.gmem,
                         assumed_align=4,
                     ),
+                    overlap_spin_timeout_ns,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,
@@ -3280,9 +3278,8 @@ class FlashAttentionBackwardSm100BigD:
             )
             # gmem accumulator for this CTA's block. Two levels of blocking:
             #   [head_dim slice][row block][4-col group][row][4 cols]
-            # The outer slice exists so the shared postprocess can be called once
-            # per slice with head_dim = accum_slice: each slice is a contiguous
-            # region that looks exactly like a head_dim=accum_slice accumulator.
+            # Each outer slice looks like a head_dim=accum_slice accumulator, so the host
+            # folds slices into the head axis for one postprocess launch.
             # dK / dV are indexed by the key block (the grid's x), dQ by the m
             # iteration.
             num_n_block = cute.ceil_div(seqlen_k, self.tile_n)
@@ -3665,7 +3662,7 @@ def bigd_host_config(head_dim: int, head_dim_v: int, cta_group: int = 1):
 
     tile_m / tile_n have to match the interface's m_block_size / n_block_size (they
     size the accumulators and drive the postprocess grid), and the accumulator slice
-    widths drive the postprocess loop, so both are read from the kernel object rather
+    widths shape the sliced postprocess view, so both are read from the kernel object rather
     than duplicated.
     """
     kernel = FlashAttentionBackwardSm100BigD.from_shape(

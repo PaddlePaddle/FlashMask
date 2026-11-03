@@ -11,9 +11,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Boolean
 
-import flashmask.cute.utils as utils
-from flashmask.cute import layout_utils
-from flashmask.cute.cute_dsl_utils import ParamsBase
+from . import utils
+from . import layout_utils
+from .cute_dsl_utils import ParamsBase
 
 
 @dataclass

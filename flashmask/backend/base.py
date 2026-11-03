@@ -53,6 +53,7 @@ REQUIRED_ATTRS = (
     "device_capability",
     "multi_processor_count",
     "cuda_stream",
+    "is_stream_capturing",
     # introspection
     "strides",
     "data_ptr",
@@ -79,6 +80,7 @@ REQUIRED_ATTRS = (
     "minimum",
     "put_along_axis",
     "repeat_interleave",
+    "roll",
     "split",
     "sum",
     "where",

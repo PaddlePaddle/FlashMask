@@ -5,13 +5,8 @@
 /**
  * High-performance BSHD → BHSD transpose-copy kernel for bf16.
  *
- * Two variants:
- *   1. transpose_bshd_to_bhsd: equal-size, src (B,S,H,D) → dst (B,H,S,D)
- *   2. transpose_copy_to_sr:   local KV (B,S_local,H,D) → SR buffer (B,H,S_total,D) at offset
- *
- * The second is the overlap-ready version: places S_local rows at s_offset
- * within the larger S_total destination. FWD uses s_offset = S_total - S_local,
- * BWD uses s_offset = 0.
+ * transpose_copy_to_sr: local KV (B,S_local,H,D) → SR buffer (B,H,S_total,D) at row
+ * s_offset (FWD: S_total - S_local, BWD: 0).
  *
  * D is a runtime argument. It only feeds the TMA descriptors, the dynamic smem
  * size and the expect_tx byte count, so no code path specializes on it. TMA needs
@@ -21,11 +16,20 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-#include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <cuda.h>
+#include "debug_logger.cuh"
 
 namespace flashmask {
 namespace layout {
+
+inline void check_cu(CUresult result, const char* call) {
+    if (result != CUDA_SUCCESS) {
+        throw std::runtime_error(std::string("[FlashMask Overlap] ") + call
+            + " failed: CUresult " + std::to_string(static_cast<int>(result)));
+    }
+}
 
 // Runtime-resolve cuTensorMapEncodeTiled via cudaGetDriverEntryPoint (same as cutlass).
 // This avoids linking against libcuda.so which is a driver-provided library.
@@ -42,12 +46,15 @@ inline CUresult call_cuTensorMapEncodeTiled(
         CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
     static FuncPtr pfn = nullptr;
     if (!pfn) {
-        cudaDriverEntryPointQueryResult status;
-        cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", (void**)&pfn, cudaEnableDefault, &status);
-        if (status != cudaDriverEntryPointSuccess || !pfn) {
-            fprintf(stderr, "Failed to resolve cuTensorMapEncodeTiled via cudaGetDriverEntryPoint\n");
-            return CUDA_ERROR_NOT_FOUND;
+        void* fn = nullptr;
+        cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+        FM_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn, cudaEnableDefault, &status));
+        if (status != cudaDriverEntryPointSuccess || !fn) {
+            throw std::runtime_error(
+                "[FlashMask Overlap] cudaGetDriverEntryPoint(cuTensorMapEncodeTiled) failed: "
+                "driver status " + std::to_string(static_cast<int>(status)));
         }
+        pfn = reinterpret_cast<FuncPtr>(fn);
     }
     return pfn(tensorMap, tensorDataType, tensorRank, globalAddress,
                globalDim, globalStrides, boxDim, elementStrides,
@@ -142,15 +149,12 @@ inline void create_src_tma_descriptor(
     uint32_t boxDim[4] = {(uint32_t)D, 1, (uint32_t)TILE_S, 1};
     uint32_t elementStrides[4] = {1, 1, 1, 1};
 
-    CUresult result = call_cuTensorMapEncodeTiled(
+    check_cu(call_cuTensorMapEncodeTiled(
         tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)src,
         globalDim, globalStrides, boxDim, elementStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
-    if (result != CUDA_SUCCESS) {
-        fprintf(stderr, "cuTensorMapEncodeTiled (src) failed: %d\n", (int)result);
-    }
+    ), "cuTensorMapEncodeTiled (src)");
 }
 
 inline void create_dst_tma_descriptor(
@@ -169,15 +173,12 @@ inline void create_dst_tma_descriptor(
     uint32_t boxDim[4] = {(uint32_t)D, (uint32_t)TILE_S, 1, 1};
     uint32_t elementStrides[4] = {1, 1, 1, 1};
 
-    CUresult result = call_cuTensorMapEncodeTiled(
+    check_cu(call_cuTensorMapEncodeTiled(
         tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)dst,
         globalDim, globalStrides, boxDim, elementStrides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    );
-    if (result != CUDA_SUCCESS) {
-        fprintf(stderr, "cuTensorMapEncodeTiled (dst) failed: %d\n", (int)result);
-    }
+    ), "cuTensorMapEncodeTiled (dst)");
 }
 
 inline void launch_copy_tma(
@@ -196,12 +197,13 @@ inline void launch_copy_tma(
     dim3 grid(S_local / TILE_S, B * H);
     dim3 block(128);
 
-    cudaFuncSetAttribute(
+    FM_CUDA_CHECK(cudaFuncSetAttribute(
         transpose_copy_kernel_tma<TILE_S>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     transpose_copy_kernel_tma<TILE_S><<<grid, block, smem_size, stream>>>(
         src_tma_map, dst_tma_map, S_local, H, S_dst, tile_bytes, s_offset);
+    FM_CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
@@ -218,14 +220,6 @@ inline void transpose_copy_to_sr(
     cudaStream_t stream = 0
 ) {
     launch_copy_tma(src, dst, B, S_local, H, D, S_dst, s_offset, stream);
-}
-
-/// Equal-size transpose (convenience wrapper): src (B,S,H,D) → dst (B,H,S,D)
-inline void transpose_bshd_to_bhsd(
-    const __nv_bfloat16* src, __nv_bfloat16* dst,
-    int B, int S, int H, int D, cudaStream_t stream = 0
-) {
-    transpose_copy_to_sr(src, dst, B, S, H, D, S, 0, stream);
 }
 
 }  // namespace layout
