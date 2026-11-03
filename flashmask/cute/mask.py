@@ -374,30 +374,47 @@ class AttentionMask:
                 # fragment then lives in local memory and every access in softmax becomes
                 # an ld.local/st.local (measured: ~16KB of local traffic per KV tile).
                 nelem = const_expr(cute.size(tScS_t2r.shape))
+                # Compare in global row space: row + m_block * tile_m against the raw
+                # bounds, instead of rebasing every loaded LTS/LTE/UTS/UTE by
+                # m_block * tile_m. Same integer inequality rearranged
+                # (row >= lts - off <=> row + off >= lts; Int32, no overflow for
+                # seqlen < 2^31), so the mask is bit-identical for every layout
+                # (any head dim, q_stage, 2-CTA, folded). Each element keeps its own row
+                # coordinate; where a thread owns one full S row (M=128 non-folded) those
+                # are all equal and the add folds to one per thread.
+                row_offset = m_block * self.tile_m
+                s_base = load_startend_row_indices_consumer_state.index * 4 * self.tile_n
                 if const_expr(has_ut_start):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        uts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 2] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if (tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte) or (tScS_t2r[i][0] >= uts and tScS_t2r[i][0] < ute):
+                        row_g = tScS_t2r[i][0] + row_offset
+                        col = tScS_t2r[i][1]
+                        lts = s_startend_row_indices[s_base + col]
+                        lte = s_startend_row_indices[s_base + col + self.tile_n]
+                        uts = s_startend_row_indices[s_base + col + self.tile_n * 2]
+                        ute = s_startend_row_indices[s_base + col + self.tile_n * 3]
+                        if (row_g >= lts and row_g < lte) or (row_g >= uts and row_g < ute):
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_lt_end):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte:
+                        row_g = tScS_t2r[i][0] + row_offset
+                        col = tScS_t2r[i][1]
+                        lts = s_startend_row_indices[s_base + col]
+                        lte = s_startend_row_indices[s_base + col + self.tile_n]
+                        if row_g >= lts and row_g < lte:
                             acc_S[i] = -cutlass.Float32.inf
                 elif const_expr(has_ut_end):
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts or tScS_t2r[i][0] < ute:
+                        row_g = tScS_t2r[i][0] + row_offset
+                        col = tScS_t2r[i][1]
+                        lts = s_startend_row_indices[s_base + col]
+                        ute = s_startend_row_indices[s_base + col + self.tile_n * 3]
+                        if row_g >= lts or row_g < ute:
                             acc_S[i] = -cutlass.Float32.inf
                 else:
                     for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts:
+                        row_g = tScS_t2r[i][0] + row_offset
+                        lts = s_startend_row_indices[s_base + tScS_t2r[i][1]]
+                        if row_g >= lts:
                             acc_S[i] = -cutlass.Float32.inf
 
             cute.arch.mbarrier_arrive(
