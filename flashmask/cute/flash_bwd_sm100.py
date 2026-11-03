@@ -4727,7 +4727,11 @@ class FlashAttentionBackwardSm100:
                 )
             cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
 
-        cute.arch.fence_view_async_shared()
+        if const_expr(not (self.mma_dS_from_smem and self.folded_kv_acc)):
+            # Folded (d256): every dS store happened in the loop above and is already
+            # fenced by the mma_dS_from_smem fence before the pipeline_dP arrival, and
+            # the block just above is compiled out, so a second fence adds nothing.
+            cute.arch.fence_view_async_shared()
         self.compute_sync_barrier.arrive_and_wait()
         pipeline_dPsum.consumer_release(consumer_state_dPsum)
         consumer_state_dPsum.advance()
