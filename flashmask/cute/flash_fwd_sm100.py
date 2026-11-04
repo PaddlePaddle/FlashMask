@@ -1293,6 +1293,22 @@ class FlashAttentionForwardSm100:
             and self.head_dim_v_padded == 256
         )
 
+        # d == dv == 256 flashmask (1-CTA single_q_stage): a query block with
+        # valid_block_count == 0 has no MMA / correction work and its O tile used to rely on
+        # the wrapper zero-filling the whole output. The epilogue warp writes those tiles'
+        # zeros itself instead, so ops/fwd.py can allocate O uninitialized for this config.
+        self.zero_empty_o_tiles = const_expr(
+            self.enable_flashmask
+            and self.single_q_stage
+            and not self.use_2cta_instrs
+            and not self.folded_acc
+            and not self.is_split_kv
+            and not self.pack_gqa
+            and self.use_tma_O
+            and self.head_dim_padded == 256
+            and self.head_dim_v_padded == 256
+        )
+
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -4582,6 +4598,34 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
 
                 epi_consumer_phase ^= 1
+            else:
+                if const_expr(self.zero_empty_o_tiles):
+                    # Fully masked query block: no MMA / correction work, and (non-persistent,
+                    # one tile per CTA) neither Q nor O ever touched sO / sQ. Zero sO in place
+                    # and TMA-store it like a regular O tile; TMA clips rows past seqlen_q.
+                    # (mO here is the TMA coordinate tensor, so it cannot be written directly.)
+                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+                    gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
+                    store_O, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_O, 0, cute.make_layout(1), sO, gO
+                    )
+                    num_epi_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+                    epi_tidx = cute.arch.thread_idx()[0] % num_epi_threads
+                    # The whole stage-0 sO buffer, as raw 32-bit words (all zeros, so the
+                    # swizzle of the real layout does not matter).
+                    n_words = const_expr(self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 32)
+                    sO_words = cute.make_tensor(
+                        cute.make_ptr(Int32, sO.iterator.toint(), cute.AddressSpace.smem, assumed_align=16),
+                        cute.make_layout(n_words),
+                    )
+                    for i in cutlass.range(n_words // num_epi_threads, unroll=8):
+                        sO_words[i * num_epi_threads + epi_tidx] = Int32(0)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
+                    # Issued exactly like the regular O store above.
+                    store_O(src_idx=0, dst_idx=self.m_tile_index(m_block, 0, epi_cta_coord_v))
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
 
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
