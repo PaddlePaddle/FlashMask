@@ -1351,6 +1351,7 @@ class FlashAttentionBackwardSm100BigD:
         overlap_work_done_addr=None,
         overlap_spin_timeout_ns=None,
         overlap_segment_idx=None,
+        overlap_local_kv_size=None,
         overlap_dk_addr=None,
         overlap_dv_addr=None,
         overlap_b=None,
@@ -1445,6 +1446,7 @@ class FlashAttentionBackwardSm100BigD:
             overlap_work_done_addr=overlap_work_done_addr,
             overlap_spin_timeout_ns=overlap_spin_timeout_ns,
             overlap_segment_idx=overlap_segment_idx,
+            overlap_local_kv_size=overlap_local_kv_size,
             overlap_comm_rpb=overlap_comm_rpb,
         )
 
@@ -1468,6 +1470,7 @@ class FlashAttentionBackwardSm100BigD:
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
         overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[Int32] = None,
+        overlap_local_kv_size: Optional[Int32] = None,
         overlap_comm_rpb: cutlass.Constexpr = None,
     ):
         self.q_dtype = mQ.element_type
@@ -1600,6 +1603,7 @@ class FlashAttentionBackwardSm100BigD:
             overlap_work_done_addr,
             overlap_spin_timeout_ns,
             overlap_segment_idx,
+            overlap_local_kv_size,
             overlap_comm_rpb,
         ).launch(
             grid=grid_dim,
@@ -1648,6 +1652,7 @@ class FlashAttentionBackwardSm100BigD:
         overlap_work_done_addr: Optional[cutlass.Int64],
         overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[Int32],
+        overlap_local_kv_size: Optional[Int32],
         overlap_comm_rpb: cutlass.Constexpr,
     ):
         """Run the tiled BigD backward dataflow for one scheduled KV block.
@@ -2152,6 +2157,7 @@ class FlashAttentionBackwardSm100BigD:
                         assumed_align=4,
                     ),
                     overlap_spin_timeout_ns,
+                    overlap_local_kv_size,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,

@@ -125,11 +125,11 @@ The implementation lives in [`flashmask/overlap`](flashmask/overlap/). It commun
 
 Overlap is enabled by passing a CP `group` (world size > 1) to `flashmask_attention`. Key/value are then the local `S_local` shard, and the mask key axis has length `S_local * group_size` in group-rank chunk order. The library converts it to its internal order, so callers must not pre-roll it. Hierarchical (multi-node) communication is selected automatically when the group spans more than one node.
 
-Overlap supports only the following inputs. Anything else raises a `ValueError` on every rank before any communication starts:
+The overlap-specific checks below reject unsupported calls before launching attention. Topology-dependent failures abort during communicator initialization:
 
-- `S_local` in {4096, 8192, 16384, 32768, 65536, 131072};
+- positive `S_local` with `S_local % 4 == 0` and `S_local * H_kv * head_dim % 512 == 0`, which may change from call to call; hierarchical (multi-node) groups additionally require `S_local % 512 == 0`;
 - a power-of-two CP group of at most 64 ranks, with `S_local * group_size <= 2097152`;
-- a K shape for which the backward picks 1, 2, 4 or 8 KV chunks per segment (always true for the two rules above);
+- a K shape for which the backward picks 1, 2, 4 or 8 KV chunks per segment (always true for the rule above);
 - `head_dim_v == head_dim` (so MLA shapes such as 192/128 or 576/512 are not supported);
 - bf16 Q/K/V;
 - `causal=False` with a 2-column `[lt_start, ut_end]` mask (express causality in the mask) whose batch dimension equals the K/V batch size (no batch broadcasting);
@@ -137,9 +137,13 @@ Overlap supports only the following inputs. Anything else raises a `ValueError` 
 
 Failures past this check, for example a CUDA allocation error or a shape whose communication chunk mask exceeds the device's shared-memory limit, abort the process with a `[FlashMask Overlap]` message instead of raising.
 
+For fixed B/H/D, buffers and backward KV chunks per segment follow the power-of-two bucket of the largest `S_local` seen. A length change within that bucket updates runtime dimensions without rebuilding windows; growing beyond allocated capacity synchronizes and reallocates collectively. Shrinking does not restore the old segment grouping or release capacity. A new bucket reserves less than twice its triggering length, but after shrinking the retained capacity can exceed twice the current length. No padding is inserted into KV or masks, and attention uses the exact length.
+The new tail-length path has been exercised on single-node CP4 (Paddle, D=128/256/512); other CP sizes and hierarchical tail lengths are not validated by this change.
+
 Overlap also assumes the following usage contract, which it does not check:
 
 - **One ordered compute stream.** All overlap calls of a process run on one ordered stream (the framework's current stream). The gathered KV buffer is reused by the next call once that stream reaches it, so attention still reading it on another stream is not waited for.
+- **Dense local K/V.** External tensors use `[B, S_local, H_kv, D]` contiguous storage; Q is `[B, S_q, H_q, D]`, with `H_q` divisible by `H_kv` and the mask-head count. The raw local-K/V copy does not consume framework strides. Internal SR storage is BHSD for D <= 256, BSHD otherwise. The usual attention head-dimension constraints still apply (bf16 D divisible by 8, equal Q/K/V head dimensions); this extension is not ragged attention or unequal-length rank sharding.
 - **One active CP group per process.** Every rank of a group passes the same group object. Switching to a different group rebuilds the communicator, and the teardown of the old one is collective: all ranks of the old group must switch at the same call. Alternating between groups rebuilds every time.
 - **Rank-uniform schedules.** All ranks make the same sequence of overlap calls with the same shapes. A Python exception raised before a backward call starts its all-gather leaves the communicator usable; one raised in the middle of the backward does not.
 

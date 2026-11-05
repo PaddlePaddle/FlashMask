@@ -125,13 +125,27 @@ FlashMask-4 将掩码信息用于上下文并行（CP）的计算分配与通信
 
 向 `flashmask_attention` 传入 CP `group`（world size > 1）即启用 Overlap。此时 key/value 为本地 `S_local` 分片，掩码的 key 维长度为 `S_local * group_size`，按 group 内 rank 顺序分块；库内部会转换为自身的通信顺序，调用方不要预先 roll。group 跨多个节点时自动启用分层（多机）通信。
 
-Overlap 仅支持以下输入，其他输入会在任何通信开始前抛出 `ValueError`：
+Overlap 仅支持以下输入，其他输入会在注意力启动前被拒绝。与拓扑相关的失败在通信器初始化阶段直接 abort：
 
-- `S_local` ∈ {4096, 8192, 16384, 32768, 65536, 131072}；
-- 每个 CP group 最多 64 个 rank；
+- `S_local` 为正，且 `S_local % 4 == 0`、`S_local * H_kv * head_dim % 512 == 0`；该值**每次调用可以不同**；分层（多机）group 额外要求 `S_local % 512 == 0`；
+- CP group 为 2 的幂、最多 64 个 rank，且 `S_local * group_size <= 2097152`；
+- K 的形状使得反向每 segment 取 1、2、4 或 8 个 KV chunk（上述规则下恒成立）；
 - `head_dim_v == head_dim`（因此不支持 192/128、576/512 等 MLA 形状）；
 - Q/K/V 为 bf16；
-- `causal=False`，掩码为 2 列 `[lt_start, ut_end]`（因果性通过掩码表达）。
+- `causal=False`，掩码为 2 列 `[lt_start, ut_end]`（因果性通过掩码表达），且 mask 的 batch 维等于 K/V 的 batch，不做广播；
+- 不对 overlap 调用做 CUDA graph capture。
+
+上述检查之后的失败（例如 CUDA 分配失败，或某个形状的通信 chunk mask 超出设备共享内存上限）会以 `[FlashMask Overlap]` 信息终止进程，而不是抛异常。
+
+固定 B/H/D 时，缓冲区与反向每 segment 的 KV chunk 数都跟随所见最大 `S_local` 的 2 的幂 bucket。桶内长度变化只更新运行时维度，不重建窗口；增长超出已分配容量时会同步并集合式重新分配。缩小长度不会恢复旧的 segment 分组，也不释放容量。新 bucket 预留的容量小于触发长度的两倍，但缩小之后保留的容量可能超过当前长度的两倍。KV 与掩码都不做 padding，注意力始终按真实长度计算。
+新的尾块长度路径已在单机 CP4（Paddle，D=128/256/512）上验证；其他 CP 规模与分层尾块长度不在本次改动的验证范围内。
+
+Overlap 还假定以下使用契约，但不会检查：
+
+- **单一有序计算流。** 一个进程的所有 overlap 调用都跑在同一条有序流（框架当前流）上。收集到的 KV 缓冲区在该流走到时会被下一次调用复用，因此另一个流上仍在读它的注意力不会被等待。
+- **本地 K/V 稠密。** 外部张量使用 `[B, S_local, H_kv, D]` 连续存储；Q 为 `[B, S_q, H_q, D]`，`H_q` 需被 `H_kv` 与 mask head 数整除。本地 K/V 的原始拷贝不使用框架 stride。内部 SR 存储在 D ≤ 256 时为 BHSD，否则为 BSHD。通常的 head_dim 约束仍然适用（bf16 且 D 能被 8 整除、Q/K/V head dim 相等）；本扩展不是 ragged attention，也不是 rank 间不等长分片。
+- **每进程一个活跃 CP group。** group 内每个 rank 传入同一个 group 对象。切换到另一个 group 会重建通信器，且旧通信器的销毁是集合式的：旧 group 的所有 rank 必须在同一次调用处切换。在 group 之间来回切换会每次重建。
+- **各 rank 调度一致。** 所有 rank 以相同形状、相同顺序发起 overlap 调用。在反向启动 all-gather 之前抛出的 Python 异常不会破坏通信器；在反向中途抛出的会。
 
 `FLASHMASK_SPIN_TIMEOUT_S`（默认 300，0 表示关闭）限制 Overlap 通信 kernel 等待对端的时间，超时后打印诊断信息并 trap，类似 NCCL 集合通信超时。attention kernel 等待已收集 KV 的时间也受同一预算限制，超时后打印卡住的标志位并以 device-side assert 失败。如果进入 overlap 之前各 rank 可能合理地错开更久（例如只有 rank 0 在保存 checkpoint 或做评估），请调大这个值。
 

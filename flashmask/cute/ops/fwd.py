@@ -616,7 +616,7 @@ def _flash_attn_fwd(
         overlap_s = cutlass.Int32(_os)
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
-        overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
+        overlap_local_kv_size = cutlass.Int32(overlap_ag_args.local_kv_seqlen)
         overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
     else:
         overlap_k_addr = None
@@ -626,7 +626,7 @@ def _flash_attn_fwd(
         overlap_s = None
         overlap_h = None
         overlap_d = None
-        overlap_kv_chunk_size = None
+        overlap_local_kv_size = None
         overlap_spin_timeout_ns = None
         overlap_bhsd_layout = None
 
@@ -657,7 +657,7 @@ def _flash_attn_fwd(
         block_bos is None,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
-        (overlap_bhsd_layout, overlap_kv_chunk_size) if enable_overlap else ()
+        (overlap_bhsd_layout,) if enable_overlap else ()
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -734,7 +734,7 @@ def _flash_attn_fwd(
                     "overlap_h": overlap_h,
                     "overlap_d": overlap_d,
                     "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
-                    "overlap_kv_chunk_size": overlap_kv_chunk_size,
+                    "overlap_local_kv_size": overlap_local_kv_size,
                     "overlap_bhsd_layout": overlap_bhsd_layout,
                 }
                 if enable_overlap
@@ -742,8 +742,7 @@ def _flash_attn_fwd(
             ),
             stream=current_stream,
         )
-    # Runtime address and shape scalars are re-supplied below; compile-time
-    # overlap_kv_chunk_size is captured by the compiled callable.
+    # Runtime address and shape scalars are re-supplied below.
 
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -775,6 +774,7 @@ def _flash_attn_fwd(
                 "overlap_h": overlap_h,
                 "overlap_d": overlap_d,
                 "overlap_spin_timeout_ns": overlap_spin_timeout_ns,
+                "overlap_local_kv_size": overlap_local_kv_size,
             }
             if enable_overlap
             else {}

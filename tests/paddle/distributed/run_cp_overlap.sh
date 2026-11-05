@@ -15,6 +15,8 @@
 # Env:
 #   CP_SIZE       context-parallel size = launched world size (default 8)
 #   D HQ HKS BS S_LOCAL MASKS REPEATS   one mask per launch; B/hk cycled in-process
+#   S_LOCALS      optional comma list of S_local run in order in ONE process
+#                 (overrides S_LOCAL; doc lengths scaled from DOC_PACKING)
 #   TARGET_RANKS  PADDLE_TRAINER_IDs that participate (default "0"); count = nnodes
 #   DEVICES       GPUs per node (default: single-node -> 0..CP_SIZE-1, else all)
 #   PY_BIN        python interpreter (default: python on PATH)
@@ -132,8 +134,8 @@ else
     device_arg=""
 fi
 
-logdir="log_cp${CP_SIZE}-d${D}-${MASKS}-r$rank"
-echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=$S_LOCAL bs=$BS hq=$HQ hks=$HKS masks=$MASKS nnodes=$nnodes rank=$rank"
+logdir="log_cp${CP_SIZE}-d${D}-${MASKS}${S_LOCALS:+-s${S_LOCALS//,/_}}-r$rank"
+echo "[run_cp_overlap] CP=$CP_SIZE d=$D S_local=${S_LOCALS:-$S_LOCAL} bs=$BS hq=$HQ hks=$HKS masks=$MASKS nnodes=$nnodes rank=$rank"
 
 $PY_BIN -m paddle.distributed.launch \
     --log_dir "$logdir" \
@@ -144,4 +146,4 @@ $PY_BIN -m paddle.distributed.launch \
     $device_arg \
     cp_overlap_main.py \
         --cp_size "$CP_SIZE" --d "$D" --s_local "$S_LOCAL" --bs "$BS" --hq "$HQ" --hks "$HKS" \
-        --masks "$MASKS" --repeats "$REPEATS"
+        --masks "$MASKS" --repeats "$REPEATS" ${S_LOCALS:+--s_locals "$S_LOCALS"}

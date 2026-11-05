@@ -157,12 +157,14 @@ inline void create_src_tma_descriptor(
     ), "cuTensorMapEncodeTiled (src)");
 }
 
+// s_end bounds the S coordinate: a partial last tile is clipped there instead of writing
+// into the rows after this rank's chunk.
 inline void create_dst_tma_descriptor(
-    CUtensorMap* tma_map, __nv_bfloat16* dst, int B, int H, int S_dst, int D
+    CUtensorMap* tma_map, __nv_bfloat16* dst, int B, int H, int S_dst, int D, int s_end
 ) {
     // Destination (B, H, S_dst, D), TMA dims (innermost→outermost): D, S_dst, H, B
     uint64_t globalDim[4] = {
-        (uint64_t)D, (uint64_t)S_dst, (uint64_t)H, (uint64_t)B
+        (uint64_t)D, (uint64_t)s_end, (uint64_t)H, (uint64_t)B
     };
     uint64_t globalStrides[3] = {
         (uint64_t)(D * sizeof(__nv_bfloat16)),                      // stride for S (row-to-row within (b,h) slice)
@@ -192,9 +194,9 @@ inline void launch_copy_tma(
 
     CUtensorMap src_tma_map, dst_tma_map;
     create_src_tma_descriptor(&src_tma_map, src, B, S_local, H, D);
-    create_dst_tma_descriptor(&dst_tma_map, dst, B, H, S_dst, D);
+    create_dst_tma_descriptor(&dst_tma_map, dst, B, H, S_dst, D, s_offset + S_local);
 
-    dim3 grid(S_local / TILE_S, B * H);
+    dim3 grid((S_local + TILE_S - 1) / TILE_S, B * H);
     dim3 block(128);
 
     FM_CUDA_CHECK(cudaFuncSetAttribute(

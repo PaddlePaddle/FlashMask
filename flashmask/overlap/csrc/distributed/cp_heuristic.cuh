@@ -23,4 +23,12 @@ inline int get_num_chunk_per_segment(int b_kv, int local_seqlen_k, int h_kv, int
     return num_chunks;
 }
 
+// Power-of-two bucket of S_local. Buffers and the chunks per segment follow the largest bucket
+// seen, so a varying S_local reallocates or re-lays out a window only when it outgrows it.
+inline int seqlen_bucket(int s_local) {
+    int bucket = 1;
+    while (bucket < s_local) bucket <<= 1;
+    return bucket;
+}
+
 }   // namespace flashmask

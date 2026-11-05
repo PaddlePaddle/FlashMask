@@ -37,126 +37,49 @@ __global__ void InitBitmapForLocalSkip(
     }
 }
 
-// Supports mask_head >= 1. When mask_head > 1, AND-reduces across all mask heads
-// so that a chunk is skippable only when ALL heads agree it is fully masked.
-// When mask_head == 1, the head loop runs once with negligible overhead.
-// mask: (B, num_head, S_k, 2) int32 [lt_start, ut_end]; each thread checks 4 rows via two int4 loads.
-template <int num_warps = 8, int row_per_warp = 32>
-__global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) BlockSparsityCheckSpecializedKernel(
+// copy_chunk_mask[b * num_works + w] = 1 iff every mask head masks every row of work w, on the
+// AG/RS work grid: work w covers rows [j * rows_per_work, (j + 1) * rows_per_work) of chunk
+// c = w / work_per_chunk (j = w % work_per_chunk), clipped to the chunk's S_chunk rows.
+// mask: (B, num_head, S_k, 2) int32 [lt_start, ut_end]; each thread checks 4 rows via two int4
+// loads, so S_chunk % 4 == 0.
+template <int rows_per_work>
+__global__ void __launch_bounds__(rows_per_work / 4) ChunkMaskKernel(
     const int* const __restrict__ mask,
     int* const __restrict__ copy_chunk_mask,
     const int num_head,                         // mask head count (H_mask)
     const int64_t batch_stride,                 // int32 elements, multiple of 4
-    const int64_t head_stride                   // int32 elements, multiple of 4
+    const int64_t head_stride,                  // int32 elements, multiple of 4
+    const int S_chunk,
+    const int num_works                         // works per batch
 ) {
-    static_assert(num_warps == 16 || num_warps == 8 || num_warps == 4);
-    static_assert(row_per_warp == 32 || row_per_warp == 64 || row_per_warp == 16);
-    static_assert(row_per_warp != 16 || (row_per_warp == 16 && num_warps == 4));
-    static constexpr int rows_per_cta = row_per_warp * num_warps;
-    __shared__ int warps_masked[num_warps];
-    __shared__ int temp_result[4];              // cross-head AND-reduction buffer
-    const int load_index = blockIdx.x * num_warps * 32 + threadIdx.x;
-    const int* const rows = mask + blockIdx.y * batch_stride + int64_t(load_index) * 8;
-    for (int head_id = 0; head_id < num_head; head_id++) {
-        const int4* const pairs = reinterpret_cast<const int4*>(rows + head_id * head_stride);
-        const int4 p01 = pairs[0];
-        const int4 p23 = pairs[1];
-        int is_masked = (p01.x <= p01.y) && (p01.z <= p01.w) && (p23.x <= p23.y) && (p23.z <= p23.w);
-        int current_warp_masked = __all_sync(0xffffffff, is_masked);
-        if ((threadIdx.x % 32) == 0) {
-            warps_masked[threadIdx.x / 32] = current_warp_masked;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            const int4* smem_int4 = reinterpret_cast<const int4*>(warps_masked);
-            if constexpr (rows_per_cta == 1024) {
-                int2 result;
-                int4 src = *smem_int4;
-                result.x = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 1);
-                result.x &= src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 2);
-                result.y = src.x & src.y & src.z & src.w;
-                src = *(smem_int4 + 3);
-                result.y &= src.x & src.y & src.z & src.w;
-                int2* const addr = reinterpret_cast<int2*>(temp_result);
-                if (head_id == 0) { *addr = result; }
-                else { int2 old = *addr; old.x &= result.x; old.y &= result.y; *addr = old; }
-            }
-            if constexpr (rows_per_cta == 512) {
-                int4 src = *smem_int4;
-                if constexpr (num_warps == 16) {
-                    int4 result;
-                    result.x = src.x & src.y & src.z & src.w;
-                    src = *(smem_int4 + 1);
-                    result.y = src.x & src.y & src.z & src.w;
-                    src = *(smem_int4 + 2);
-                    result.z = src.x & src.y & src.z & src.w;
-                    src = *(smem_int4 + 3);
-                    result.w = src.x & src.y & src.z & src.w;
-                    int4* const addr = reinterpret_cast<int4*>(temp_result);
-                    if (head_id == 0) { *addr = result; }
-                    else { int4 old = *addr; old.x &= result.x; old.y &= result.y; old.z &= result.z; old.w &= result.w; *addr = old; }
-                } else {
-                    int2 result;
-                    result.x = src.x & src.y & src.z & src.w;
-                    src = *(smem_int4 + 1);
-                    result.y = src.x & src.y & src.z & src.w;
-                    int2* const addr = reinterpret_cast<int2*>(temp_result);
-                    if (head_id == 0) { *addr = result; }
-                    else { int2 old = *addr; old.x &= result.x; old.y &= result.y; *addr = old; }
-                }
-            }
-            if constexpr (rows_per_cta == 256) {
-                int4 result;
-                int4 src = *smem_int4;
-                result.x = src.x & src.y;
-                result.y = src.z & src.w;
-                src = *(smem_int4 + 1);
-                result.z = src.x & src.y;
-                result.w = src.z & src.w;
-                int4* const addr = reinterpret_cast<int4*>(temp_result);
-                if (head_id == 0) { *addr = result; }
-                else { int4 old = *addr; old.x &= result.x; old.y &= result.y; old.z &= result.z; old.w &= result.w; *addr = old; }
-            }
-            if constexpr (rows_per_cta == 64) {
-                int4 result = *smem_int4;
-                int4* const addr = reinterpret_cast<int4*>(temp_result);
-                if (head_id == 0) { *addr = result; }
-                else { 
-                    int4 old = *addr;
-                    old.x &= result.x;
-                    old.y &= result.y;
-                    old.z &= result.z;
-                    old.w &= result.w;
-                    *addr = old; 
-                }
-            }
-        }
-        // barrier before next head iteration so warps_masked is not overwritten prematurely
-        if (head_id < num_head - 1) __syncthreads();
-    }
-    // write the AND-reduced result to global memory
-    if (threadIdx.x == 0) {
-        const int block_offset = blockIdx.y * gridDim.x + blockIdx.x;
-        if constexpr (rows_per_cta == 1024 || (rows_per_cta == 512 && num_warps != 16)) {
-            *(reinterpret_cast<int2*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int2*>(temp_result));
-        } else {
-            *(reinterpret_cast<int4*>(copy_chunk_mask) + block_offset) = *(reinterpret_cast<int4*>(temp_result));
+    const int work_per_chunk = (S_chunk + rows_per_work - 1) / rows_per_work;
+    const int chunk = blockIdx.x / work_per_chunk;
+    const int work_row = blockIdx.x % work_per_chunk * rows_per_work;
+    const int row = chunk * S_chunk + work_row + 4 * threadIdx.x;
+    int masked = 1;
+    if (work_row + 4 * threadIdx.x < S_chunk) {
+        const int* const rows = mask + blockIdx.y * batch_stride + int64_t(row) * 2;
+        for (int head_id = 0; head_id < num_head; head_id++) {
+            const int4* const pairs = reinterpret_cast<const int4*>(rows + head_id * head_stride);
+            const int4 p01 = pairs[0];
+            const int4 p23 = pairs[1];
+            masked &= (p01.x <= p01.y) && (p01.z <= p01.w) && (p23.x <= p23.y) && (p23.z <= p23.w);
         }
     }
+    masked = __syncthreads_and(masked);
+    if (threadIdx.x == 0) copy_chunk_mask[blockIdx.y * num_works + blockIdx.x] = masked;
 }
 
 /**
- * 'Sparse' means that we will check whether the 256/512-row chunk can be skipped or not.
- * @param copy_chunk_mask Pre-computed chunk mask. If all 256/512 rows in a chunk are masked, mask[chunk_id] = 1
- *  copy_chunk_mask is generated by `BlockSparsityCheckKernel`, 1D buffer (size: (S - S_chunk) / 256 or 512)
+ * 'Sparse' means that we will check whether the 512-row work can be skipped or not.
+ * @param copy_chunk_mask Pre-computed by `ChunkMaskKernel`: mask[work] = 1 if all rows of the work are masked.
+ *  Each chunk is cut into ceil(S_chunk / 512) works from its first row, so its last work may be shorter.
  * @param  block_cnt_semaphore Used in dynamic scheduling. Since each CTA is responsible for remote-getting
  *  one entire chunk (256/512 rows), if the chunk is masked then the computation power will be wasted. To avoid
  *  load-imbalance for this communication kernel (which is crucial to overlap performance), a chunk-cnt semaphore
  *  is used so every CTA use atomic op to get a chunk ID to process.
 */
-template <typename T, int S, int S_chunk, int num_warps=8, int row_per_warp=32, bool use_hierarchical=false>
+template <typename T, int num_warps=8, int row_per_warp=32, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -170,27 +93,21 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     const int total_n_pes,
     const int num_batch,                // B (or B*H when simulating per-head RDMA)
     const int S_stride,                 // H * D (or D when simulating)
+    const int S_chunk,                  // S_local
     int64_t* const __restrict__ semaphores = nullptr,
     int* const __restrict__ rank_empty_counters = nullptr,
     const int gpus_per_node = 1,
     const int sema_inter_size = 0,
     const int num_heads_per_batch = 1   // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
 ) {
-    // Degenerate case: S == S_chunk means nranks=1, nothing to remote-get.
-    // This template instantiation is unreachable at runtime (overlap requires nranks > 1)
-    // but is generated by SChunkDispatch × SeqlenDispatch combinatorial expansion.
-    // Early return with proper wptr signaling to prevent hang if ever launched by mistake.
-    if constexpr (S <= S_chunk) {
-        announce_comm_cta(stream_coordinator);
-        if (threadIdx.x == 0) atomicMax(wptr, INT_MAX);
-        return;
-    }
-
     announce_comm_cta(stream_coordinator);
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
-    constexpr int seqlen_offset = S - S_chunk;
-    constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
-    constexpr int work_per_chunk = S_chunk / row_per_block;
+    const int S = S_chunk * total_n_pes;
+    const int seqlen_offset = S - S_chunk;
+    const int work_per_chunk = (S_chunk + row_per_block - 1) / row_per_block;
+    const int chunk_per_batch = (total_n_pes - 1) * work_per_chunk;
+    // rows the first-fetched (last) work of a chunk is short of row_per_block
+    const int work_pad = work_per_chunk * row_per_block - S_chunk;
     const int total_chunks = num_batch * chunk_per_batch;
     // the gathered KV (num_batch * S * S_stride) exceeds INT_MAX for large shapes,
     // so every offset built from it is 64-bit. Loop counters stay int.
@@ -204,7 +121,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int64_t* const sema_inter = semaphores;
     int64_t* const sema_intra = semaphores + sema_inter_size;
 
-    // wptr = min of all CTAs' latest done work id; lane j reads CTA j's slot, so the grid is 32 CTAs.
+    // wptr = rows gathered by the works up to the min of all CTAs' latest done work id (works of a
+    // chunk run right to left, its short work first); lane j reads CTA j's slot, so the grid is 32 CTAs.
     // Slot release + lane acquires carry every CTA's data to the publisher; a stale slot only lowers wptr.
     // The min can miss the final INT_MAX (two exiting CTAs may read each other's stale slots), so
     // the last exiter, found by the acq_rel exit_count RMW, publishes INT_MAX.
@@ -227,8 +145,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             __syncwarp();
             if (threadIdx.x == blockIdx.x) {
                 cuda::atomic_ref<int, cuda::thread_scope_device> frontier(*wptr);
-                frontier.fetch_max(
-                    wid == INT_MAX ? INT_MAX : (wid * row_per_block),       // 256 or 512 * wid, or INT_MAX
+                frontier.fetch_max(wid == INT_MAX ? INT_MAX
+                        : wid / work_per_chunk * S_chunk + max(wid % work_per_chunk * row_per_block - work_pad, 0),
                     cuda::memory_order_release);
                 if (exiting && cuda::atomic_ref<int, cuda::thread_scope_device>(*exit_count)
                         .fetch_add(1, cuda::memory_order_acq_rel) == static_cast<int>(gridDim.x) - 1) {
@@ -271,7 +189,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         const int batch_id = work_id_m1 / chunk_per_batch;
         const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
         int mask_index = 0;
-        int seqlen_id = 0, remote_pe = 0;
+        int seqlen_id = 0, remote_pe = 0, rows = row_per_block;
         int64_t src_addr = 0;
         bool is_phase1 = true;
         int target_rank = 0;  // For hierarchical: data owner rank (semaphore wait target)
@@ -297,14 +215,17 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
                 info, total_n_pes, S_chunk, total_n_pes, gpus_per_node);
             src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
-            // Circular-shift traversal, right to left
-            seqlen_id = seqlen_offset - seq_work_id * row_per_block;
-            const int cp_chunk_id = (S - 1 - seqlen_id) / S_chunk;
-            remote_pe = my_pe - cp_chunk_id;
+            // Circular-shift traversal, right to left; work e of the batch is row row_in_chunk of SR chunk c
+            const int e = chunk_per_batch - seq_work_id;
+            const int c = e / work_per_chunk;
+            const int row_in_chunk = e % work_per_chunk * row_per_block;
+            seqlen_id = c * S_chunk + row_in_chunk;
+            rows = min(row_per_block, S_chunk - row_in_chunk);
+            remote_pe = my_pe - (total_n_pes - 1 - c);
             remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes;
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
-            src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * row_stride;
-            mask_index = chunk_per_batch * (batch_id / num_heads_per_batch + 1) - seq_work_id;
+            src_addr = batch_id * batch_stride + (seqlen_offset + row_in_chunk) * row_stride;
+            mask_index = chunk_per_batch * (batch_id / num_heads_per_batch) + e;
         }
 
         bool should_skip = false;
@@ -344,14 +265,14 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
                 cached_semaphores[target_rank] = 1;
             }
         }
-        // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
+        // copy upto 4 heads (S_stride = H * D), and `rows` rows (seqlen axis) per CTA
         const int64_t dst_addr = batch_id * batch_stride + seqlen_id * row_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
             shmem::offset_or_null(v_sr, dst_addr),
             k_sr + src_addr,
             shmem::offset_or_null(v_sr, src_addr),
-            row_per_block * S_stride * sizeof(T), remote_pe
+            rows * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
@@ -369,7 +290,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
 //                          In hierarchical mode the SR buffer is NOT reused across segments; each segment writes
 //                          to a unique [segment_idx * num_chunks * S_chunk, (segment_idx+1) * ...) region so that
 //                          later segments' Phase-2 consumers can still read Phase-1 data fetched in earlier segments.
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_hierarchical=false>
+template <typename T, int num_warps=8, int row_per_warp=32, int num_chunks=4, bool has_local_chunk=false, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkSplittedRemoteGetKernel(
     T* const __restrict__ k_sr,
     T* const __restrict__ v_sr,
@@ -385,6 +306,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     const int total_n_pes,
     const int num_batch,                // B
     const int S_stride,                 // H * D
+    const int S_chunk,                  // S_local
     const int num_segments = 4,
     int64_t* const __restrict__ semaphores = nullptr,
     int* const __restrict__ rank_empty_counters = nullptr,
@@ -399,12 +321,12 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     }
     constexpr bool has_local = has_local_chunk;
     constexpr int row_per_block = num_warps * row_per_warp;
-    constexpr int S = S_chunk * num_chunks;                  // seqlen of this segment (num_chunks is already the real total)
-    constexpr int work_per_seg = S / row_per_block;
-    constexpr int work_per_chunk = S_chunk / row_per_block;
+    // works of a chunk start at its first row; the last one may be short (see ChunkMaskKernel)
+    const int work_per_chunk = (S_chunk + row_per_block - 1) / row_per_block;
+    const int work_per_seg = num_chunks * work_per_chunk;
     // for each segment, get the number of work we can skip (due to being local). Note that
     // if work_to_skip is not 0, there will be some skippable works for **each batch**
-    constexpr int work_to_skip = has_local ? (S_chunk / row_per_block) : 0;
+    const int work_to_skip = has_local ? work_per_chunk : 0;
     constexpr int chunk_offset = has_local ? 1 : 0;
     // though the actual skippable work is `num_batch * (work_per_seg - work_to_skip)`
     // for batch_idx > 0, those skippable local works cannot be skipped **directly**.
@@ -413,7 +335,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     // Hierarchical: one SR region per segment; the caller advances only k_sr, local_k stays at the base.
     // Non-hierarchical: k_sr stays at the base; local_k is the base or the tail backup.
     const int64_t row_stride = S_stride;
-    const int64_t batch_stride = S * row_stride;
+    const int64_t batch_stride = int64_t(num_chunks) * S_chunk * row_stride;
     // Non-hierarchical remote local K/V: SR base for one segment, else the (B, S_chunk) tail backup.
     const int64_t local_batch_stride = num_segments == 1 ? batch_stride : S_chunk * row_stride;
 
@@ -499,10 +421,14 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             continue;
         }
 
-        int chunk_id = seq_work_id / work_per_chunk;
+        const int chunk_id = seq_work_id / work_per_chunk;
+        const int row_in_chunk = seq_work_id % work_per_chunk * row_per_block;
+        const int rows = min(row_per_block, S_chunk - row_in_chunk);
+        // dst: segment-local row (hierarchical: k_sr is already advanced to this segment's region)
+        const int seqlen_id = chunk_id * S_chunk + row_in_chunk;
 
-        // Compute remote PE, src/dst addresses (done early so masked-skip can check Phase 1)
-        int seqlen_id = 0, remote_pe = 0;
+        // Compute remote PE and src address (done early so masked-skip can check Phase 1)
+        int remote_pe = 0;
         int64_t src_addr = 0;
         bool is_phase1 = false;
         int target_rank = 0;
@@ -510,16 +436,11 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         if constexpr (use_hierarchical) {
             // Hierarchical: global_logical_pos maps to target_rank via congruence-group-first order
             const int global_logical_pos = segment_idx * num_chunks + chunk_id;
-            const int row_within_chunk = seq_work_id % work_per_chunk;
             auto info = hier::hier_map_chunk(global_logical_pos, my_pe, total_n_pes, gpus_per_node);
 
             target_rank = info.target_rank;
             remote_pe   = info.src_pe;
             is_phase1   = info.is_phase1;
-
-            // dst: segment-local offset (k_sr is already advanced to this segment's region by caller)
-            // seq_work_id * row_per_block == chunk_id * S_chunk + row_within_chunk * row_per_block
-            seqlen_id = seq_work_id * row_per_block;
 
             // src: local_k is the SR base, laid out [segment][batch][chunk][row].
             //   Phase 1: target_rank's local KV (segment 0, chunk 0). Phase 2: src_pe's copy, stored
@@ -527,14 +448,13 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             const hier::HierBwdChunk src = hier::hier_bwd_src_chunk(
                 info, num_chunks, total_n_pes, gpus_per_node);
             src_addr = (src.segment * num_batch + batch_id) * batch_stride
-                + (src.chunk * S_chunk + row_within_chunk * row_per_block) * row_stride;
+                + (src.chunk * S_chunk + row_in_chunk) * row_stride;
         } else {
             // Non-hierarchical: circular shift order
-            seqlen_id = seq_work_id * row_per_block;
-            remote_pe = start_rank + seqlen_id / S_chunk;
+            remote_pe = start_rank + chunk_id;
             remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
             target_rank = remote_pe;
-            src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * row_stride;
+            src_addr = batch_id * local_batch_stride + row_in_chunk * row_stride;
         }
 
         bool should_skip = false;
@@ -572,7 +492,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             }
         }
 
-        // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
+        // copy upto 4 heads (S_stride = H * D), and `rows` rows (seqlen axis) per CTA
         const int64_t dst_addr = batch_id * batch_stride + seqlen_id * row_stride;
         // src is always local_k/local_v (the SR buffer base pointer on remote_pe, passed by caller):
         //   Hierarchical Phase 1: remote_pe == target_rank, reads its local KV at SR offset 0.
@@ -584,7 +504,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             shmem::offset_or_null(v_sr, dst_addr),
             local_k + src_addr,
             shmem::offset_or_null(local_v, src_addr),
-            row_per_block * S_stride * sizeof(T), remote_pe
+            rows * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.
         // therefore, next_work_id's update is visible to all threads and won't be overwritten
