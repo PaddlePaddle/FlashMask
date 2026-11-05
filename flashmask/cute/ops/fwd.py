@@ -357,7 +357,40 @@ def _flash_attn_fwd(
         # On SM100 the flashmask fwd skips the O store for a fully-masked query block
         # (valid_block_count == 0) and has no zero-writer for it, so that O tile would
         # be left uninitialized -- keep the zero-filled allocation on SM100.
-        out = (be.empty if compute_capability == 9 else be.zeros)(
+        # SM100 d == dv == 256 dense path (no flashmask / block sparsity / CP overlap /
+        # local window, and causal only with seqlen_q <= seqlen_k): every query block has at
+        # least one KV block and the kernel stores its whole O tile (split-KV is not
+        # supported at this head dim), so the zero-fill (~0.2 ms for B=16 S=8K H=16) is dead.
+        sm100_hd256_dense_writes_all_o = (
+            compute_capability == 10
+            and head_dim == 256
+            and head_dim_v == 256
+            and startend_row_indices is None
+            and block_sparse_tensors is None
+            and group is None
+            and window_size_left is None
+            and window_size_right is None
+            and (not causal or seqlen_q <= k.shape[1])
+        )
+        # Same config with flashmask: the kernel writes zeros for fully masked query blocks
+        # itself (FlashAttentionForwardSm100.zero_empty_o_tiles), so no zero-fill either.
+        sm100_hd256_flashmask_writes_all_o = (
+            compute_capability == 10
+            and head_dim == 256
+            and head_dim_v == 256
+            and startend_row_indices is not None
+            and block_sparse_tensors is None
+            and group is None
+            and window_size_left is None
+            and window_size_right is None
+        )
+        out = (
+            be.empty
+            if compute_capability == 9
+            or sm100_hd256_dense_writes_all_o
+            or sm100_hd256_flashmask_writes_all_o
+            else be.zeros
+        )(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_framework_dtype
         )
     else:
