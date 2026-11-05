@@ -167,7 +167,6 @@ def is_available():
 
 # Mirrors the C++ limits (overlap_comm.cu, remote_get_kernel.cuh) so check_inputs can fail
 # before any comm instead of terminating inside the noexcept bridge.
-SUPPORTED_S_LOCAL = (4096, 8192, 16384, 32768, 65536, 131072)
 MAX_RANKS = 64
 MAX_S_TOTAL = 2097152
 SUPPORTED_CHUNKS_PER_SEGMENT = (1, 2, 4, 8)
@@ -208,9 +207,13 @@ def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
             "overlap requires head_dim_v == head_dim (the SRBuffer V view is built from "
             f"K's head_dim), got head_dim={q.shape[-1]}, head_dim_v={v.shape[-1]}"
         )
-    s_local = k.shape[1]
-    if s_local not in SUPPORTED_S_LOCAL:
-        raise ValueError(f"overlap requires S_local in {SUPPORTED_S_LOCAL}, got {s_local}")
+    b, s_local, h, d = (int(x) for x in k.shape)
+    if s_local <= 0 or s_local % 4 or s_local * h * d % 512:
+        # check_s_local in overlap_comm.cu: 4-row chunk-mask loads, 512-element dK/dV reduce tasks
+        raise ValueError(
+            "overlap requires S_local % 4 == 0 and S_local * H_kv * head_dim % 512 == 0, got "
+            f"K shape {tuple(k.shape)}"
+        )
     if nranks > MAX_RANKS:
         raise ValueError(f"overlap supports at most {MAX_RANKS} ranks per group, got {nranks}")
     if nranks & (nranks - 1):
@@ -220,7 +223,6 @@ def check_inputs(q, k, v, startend_row_indices, causal, nranks, be):
             f"overlap requires S_local * group size <= {MAX_S_TOTAL}, got "
             f"{s_local} * {nranks} = {s_local * nranks}"
         )
-    b, _, h, d = (int(x) for x in k.shape)
     num_chunks = int(_load().fm4_overlap_num_chunks_per_segment(b, s_local, h, d, int(nranks)))
     if num_chunks not in SUPPORTED_CHUNKS_PER_SEGMENT or nranks % num_chunks:
         raise ValueError(
@@ -390,7 +392,7 @@ class ForwardAgArgs(NamedTuple):
     """Forward SR view plus the persistent device frontier used by the compute gate."""
     view: SrKvView
     write_ptr_addr: int  # device int*; invalid after reconfiguration
-    kv_chunk_size: int   # S_local
+    local_kv_seqlen: int   # S_local
 
 
 class BackwardAgArgs(NamedTuple):
@@ -398,6 +400,7 @@ class BackwardAgArgs(NamedTuple):
     num_segments: int
     segment_seqlen: int
     work_done_addr: int  # device int* per-work done bitmap
+    local_kv_seqlen: int   # S_local; the work grid restarts at every chunk
     comm_rpb: int
     shape: tuple  # (B, S_segment, H, D) of one segment
     segment_addrs: tuple  # per segment: (k_addr, v_addr, dk_send_addr, dv_send_addr)
@@ -440,13 +443,14 @@ def _query_layout(lib, generation, b, h, d):
             shape=(b, s_local * nranks, h, d),
         ),
         write_ptr_addr=int(lib.fm4_overlap_fwd_write_ptr()),
-        kv_chunk_size=s_local,
+        local_kv_seqlen=s_local,
     )
     bwd = BackwardAgArgs(
         num_segments=num_segments,
         segment_seqlen=segment_seqlen,
         work_done_addr=work_done_addr,
         comm_rpb=comm_rpb,
+        local_kv_seqlen=s_local,
         shape=(b, segment_seqlen, h, d),
         segment_addrs=tuple(
             (

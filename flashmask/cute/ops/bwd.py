@@ -8,6 +8,7 @@ Framework-agnostic: allocation, dtype and stream access go through a
 `flashmask.backend` adapter (``be``).
 """
 
+import dataclasses
 import math
 from typing import Optional, Tuple, Union
 
@@ -201,7 +202,19 @@ def _flash_attn_bwd(
         # It only ever fed a host-side density heuristic; the 2CTA path now skips
         # fully-masked m blocks itself, so that heuristic and the block-count scan
         # behind it are both gone.
-        prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
+        if enable_overlap:
+            # The kernel walks one split-AG segment at a time with key blocks starting at the
+            # segment's first row, so build the block max/min per segment (segments as heads).
+            mask = flashmask_info.startend_row_indices
+            b, h, s, nv = mask.shape
+            ns = overlap_runtime.backward_ag_args().num_segments
+            segment_info = FlashMaskInfoPaddle(
+                is_causal=causal, startend_row_indices=mask.reshape([b, h * ns, s // ns, nv])
+            )
+            prepare_block_maxmin(segment_info, kBlockN=n_block_size)
+            flashmask_info = dataclasses.replace(segment_info, startend_row_indices=mask)
+        else:
+            prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         num_flashmask_tensors = 2 * flashmask_info.startend_row_indices.shape[-1]
 
@@ -218,11 +231,6 @@ def _flash_attn_bwd(
         segment_seqlen = overlap_ag_args.segment_seqlen
         full_seqlen_k = startend_row_indices.shape[2]
         assert full_seqlen_k == segment_seqlen * overlap_ag_args.num_segments
-        assert segment_seqlen % n_block_size == 0
-        segment_nblocks = segment_seqlen // n_block_size
-        assert segment_nblocks % 4 == 0, (
-            "FM-3 segment mask metadata requires a 4-block-aligned segment"
-        )
         # cute_flashmask_info keeps the full mask; the SM100 loader adds the segment offset.
         # All segment-local scheduler and semaphore shapes use this length. The
         # original local length is retained by k/v and by the final dK/dV outputs.
@@ -506,12 +514,8 @@ def _flash_attn_bwd(
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
         overlap_segment_idx = cutlass.Int32(0)
+        overlap_local_kv_size = cutlass.Int32(overlap_ag_args.local_kv_seqlen)
         overlap_comm_rpb = overlap_ag_args.comm_rpb
-        # The bwd gate waits only on the work item holding a cluster tile's last row.
-        assert overlap_comm_rpb % (cluster_size * n_block_size) == 0, (
-            f"comm_rpb {overlap_comm_rpb} must be a multiple of cluster_size * n_block_size "
-            f"({cluster_size} * {n_block_size})"
-        )
         overlap_dk_send_addr, overlap_dv_send_addr = overlap_ag_args.dkv_send_addrs(0)
         overlap_dk_addr = (
             None if need_kv_accum else cutlass.Int64(overlap_dk_send_addr)
@@ -530,6 +534,7 @@ def _flash_attn_bwd(
         overlap_s = None
         overlap_h = None
         overlap_d = None
+        overlap_local_kv_size = None
         overlap_comm_rpb = None
         overlap_bhsd_layout = None
 
@@ -745,6 +750,7 @@ def _flash_attn_bwd(
                 overlap_work_done_addr=overlap_work_done_addr,
                 overlap_spin_timeout_ns=overlap_spin_timeout_ns,
                 overlap_segment_idx=overlap_segment_idx,
+                overlap_local_kv_size=overlap_local_kv_size,
                 overlap_dk_addr=overlap_dk_addr,
                 overlap_dv_addr=overlap_dv_addr,
                 overlap_b=overlap_b,
@@ -804,6 +810,7 @@ def _flash_attn_bwd(
                 overlap_segment_idx=(
                     None if segment_idx is None else cutlass.Int32(segment_idx)
                 ),
+                overlap_local_kv_size=overlap_local_kv_size,
                 overlap_dk_addr=segment_dk_addr,
                 overlap_dv_addr=segment_dv_addr,
                 overlap_b=overlap_b,

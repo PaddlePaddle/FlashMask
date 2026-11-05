@@ -24,7 +24,7 @@ namespace flashmask {
  * P2P commit: the last CTA done with a rank signals that consumer at once (strong add on
  * SignalBuffer::rs_full); no quiet or group commit.
 */
-template <typename T, int S_chunk, int num_warps=8, int row_per_warp=32,
+template <typename T, int num_warps=8, int row_per_warp=32,
     int num_chunk=4, bool has_local_chunk=false, bool use_hierarchical=false>
 __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(num_warps)) SparseLargeKVChunkRemotePutKernel(
     const T* const __restrict__ k_send,                 // K src addr (local)
@@ -40,6 +40,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     const int segment_idx,
     const int num_batch,                // B
     const int S_stride,                 // H * D
+    const int S_chunk,                  // S_local
     int64_t* const __restrict__ semaphores,          // empty flags, written by the consumers
     uint64_t* const __restrict__ rs_full_seg,        // SignalBuffer::rs_full(segment_idx)
     const int num_segments = 4,
@@ -54,14 +55,15 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     static constexpr int chunk_offset = has_local ? 1 : 0;
     static constexpr int remote_chunks = num_chunk - chunk_offset > 0 ? num_chunk - chunk_offset : 1;  // clamp to 1 to suppress div-by-zero warning; total_works=0 guards runtime
     static constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
-    static constexpr int work_per_chunk = S_chunk / row_per_block;
-    static constexpr int work_per_seg = work_per_chunk * remote_chunks;
+    // works of a chunk start at its first row; the last one may be short (see ChunkMaskKernel)
+    const int work_per_chunk = (S_chunk + row_per_block - 1) / row_per_block;
+    const int work_per_seg = work_per_chunk * remote_chunks;
 
     const int total_works = num_batch * work_per_seg;
     const int works_per_rank = num_batch * work_per_chunk;  // total put operations per target rank
     // the segment (num_chunk * S_chunk * S_stride) exceeds INT_MAX for large shapes
     const int64_t row_stride = S_stride;
-    const int64_t batch_stride = S_chunk * num_chunk * row_stride;   // num_chunk is the real total
+    const int64_t batch_stride = int64_t(S_chunk) * num_chunk * row_stride;   // num_chunk is the real total
 
     extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_empty[num_chunk];
@@ -69,7 +71,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
 
     // Block-stride loop: total_works grows with num_batch * S_chunk * num_chunk and can exceed
     // blockDim.x, same as the get kernel's staging loop.
-    constexpr int start_offset = chunk_offset * work_per_chunk;
+    const int start_offset = chunk_offset * work_per_chunk;
     for (int i = threadIdx.x; i < total_works; i += blockDim.x) {
         const int batch_id = i / work_per_seg;
         const int seqlen_id = i % work_per_seg;
@@ -159,14 +161,15 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         }
 
         // batch_offset + chunk_offset + work_offset, the src and dst in the buffer is the same
-        const int64_t addr = batch_id * batch_stride + (seg_chunk_id * S_chunk + seq_work_id * row_per_block) * row_stride;
+        const int row_in_chunk = seq_work_id * row_per_block;
+        const int64_t addr = batch_id * batch_stride + (seg_chunk_id * S_chunk + row_in_chunk) * row_stride;
 
         shmem::two_buffers_putmem_block(
             k_recv + addr,
             shmem::offset_or_null(v_recv, addr),
             k_send + addr,
             shmem::offset_or_null(v_send, addr),
-            row_per_block * S_stride * sizeof(T), target_rank
+            min(row_per_block, S_chunk - row_in_chunk) * S_stride * sizeof(T), target_rank
         );
         // buffer putmem_block will call syncthreads(), so next_work_id will not be updated
         // therefore, next_work_id's update is visible to all threads and won't be overwritten

@@ -53,16 +53,16 @@ def _overlap_gate(
     write_ptr: cute.Pointer,
     spin_timeout_ns: cutlass.Int64,
     n_block_size: cutlass.Constexpr[int],
-    kv_chunk_size: cutlass.Constexpr[int],
+    local_kv_seqlen: Int32,
 ):
     """Spin until the comm side has gathered the KV rows of tile ``nblk``.
 
     All load-warp lanes must call this; the local chunk (``reverse_row < 0``) needs no wait.
     """
-    reverse_row = s_total - nblk * n_block_size - kv_chunk_size
+    reverse_row = s_total - nblk * n_block_size - local_kv_seqlen
     if reverse_row >= 0:
         if tidx == 0:
-            target = batch_idx * (s_total - kv_chunk_size) + reverse_row
+            target = batch_idx * (s_total - local_kv_seqlen) + reverse_row
             wait_write_ptr_ge(write_ptr, 0, Int32(target), spin_timeout_ns)
         # Share lane 0's acquire with the whole warp.
         cute.arch.sync_warp()
@@ -718,7 +718,7 @@ class FlashAttentionForwardSm100:
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
         overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
-        overlap_kv_chunk_size: cutlass.Constexpr = None,
+        overlap_local_kv_size: Optional[cutlass.Int32] = None,
         overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -793,7 +793,7 @@ class FlashAttentionForwardSm100:
                 utils.make_gmem_tensor_from_addr(
                     overlap_write_ptr_addr, (1,), (1,), cutlass.Int32, align=4
                 ),
-                overlap_kv_chunk_size,
+                overlap_local_kv_size,
                 overlap_spin_timeout_ns,
             )
         else:
@@ -2426,7 +2426,7 @@ class FlashAttentionForwardSm100:
                     write_ptr=overlap_info.write_ptr.iterator,
                     spin_timeout_ns=overlap_info.spin_timeout_ns,
                     n_block_size=self.n_block_size,
-                    kv_chunk_size=overlap_info.kv_chunk_size,
+                    local_kv_seqlen=overlap_info.local_kv_seqlen,
                 )
 
             if const_expr(self.enable_flashmask):

@@ -49,20 +49,27 @@ def _overlap_gate_bwd(
     batch_idx: Int32,
     work_done: cute.Pointer,
     spin_timeout_ns: cutlass.Int64,
+    local_kv_seqlen: Int32,
     comm_rpb: cutlass.Constexpr[int],
     cta_group_size: cutlass.Constexpr[int],
     tile_n: cutlass.Constexpr[int],
 ):
-    """Wait for the split-AG work item covering this cluster-wide KV tile.
+    """Wait for every split-AG work item holding a row of this cluster-wide KV tile.
 
-    Only ``tidx == 0`` spins, but every lane of the load warp must call this so each
-    lane, including the TMA issuer, runs the proxy fence.
+    Works restart at each local_kv_seqlen-row chunk, whose last work may be short, so a tile can
+    span several. Only ``tidx == 0`` spins, but every lane of the load warp must call this so
+    each lane, including the TMA issuer, runs the proxy fence.
     """
     if tidx == 0:
-        right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
-        work_per_batch = seqlen_k // comm_rpb
-        work_id = batch_idx * work_per_batch + (right_edge - 1) // comm_rpb + 1
-        wait_flag_eq(work_done, Int32(work_id), Int32(1), spin_timeout_ns)
+        work_per_chunk = (local_kv_seqlen + comm_rpb - 1) // comm_rpb
+        first_row = n_block // cta_group_size * cta_group_size * tile_n
+        last_row = cutlass.min(first_row + cta_group_size * tile_n, seqlen_k) - 1
+        base = batch_idx * (seqlen_k // local_kv_seqlen) * work_per_chunk + 1
+        first = first_row // local_kv_seqlen * work_per_chunk + first_row % local_kv_seqlen // comm_rpb
+        last = last_row // local_kv_seqlen * work_per_chunk + last_row % local_kv_seqlen // comm_rpb
+        # dynamic non-canonical length can produce tiles which cannot be transfered by only one comm work. 
+        for work in cutlass.range(first, last + 1, unroll=1):
+            wait_flag_eq(work_done, Int32(base + work), Int32(1), spin_timeout_ns)
     # Share lane 0's acquire with the whole warp.
     cute.arch.sync_warp()
     # Order the acquire before this lane's TMA (async-proxy) reads.
@@ -796,6 +803,7 @@ class FlashAttentionBackwardSm100:
         overlap_work_done_addr: Optional[cutlass.Int64] = None,
         overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_segment_idx: Optional[cutlass.Int32] = None,
+        overlap_local_kv_size: Optional[cutlass.Int32] = None,
         overlap_dk_addr: Optional[cutlass.Int64] = None,
         overlap_dv_addr: Optional[cutlass.Int64] = None,
         overlap_b: Optional[cutlass.Int32] = None,
@@ -1383,6 +1391,7 @@ class FlashAttentionBackwardSm100:
             overlap_work_done_addr,
             overlap_spin_timeout_ns,
             overlap_segment_idx,
+            overlap_local_kv_size,
             overlap_comm_rpb,
             self.sQ_layout,
             self.sQt_layout,
@@ -1453,6 +1462,7 @@ class FlashAttentionBackwardSm100:
         overlap_work_done_addr: Optional[cutlass.Int64],
         overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
+        overlap_local_kv_size: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
         sQt_layout: cute.ComposedLayout,
@@ -1915,6 +1925,7 @@ class FlashAttentionBackwardSm100:
                 overlap_work_done_addr,
                 overlap_spin_timeout_ns,
                 overlap_segment_idx,
+                overlap_local_kv_size,
                 overlap_comm_rpb,
                 sStartEndRowIndices,
                 sFM_max_min,
@@ -2182,6 +2193,7 @@ class FlashAttentionBackwardSm100:
         overlap_work_done_addr: Optional[cutlass.Int64],
         overlap_spin_timeout_ns: Optional[cutlass.Int64],
         overlap_segment_idx: Optional[cutlass.Int32],
+        overlap_local_kv_size: Optional[cutlass.Int32],
         overlap_comm_rpb: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
         sFM_max_min: cute.Tensor,
@@ -2253,6 +2265,7 @@ class FlashAttentionBackwardSm100:
                     gate_batch_idx,
                     work_done,
                     overlap_spin_timeout_ns,
+                    overlap_local_kv_size,
                     overlap_comm_rpb,
                     self.cta_group_size,
                     self.tile_n,
@@ -3022,7 +3035,8 @@ class FlashAttentionBackwardSm100:
         fm_head_idx = head_idx // (num_heads // fm_heads)
         bh_offset = fm_batch_idx * fm_heads + fm_head_idx
         if const_expr(overlap_segment_idx is not None):
-            full_nblock_seqlen = ((full_seqlen_k + self.tile_n - 1) // self.tile_n + 3) // 4 * 4
+            # Block metadata is laid out per segment (see ops/bwd.py), segments of seqlen_k rows.
+            full_nblock_seqlen = full_seqlen_k // seqlen_info.seqlen_k * nblock_seqlen
             segment_row_offset = overlap_segment_idx * seqlen_info.seqlen_k
             bh_offset_block = (
                 bh_offset * full_nblock_seqlen

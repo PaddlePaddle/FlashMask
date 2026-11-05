@@ -15,7 +15,7 @@ namespace flashmask {
 // All fields that affect buffer sizes or kernel behavior are tracked here.
 struct OverlapConfig {
     int B = 0;
-    int S_local = 0;       // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
+    int S_local = 0;       // runtime; see check_s_local
     int H = 0;
     int D = 0;
     int nranks = 0;        // communicator size; changes require a rebuild
@@ -53,7 +53,8 @@ struct OverlapConfig {
  *
  * Dynamic reconfiguration: when B/H/D/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
- * S_local is dispatched at compile time: supported values are {4096, 8192, 16384, 32768, 65536, 131072}.
+ * S_local is a runtime value (check_s_local); capacities and the chunks per segment follow its
+ * power-of-two bucket (seqlen_bucket), so lengths inside a seen bucket only re-point the kernels.
  * Backward always runs the split AG plus the dK/dV RS overlap (nranks > 1).
 */
 template <typename KVType>
@@ -79,7 +80,7 @@ public:
     /**
      * Reconfigure if the shape changed; returns true if it did.
      * UID changes go through init_singleton_instance, which rebuilds.
-     * S_local must be one of {4096, 8192, 16384, 32768, 65536, 131072}.
+     * S_local must pass check_s_local.
     */
     bool reconfigure_if_needed(
         int new_b, int new_s_local, int new_h, int new_d,
@@ -186,8 +187,7 @@ public:
         return block_work_ids;
     }
 
-    // Rows per comm work item (always 512); the bwd gate waits on the item holding
-    // a cluster tile's last row.
+    // Rows per comm work item (always 512; the last work of a chunk may be shorter).
     int get_comm_rpb() const;
 
     int nranks() const {
@@ -277,7 +277,7 @@ private:
     // BHSD folds heads into the batch dimension: every (b,h) pair is an independent batch.
     inline int num_effective_batch() const { return _config.use_bhsd ? B * H : B; }
 
-    // Grow-only block_work_ids sizing; offsets move only on growth, which device-syncs first.
+    // Grow-only block_work_ids sizing (per S bucket); offsets move only on growth, which device-syncs first.
     void size_block_work_ids();
     // (Re)create dkv_buffer and its per-segment streams for the current shape
     void setup_dkv_buffer();
@@ -303,10 +303,12 @@ private:
 
     // Shape parameters (non-const to allow dynamic reconfiguration)
     int B;
-    int S_local;            // dispatched at runtime: {4096, 8192, 16384, 32768, 65536, 131072}
+    int S_local;
     int H;
     int D;
-    int num_chunks;
+    int num_chunks;         // chunks per bwd segment, picked for _s_bucket
+    int _s_bucket;          // largest seqlen_bucket(S_local) seen; sizes every buffer
+    size_t sr_bucket_numel() const { return static_cast<size_t>(_s_bucket) * H * D * B * _total_n_pes; }
 
     int _my_pe;
     int _total_n_pes;

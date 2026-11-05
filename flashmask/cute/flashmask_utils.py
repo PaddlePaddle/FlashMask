@@ -64,19 +64,18 @@ class OverlapInfo(NamedTuple):
     """Carries the comm-side readiness handle into the fwd load warp.
 
     write_ptr is a 1-D int32 device tensor (one entry, but laid out per batch by
-    the comm kernel: stride is (s_total - kv_chunk_size) rows per batch). The
-    load warp spins on it before each remote KV tile. kv_chunk_size is the local
-    chunk row count (== s_local); rows in the last kv_chunk_size of SRBuffer are
+    the comm kernel: stride is (s_total - local_kv_seqlen) rows per batch). The
+    load warp spins on it before each remote KV tile. local_kv_seqlen is the local
+    chunk row count (== s_local); rows in the last local_kv_seqlen of SRBuffer are
     local and never remote-fetched, so they skip the wait. spin_timeout_ns is the
     watchdog budget (0 disables).
     """
     write_ptr: cute.Tensor
-    kv_chunk_size: cutlass.Constexpr[int]
+    local_kv_seqlen: cutlass.Int32
     spin_timeout_ns: cutlass.Int64
 
     def __new_from_mlir_values__(self, values):
-        # kv_chunk_size is a compile-time constant; the other fields are MLIR values.
-        return OverlapInfo(values[0], self.kv_chunk_size, cutlass.Int64(values[1]))
+        return OverlapInfo(values[0], cutlass.Int32(values[1]), cutlass.Int64(values[2]))
 
 
 @dataclass

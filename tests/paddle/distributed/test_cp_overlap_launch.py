@@ -49,20 +49,25 @@ pytestmark = [
     ),
 ]
 
-# cp_size, head dim, kv-head counts, mask. Two launches only: d=128 exercises the
-# BHSD layout and split KV, d=512 the big-headdim / shared-KV path.
+# cp_size, head dim, kv-head counts, mask, S_LOCALS, repeats. d=128 exercises the
+# BHSD layout and split KV, d=512 the big-headdim / shared-KV path; both keep the
+# fixed S_total=32768. The dynamic case runs S_local 1152 -> 1056 -> 1504 -> 1152
+# in ONE process (GQA): shrink, grow past the first size, then return to a size
+# already seen, with
+# S_local % 512 = 128 / 32 / 480 and 1056 % 64 = 32 (32-row tail).
 CASES = [
-    (4, 128, "16,1", "document"),
-    (4, 512, "1", "prefix_lm"),
+    (4, 128, "16,1", "document", "", 1),
+    (4, 512, "1", "prefix_lm", "", 1),
+    (4, 128, "4", "document", "1152,1056,1504,1152", 2),
 ]
 
 
 @pytest.mark.parametrize(
-    "cp_size, d, hks, mask",
+    "cp_size, d, hks, mask, s_locals, repeats",
     CASES,
-    ids=[f"cp{c[0]}-d{c[1]}-{c[3]}" for c in CASES],
+    ids=[f"cp{c[0]}-d{c[1]}-{c[3]}" + ("-dyn" if c[4] else "") for c in CASES],
 )
-def test_cp_overlap(cp_size, d, hks, mask):
+def test_cp_overlap(cp_size, d, hks, mask, s_locals, repeats):
     env = dict(
         os.environ,
         CP_SIZE=str(cp_size),
@@ -71,7 +76,8 @@ def test_cp_overlap(cp_size, d, hks, mask):
         HKS=hks,
         BS="1",
         MASKS=mask,
-        REPEATS="1",
+        S_LOCALS=s_locals,
+        REPEATS=str(repeats),
     )
     proc = subprocess.run(
         ["bash", str(LAUNCHER)],
@@ -83,7 +89,8 @@ def test_cp_overlap(cp_size, d, hks, mask):
     )
     if proc.returncode != 0:
         pytest.fail(
-            f"run_cp_overlap.sh exited {proc.returncode} for cp={cp_size} d={d} mask={mask}\n"
+            f"run_cp_overlap.sh exited {proc.returncode} for cp={cp_size} d={d} mask={mask} "
+            f"s_locals={s_locals or 'default'}\n"
             f"--- stdout (tail) ---\n{proc.stdout[-4000:]}\n"
             f"--- stderr (tail) ---\n{proc.stderr[-4000:]}"
         )
