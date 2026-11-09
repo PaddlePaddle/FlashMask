@@ -31,7 +31,7 @@ inline void check_cu(CUresult result, const char* call) {
     }
 }
 
-// Runtime-resolve cuTensorMapEncodeTiled via cudaGetDriverEntryPoint (same as cutlass).
+// Runtime-resolve cuTensorMapEncodeTiled via cudaGetDriverEntryPointByVersion.
 // This avoids linking against libcuda.so which is a driver-provided library.
 inline CUresult call_cuTensorMapEncodeTiled(
     CUtensorMap *tensorMap, CUtensorMapDataType tensorDataType,
@@ -48,10 +48,13 @@ inline CUresult call_cuTensorMapEncodeTiled(
     if (!pfn) {
         void* fn = nullptr;
         cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
-        FM_CUDA_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn, cudaEnableDefault, &status));
+        // Ask for the CUDA 12.0 ABI of the symbol (where it was introduced): the unversioned call
+        // requests the runtime's own version and fails on an older user-mode driver.
+        FM_CUDA_CHECK(cudaGetDriverEntryPointByVersion(
+            "cuTensorMapEncodeTiled", &fn, 12000, cudaEnableDefault, &status));
         if (status != cudaDriverEntryPointSuccess || !fn) {
             throw std::runtime_error(
-                "[FlashMask Overlap] cudaGetDriverEntryPoint(cuTensorMapEncodeTiled) failed: "
+                "[FlashMask Overlap] cudaGetDriverEntryPointByVersion(cuTensorMapEncodeTiled) failed: "
                 "driver status " + std::to_string(static_cast<int>(status)));
         }
         pfn = reinterpret_cast<FuncPtr>(fn);
