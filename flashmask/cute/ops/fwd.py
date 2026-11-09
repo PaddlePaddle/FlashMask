@@ -651,15 +651,17 @@ def _flash_attn_fwd(
         overlap_bhsd_layout = None
 
     # DynamicPersistentTileScheduler ticket counter (SM100 hd256 flashmask): int32[2], zeroed
-    # once per device and reset by the kernel itself, so no per-call memset. The kernel only
-    # uses it for the configs it schedules persistently; passing it is harmless otherwise.
+    # once and reset by the kernel itself, so no per-call memset. Launches on one stream are
+    # serialized, but kernels on different streams may run concurrently and must not share
+    # a counter, so there is one per (device, stream). The kernel only uses it for the
+    # configs it schedules persistently; passing it is harmless otherwise.
     sched_counter_tensor = None
     if compute_capability == 10:
-        dev_key = str(be.device_of(q))
-        sched_counter = _flash_attn_fwd.sched_counters.get(dev_key)
+        sched_key = (str(be.device_of(q)), be.cuda_stream())
+        sched_counter = _flash_attn_fwd.sched_counters.get(sched_key)
         if sched_counter is None:
             sched_counter = be.zeros([2], dtype=be.int32)
-            _flash_attn_fwd.sched_counters[dev_key] = sched_counter
+            _flash_attn_fwd.sched_counters[sched_key] = sched_counter
         sched_counter_tensor = from_dlpack(sched_counter, assumed_align=4)
 
     compile_key = (

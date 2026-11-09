@@ -1154,6 +1154,7 @@ class FlashAttentionForwardSm100:
                 self.use_tma_O,
                 self.head_dim_padded == 256,
                 self.head_dim_v_padded == 256,
+                not self.is_local,
             ))
         )
         self.sched_ring_stages = 4
@@ -1181,10 +1182,9 @@ class FlashAttentionForwardSm100:
         # correction warps stage chunk c, the epilogue warp TMA-stores it and frees the slot.
         # TMEM O is released once the last chunk is in smem instead of after 64 KB of strided
         # st.global (4.2 us tail).
-        self.fm_o_chunk = const_expr(self.fm_persistent)
         self.sOc_layout = None
         tma_atom_Oc, mOc = None, None
-        if const_expr(self.fm_o_chunk):
+        if const_expr(self.fm_persistent):
             self.o_chunk_cols, self.o_chunk_stages = 32, 2
             # Per-tile uses of each slot must be even so every tile starts on the same parity.
             assert (self.head_dim_v_padded // (self.o_chunk_cols * self.o_chunk_stages)) % 2 == 0
@@ -1265,7 +1265,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.fm_persistent):
             self.mbar_total = self.mbar_total + 2 * self.sched_ring_stages
         self.mbar_o_chunk_offset = self.mbar_total  # full[o_chunk_stages], empty[o_chunk_stages]
-        if const_expr(self.fm_o_chunk):
+        if const_expr(self.fm_persistent):
             self.mbar_total = self.mbar_total + 2 * self.o_chunk_stages
 
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
@@ -1314,7 +1314,7 @@ class FlashAttentionForwardSm100:
             ]
             sOc: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.o_dtype, cute.cosize(self.sOc_layout) if const_expr(self.fm_o_chunk) else 0
+                    self.o_dtype, cute.cosize(self.sOc_layout) if const_expr(self.fm_persistent) else 0
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1396,33 +1396,22 @@ class FlashAttentionForwardSm100:
         # 32 KB per-partition L0 instruction cache together with the correction warp's (ncu:
         # ~85% of softmax no_inst stalls sit on the first instruction of a 128 B line;
         # softmax + correction was ~40 KB). So run every block of the tile through ONE
-        # softmax_step instance: the causal / seqlen R2P pass and the flashmask pass are runtime-guarded inside it, the
-        # first block takes the regular path, and the S load / P store pick the ping-pong
-        # slot by TMEM address arithmetic instead of two copies (pp_dyn_slot).
-        self.fm_one_softmax = const_expr(
-            self.fm_persistent
-            and self.use_s_ping_pong
-            and not self.is_local
-            and not self.is_split_kv
-        )
-        self.pp_dyn_slot = self.fm_one_softmax
-        # On top of fm_one_softmax: the correction warps' final O normalization runs as a runtime loop over the sOc chunks
-        # instead of being unrolled over all of dv. It runs once per tile, but its ~530
-        # unrolled instructions sit in every SMSP's L0 instruction cache next to softmax.
-        self.fm_corr_epi_loop = const_expr(
-            self.fm_one_softmax
-            and self.fm_o_chunk
-            and not self.folded_acc
-        )
-        # On top of fm_one_softmax: shrink the load warp's code (it shares SMSP 2 with softmax warp 2 / correction warp 6). The
-        # first block's K + startend loads go through the main loop instead of a peeled copy,
-        # and the startend copy for <= 2 bound columns is a fixed 4-step load-then-store
-        # (all loads, then all stores) instead of a while loop that ptxas unrolls with remainders.
+        # softmax_step instance: the causal / seqlen R2P pass and the flashmask pass are
+        # runtime-guarded inside it, the first block takes the regular path, and the S load /
+        # P store (and the MMA warp's QK / PV issue) pick the ping-pong slot by TMEM address
+        # arithmetic instead of two copies.
+        self.fm_one_softmax = const_expr(self.fm_persistent and self.use_s_ping_pong)
+        # On top of fm_one_softmax: the correction warps' final O normalization runs as a
+        # runtime loop over the sOc chunks instead of being unrolled over all of dv. It runs
+        # once per tile, but its ~530 unrolled instructions sit in every SMSP's L0
+        # instruction cache next to softmax.
+        self.fm_corr_epi_loop = const_expr(self.fm_one_softmax and not self.folded_acc)
+        # On top of fm_one_softmax: shrink the load warp's code (it shares SMSP 2 with softmax
+        # warp 2 / correction warp 6). The first block's K + startend loads go through the main
+        # loop instead of a peeled copy, and the startend copy for <= 2 bound columns loads
+        # everything first and then stores, instead of a while loop that ptxas unrolls with
+        # remainders.
         self.fm_load_one_loop = const_expr(self.fm_one_softmax and self.q_stage == 1)
-        # On top of fm_one_softmax: the MMA warp's QK / PV issue also picks the ping-pong slot by address arithmetic (one UTCHMMA
-        # sequence per gemm, not two), to shrink the code that shares SMSP 0 with softmax
-        # warp 0 and correction warp 4.
-        self.pp_dyn_mma = self.fm_one_softmax
         self.pp_lazy_o_wait = const_expr(
             self.use_s_ping_pong and (self.hd256_2cta or self.fm_persistent)
         )
@@ -1601,7 +1590,7 @@ class FlashAttentionForwardSm100:
                     mbar_ptr + self.mbar_corr_epi_empty_offset + i,
                     cute.arch.WARP_SIZE * len(self.epilogue_warp_ids),
                 )
-            if const_expr(self.fm_o_chunk):
+            if const_expr(self.fm_persistent):
                 # O chunk ring: full <- every correction thread, empty <- the epilogue warp.
                 for i in cutlass.range_constexpr(self.o_chunk_stages):
                     cute.arch.mbarrier_init(
@@ -1702,7 +1691,7 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
         sOc, sOc_full_view = None, None
-        if const_expr(self.fm_o_chunk):
+        if const_expr(self.fm_persistent):
             # (m, cols, stages) ring the epilogue warp TMA-stores from.
             sOc_ptr = cute.recast_ptr(storage.sOc.data_ptr(), sOc_layout.inner, self.o_dtype)
             sOc = cute.make_tensor(sOc_ptr, sOc_layout.outer)
@@ -3021,7 +3010,7 @@ class FlashAttentionForwardSm100:
                 )
                 for slot in range(2)
             ]
-            if const_expr(self.pp_dyn_mma):
+            if const_expr(self.fm_one_softmax):
                 # One QK and one PV issue sequence for both slots; the slot only changes
                 # the TMEM accumulator / A-operand address and the barrier index (computed at
                 # runtime), instead of two unrolled copies of every UTCHMMA sequence.
@@ -3329,7 +3318,7 @@ class FlashAttentionForwardSm100:
         block_count: Int32,
     ):
         """S ping-pong: issue QK for global block `block_count` into S slot block_count & 1."""
-        if const_expr(self.pp_dyn_mma):
+        if const_expr(self.fm_one_softmax):
             slot = block_count & 1
             gemm_S_pp[0](
                 acc_tmem_addr=self.tmem_s_offset[0]
@@ -3360,7 +3349,7 @@ class FlashAttentionForwardSm100:
     ):
         """S ping-pong: issue PV for global block `block_count` from P slot block_count & 1."""
         pv_phase = (block_count >> 1) & 1
-        if const_expr(self.pp_dyn_mma):
+        if const_expr(self.fm_one_softmax):
             slot = block_count & 1
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + slot, pv_phase)
             gemm_P_pp[0](
@@ -3396,7 +3385,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.pp_lazy_o_wait):
             # One O_full slot per S/P slot (block & 1), phase (block >> 1) & 1, so the
             # correction warps only wait when they actually rescale O.
-            if const_expr(self.pp_dyn_mma):
+            if const_expr(self.fm_one_softmax):
                 with cute.arch.elect_one():
                     self.mma_barrier_commit(mbar_ptr + self.mbar_O_full_offset + (block_count & 1))
             elif (block_count & 1) == 0:
@@ -4085,7 +4074,7 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_wait(
                 mbar_ptr + self.mbar_S_full_offset + pp_slot, (mma_si_consumer_phase >> 1) & 1
             )
-            if const_expr(self.pp_dyn_slot):
+            if const_expr(self.fm_one_softmax):
                 # One code path for both S slots: offset the TMEM address by the slot instead
                 # of branching between two copies of the load (and of the P store).
                 pp_col = pp_slot * (self.tmem_s_offset[1] - self.tmem_s_offset[0])
@@ -4298,7 +4287,7 @@ class FlashAttentionForwardSm100:
         elif const_expr(self.use_s_ping_pong):
             # Same 3/4 + 1/4 split store as below, into this block's P slot.
             n_p_chunks = const_expr(cute.size(tStP_r2t.shape[2]))
-            if const_expr(self.pp_dyn_slot):
+            if const_expr(self.fm_one_softmax):
                 tStP_cur = cute.make_tensor(
                     tStP_r2t.iterator + pp_slot * (self.tmem_s_offset[1] - self.tmem_s_offset[0]),
                     tStP_r2t.layout,
@@ -4611,7 +4600,7 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                         )
-                    if const_expr(self.fm_o_chunk):
+                    if const_expr(self.fm_persistent):
                         # O leaves through the sOc ring; the epilogue warp TMA-stores each
                         # chunk. Returns once the last chunk is in smem, i.e. TMEM O is free.
                         self.correction_epilogue(
@@ -5039,7 +5028,7 @@ class FlashAttentionForwardSm100:
                 else:
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
                 gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
-                if const_expr(self.fm_o_chunk):
+                if const_expr(self.fm_persistent):
                     # Drain the sOc ring: chunk c sits in slot c % stages once the correction
                     # warps arrive on its full barrier; free the slot once the TMA has read it.
                     mOc_cur = seqlen.offset_batch_Q(mOc, batch_idx, dim=3)[None, None, head_idx]
