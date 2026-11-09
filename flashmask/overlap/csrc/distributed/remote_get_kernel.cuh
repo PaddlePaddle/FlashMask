@@ -206,9 +206,11 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             remote_pe = info.src_pe;         // PE to fetch from (Phase 1: = target_rank; Phase 2: = same-node rank)
             is_phase1 = info.is_phase1;
             seqlen_id = hier::hier_seqlen_id(logical_pos, row_within_chunk, row_per_block, total_n_pes, S_chunk);
+            rows = min(row_per_block, S_chunk - row_within_chunk * row_per_block);
 
-            // copy_chunk_mask is in SR buffer order from seqlen 0
-            mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch + seqlen_id / row_per_block;
+            // copy_chunk_mask: work row_within_chunk of SR chunk nranks-1-logical_pos (ChunkMaskKernel grid)
+            mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch
+                + (total_n_pes - 1 - logical_pos) * work_per_chunk + row_within_chunk;
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
