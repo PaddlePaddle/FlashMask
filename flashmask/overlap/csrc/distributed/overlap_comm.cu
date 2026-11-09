@@ -74,12 +74,11 @@ inline void check_comm_launch(const char* name) {
 }
 
 // S_local constraints of the work grid: 4-row chunk-mask loads and 512-element dK/dV reduce
-// tasks. Hierarchical routing addresses whole works only.
-inline void check_s_local(int s, int h, int d, bool hierarchical) {
-    if (s <= 0 || s % 4 || int64_t(s) * h * d % 512 || (hierarchical && s % rows_per_work)) {
+// tasks.
+inline void check_s_local(int s, int h, int d) {
+    if (s <= 0 || s % 4 || int64_t(s) * h * d % 512) {
         throw std::invalid_argument("[FlashMask Overlap] S_local must be a positive multiple of 4 with "
-            "S_local * H * D % 512 == 0 (and a multiple of " + std::to_string(rows_per_work)
-            + " for hierarchical CP), got S_local=" + std::to_string(s) + ", H=" + std::to_string(h)
+            "S_local * H * D % 512 == 0, got S_local=" + std::to_string(s) + ", H=" + std::to_string(h)
             + ", D=" + std::to_string(d));
     }
 }
@@ -122,7 +121,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     _gpus_per_node = gin::num_lsa_ranks(*gin_context_);
     _num_nodes = _total_n_pes / _gpus_per_node;
     _use_hierarchical = hier::hier_is_effective(_total_n_pes, _gpus_per_node);
-    check_s_local(s_kv, h_kv, d_kv, _use_hierarchical);
+    check_s_local(s_kv, h_kv, d_kv);
     // Set before any sizing: num_effective_batch() reads use_bhsd.
     _config = {b_kv, s_kv, h_kv, d_kv, nranks, OverlapConfig::bhsd_for(d_kv)};
     reserve_comm_kernel_smem(S_local, num_chunks, num_effective_batch(), B);
@@ -829,7 +828,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
             "[FlashMask Overlap] World-size changes require rebuilding the NCCL communicator.");
     }
 
-    check_s_local(new_s_local, new_h, new_d, _use_hierarchical);
+    check_s_local(new_s_local, new_h, new_d);
     const int new_s_bucket = std::max(_s_bucket, seqlen_bucket(new_s_local));
     const int new_num_chunks = get_num_chunk_per_segment(new_b, new_s_bucket, new_h, new_d, _total_n_pes);
     reserve_comm_kernel_smem(new_s_local, new_num_chunks,
