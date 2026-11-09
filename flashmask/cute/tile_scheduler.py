@@ -687,6 +687,8 @@ class DynamicPersistentTileScheduler:
 
     @dataclass
     class Params(ParamsBase):
+        """Static tile-space shape of one launch."""
+
         num_block: Int32
         num_block_divmod: FastDivmodDivisor
         num_head_divmod: FastDivmodDivisor
@@ -696,6 +698,14 @@ class DynamicPersistentTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "DynamicPersistentTileScheduler.Params":
+            """Build the params from the scheduler arguments.
+
+            Args:
+                args: Tile counts per (m_block, head, batch).
+
+            Returns:
+                The scheduler params.
+            """
             total_blocks = args.num_block * args.num_head * args.num_batch
             return DynamicPersistentTileScheduler.Params(
                 args.num_block,
@@ -750,6 +760,20 @@ class DynamicPersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> "DynamicPersistentTileScheduler":
+        """Create the per-warp scheduler; the first tile is blockIdx.x.
+
+        Args:
+            params: Scheduler params.
+            sched_tile: Smem ring of ring_stages published tickets.
+            sched_mbar: 2 * ring_stages mbarriers (full, then empty).
+            counter: Global int32[2] ticket counter and finished-CTA count.
+            ring_stages: Number of ring slots.
+            num_consumer_threads: Threads that arrive on each empty barrier.
+            is_producer: Whether this warp draws the tickets.
+
+        Returns:
+            The scheduler.
+        """
         return DynamicPersistentTileScheduler(
             params,
             Int32(cute.arch.block_idx()[0]),
@@ -779,6 +803,11 @@ class DynamicPersistentTileScheduler:
             cute.arch.mbarrier_init(sched_mbar + ring_stages + i, num_consumer_threads)
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        """Decode the current ticket into (m_block, head, batch, split).
+
+        Returns:
+            The work tile; invalid once the ticket is past total_blocks.
+        """
         bh_idx, block_rev = divmod(self._tile_idx, self.params.num_block_divmod)
         batch_idx, head_idx = divmod(bh_idx, self.params.num_head_divmod)
         block_idx = self.params.num_block - 1 - block_rev
@@ -835,6 +864,7 @@ class DynamicPersistentTileScheduler:
         return ticket
 
     def advance_to_next_work(self, *, loc=None, ip=None):
+        """Move to the next ticket: the producer draws it, consumers read it from the ring."""
         if const_expr(self._is_producer):
             ticket = self._producer_next()
         else:

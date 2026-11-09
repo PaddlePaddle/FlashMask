@@ -45,8 +45,19 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
 
 @cute.jit
 def flashmask_count_le(s: cute.Tensor, base: Int32, n: cutlass.Constexpr[int], row: Int32) -> Int32:
-    # Number of c in [0, n) with s[base + c] <= row, for s non-decreasing over c (n a power
-    # of 2). Branchless lower bound: the steps sum to n - 1, the last probe adds the final 1.
+    """Count the c in [0, n) with s[base + c] <= row, for s non-decreasing over c.
+
+    Branchless lower bound: the steps sum to n - 1, the last probe adds the final 1.
+
+    Args:
+        s: Row-index tensor, non-decreasing over [base, base + n).
+        base: Offset of the first element in s.
+        n: Number of elements, a power of 2.
+        row: Row index to compare against.
+
+    Returns:
+        The number of elements <= row.
+    """
     pos = Int32(0)
     for k in cutlass.range_constexpr(n.bit_length() - 1):
         step = const_expr(n >> (k + 1))
@@ -57,8 +68,19 @@ def flashmask_count_le(s: cute.Tensor, base: Int32, n: cutlass.Constexpr[int], r
 
 @cute.jit
 def flashmask_warp_not_monotone(s: cute.Tensor, base: Int32, n: cutlass.Constexpr[int]) -> Int32:
-    # Nonzero if s[base + c] decreases anywhere over c in [0, n). Each lane checks the pairs
-    # (c, c + 1) for c = lane, lane + 32, ...; the last pair compares s[n - 1] with itself.
+    """Check whether s[base + c] decreases anywhere over c in [0, n), per lane.
+
+    Each lane checks the pairs (c, c + 1) for c = lane, lane + 32, ...; the last pair
+    compares s[n - 1] with itself.
+
+    Args:
+        s: Row-index tensor.
+        base: Offset of the first element in s.
+        n: Number of elements, a multiple of 32.
+
+    Returns:
+        Nonzero if this lane found a decreasing pair.
+    """
     lane = cute.arch.lane_idx()
     bad = Int32(0)
     for k in cutlass.range_constexpr(n // 32):
@@ -79,10 +101,21 @@ def mask_r2p_ranges(
     lo1_open: cutlass.Constexpr[bool],
     hi2_open: cutlass.Constexpr[bool],
 ) -> None:
-    # Same register-index layout as mask_r2p (tScS_t2r[i][1] == i): set X[c] = -inf for c in
-    # [lo1, hi1) or [lo2, hi2). An empty range (lo >= hi) masks nothing. lo1_open means
-    # lo1 = 0 and hi2_open means hi2 = ncol; those bounds are not built (the values passed
-    # for them are ignored).
+    """Set X[c] = -inf for c in [lo1, hi1) or [lo2, hi2).
+
+    Same register-index layout as mask_r2p (tScS_t2r[i][1] == i). An empty range
+    (lo >= hi) masks nothing.
+
+    Args:
+        X: Accumulator fragment, masked in place.
+        lo1: Start of the first range (ignored if lo1_open).
+        hi1: End of the first range.
+        lo2: Start of the second range (ignored unless two_ranges).
+        hi2: End of the second range (ignored if hi2_open).
+        two_ranges: Whether the second range is applied.
+        lo1_open: The first range starts at 0; lo1 is not built.
+        hi2_open: The second range ends at ncol; hi2 is not built.
+    """
     ncol = const_expr(cute.size(X.shape))
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
         # Shifts >= 32 give 0 (shl clamps), so (1 << n) - 1 is all ones past the chunk.
@@ -98,6 +131,30 @@ def mask_r2p_ranges(
             masked = cutlass.Boolean(mask & (1 << i))
             c = s * 24 + i
             X[c] = -Float32.inf if masked else X[c]
+
+
+@cute.jit
+def mask_cols_ge(
+    acc_S: cute.Tensor,
+    tScS_t2r: cute.Tensor,
+    col_limit: Int32,
+    ncol: cutlass.Constexpr[int],
+    r2p: cutlass.Constexpr[bool],
+) -> None:
+    """Set acc_S to -inf for every column >= col_limit.
+
+    Args:
+        acc_S: Score fragment, masked in place.
+        tScS_t2r: Coordinates of acc_S; [i][1] is the column of element i.
+        col_limit: First masked column.
+        ncol: Number of elements in acc_S.
+        r2p: Use the R2P bit-mask path (requires tScS_t2r[i][1] == i).
+    """
+    if const_expr(not r2p):
+        for i in cutlass.range(ncol, unroll_full=True):
+            acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit else acc_S[i]
+    else:
+        mask_r2p(acc_S, col_limit, arch=100, rank1=True)
 
 
 @cute.jit
@@ -388,19 +445,11 @@ class AttentionMask:
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 ncol = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(causal_active is None):
-                    if const_expr(not r2p):
-                        for i in cutlass.range(ncol, unroll_full=True):
-                            acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
-                    else:
-                        mask_r2p(acc_S, col_limit_right, arch=100, rank1=True)
+                    mask_cols_ge(acc_S, tScS_t2r, col_limit_right, ncol, r2p)
                 elif causal_active:
                     # fm_one_softmax: the caller runs one softmax_step instance for every block and only
                     # the causal diagonal / seqlen_k edge blocks need this pass.
-                    if const_expr(not r2p):
-                        for i in cutlass.range(ncol, unroll_full=True):
-                            acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
-                    else:
-                        mask_r2p(acc_S, col_limit_right, arch=100, rank1=True)
+                    mask_cols_ge(acc_S, tScS_t2r, col_limit_right, ncol, r2p)
             else:
                 local_row_offset_right = (
                     causal_row_offset + self.window_size_right

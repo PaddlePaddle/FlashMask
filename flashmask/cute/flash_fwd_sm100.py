@@ -2737,25 +2737,43 @@ class FlashAttentionForwardSm100:
                                         flashmask_info,
                                         mbar_ptr,
                                     )
-                                    n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                    n_block = self.n_block_getter(
+                                        s_n_block_cur_stage,
+                                        s_extra_flags_cur_stage,
+                                        n_block_idx,
+                                    )
                                     n_block_idx += 1
 
                                 if n_block == Int32(self.generate_block_incomplete):
-                                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
+                                    cute.arch.mbarrier_arrive(
+                                        mbar_ptr
+                                        + self.mbar_generate_block_empty_offset
+                                        + generate_block_consumer_state.index,
+                                    )
                                     generate_block_consumer_state.advance()
 
-                                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_generate_block_full_offset + generate_block_consumer_state.index, generate_block_consumer_state.phase)
+                                    cute.arch.mbarrier_wait(
+                                        mbar_ptr
+                                        + self.mbar_generate_block_full_offset
+                                        + generate_block_consumer_state.index,
+                                        generate_block_consumer_state.phase,
+                                    )
 
                                     s_n_block_cur_stage = cute.make_tensor(
-                                                              s_n_block.iterator + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
-                                                              cute.make_layout(self.generate_block_buffer_block_count),
-                                                          )
+                                        s_n_block.iterator
+                                        + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
+                                        cute.make_layout(self.generate_block_buffer_block_count),
+                                    )
                                     s_extra_flags_cur_stage = cute.make_tensor(
-                                                                  s_extra_flags.iterator + generate_block_consumer_state.index,
-                                                                  cute.make_layout(1),
-                                                              )
+                                        s_extra_flags.iterator + generate_block_consumer_state.index,
+                                        cute.make_layout(1),
+                                    )
                                     n_block_idx = 0
-                                    n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                    n_block = self.n_block_getter(
+                                        s_n_block_cur_stage,
+                                        s_extra_flags_cur_stage,
+                                        n_block_idx,
+                                    )
                                     n_block_idx += 1
                         else:
                             if const_expr(self.enable_overlap):
@@ -2772,7 +2790,8 @@ class FlashAttentionForwardSm100:
                             if const_expr(not self.use_s_ping_pong):
                                 load_V(block=n_block_first, producer_state=kv_producer_state)  # V0
                                 kv_producer_state.advance()
-                            # TODO: two possible optimization: 1.reuse kv_producer_state 2.skip load when not partially masked
+                            # TODO: two possible optimization: 1.reuse kv_producer_state
+                            # 2.skip load when not partially masked
 
                             load_startend_row_indices_producer_state = self.load_startend_row_indices(
                                 batch_idx,
@@ -2813,25 +2832,43 @@ class FlashAttentionForwardSm100:
                                         mbar_ptr,
                                     )
 
-                                    n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                    n_block = self.n_block_getter(
+                                        s_n_block_cur_stage,
+                                        s_extra_flags_cur_stage,
+                                        n_block_idx,
+                                    )
                                     n_block_idx += 1
 
                                 if n_block == Int32(self.generate_block_incomplete):
-                                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
+                                    cute.arch.mbarrier_arrive(
+                                        mbar_ptr
+                                        + self.mbar_generate_block_empty_offset
+                                        + generate_block_consumer_state.index,
+                                    )
                                     generate_block_consumer_state.advance()
 
-                                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_generate_block_full_offset + generate_block_consumer_state.index, generate_block_consumer_state.phase)
+                                    cute.arch.mbarrier_wait(
+                                        mbar_ptr
+                                        + self.mbar_generate_block_full_offset
+                                        + generate_block_consumer_state.index,
+                                        generate_block_consumer_state.phase,
+                                    )
 
                                     s_n_block_cur_stage = cute.make_tensor(
-                                                              s_n_block.iterator + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
-                                                              cute.make_layout(self.generate_block_buffer_block_count),
-                                                          )
+                                        s_n_block.iterator
+                                        + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
+                                        cute.make_layout(self.generate_block_buffer_block_count),
+                                    )
                                     s_extra_flags_cur_stage = cute.make_tensor(
-                                                                  s_extra_flags.iterator + generate_block_consumer_state.index,
-                                                                  cute.make_layout(1),
-                                                              )
+                                        s_extra_flags.iterator + generate_block_consumer_state.index,
+                                        cute.make_layout(1),
+                                    )
                                     n_block_idx = 0
-                                    n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                    n_block = self.n_block_getter(
+                                        s_n_block_cur_stage,
+                                        s_extra_flags_cur_stage,
+                                        n_block_idx,
+                                    )
                                     n_block_idx += 1
 
                         if const_expr(self.use_s_ping_pong):
@@ -3072,6 +3109,9 @@ class FlashAttentionForwardSm100:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
                 block_iter_count = n_block_max - n_block_min
                 if const_expr(not self.is_split_kv):
+                    # A query block without any KV block still runs one fully masked block
+                    # (load and softmax do), so the S ping-pong slot numbering counts it.
+                    block_iter_count = cutlass.max(block_iter_count, Int32(1))
                     process_tile = True
                 else:
                     process_tile = n_block_min < n_block_max
@@ -3228,7 +3268,6 @@ class FlashAttentionForwardSm100:
                             # Don't need to wait for the softmax warp to have finished reading the previous
                             # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                             # has been read and Pi has been written.
-                            # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
                             sK_cur = sK[None, None, None, Ki_index]
                             if const_expr(self.uneven_kv_smem):
                                 sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -3317,7 +3356,15 @@ class FlashAttentionForwardSm100:
         sK_cur: cute.Tensor,
         block_count: Int32,
     ):
-        """S ping-pong: issue QK for global block `block_count` into S slot block_count & 1."""
+        """S ping-pong: issue QK for global block `block_count` into S slot block_count & 1.
+
+        Args:
+            gemm_S_pp: QK gemm callables, one per S slot (only [0] with fm_one_softmax).
+            mbar_ptr: Base of the CTA's mbarrier array.
+            tSrKi: K operand fragment of this block.
+            sK_cur: K smem stage of this block.
+            block_count: Global block counter across work tiles.
+        """
         if const_expr(self.fm_one_softmax):
             slot = block_count & 1
             gemm_S_pp[0](
@@ -3347,7 +3394,17 @@ class FlashAttentionForwardSm100:
         O_should_accumulate,
         block_count: Int32,
     ):
-        """S ping-pong: issue PV for global block `block_count` from P slot block_count & 1."""
+        """S ping-pong: issue PV for global block `block_count` from P slot block_count & 1.
+
+        Args:
+            gemm_P_pp: PV gemm callables per P slot; with fm_one_softmax, (gemm, P slot 0
+                address, P slot 1 address).
+            mbar_ptr: Base of the CTA's mbarrier array.
+            tOrVi: V operand fragment of this block.
+            sV_cur: V smem stage of this block.
+            O_should_accumulate: Accumulate into O instead of overwriting it.
+            block_count: Global block counter across work tiles.
+        """
         pv_phase = (block_count >> 1) & 1
         if const_expr(self.fm_one_softmax):
             slot = block_count & 1
@@ -3515,6 +3572,8 @@ class FlashAttentionForwardSm100:
                 "address sP by its natural MMA A coordinate instead"
             )
             thr_tmem_store = None
+            # use_s_ping_pong excludes folded_acc, so there is no second P slot here.
+            tStP_r2t_1 = None
             sP_logical = cute.make_tensor(
                 sP.iterator,
                 # Same MODE STRUCTURE as tStSi (((m, n_folded), 1, 1)), because the tiled copy
@@ -3705,15 +3764,24 @@ class FlashAttentionForwardSm100:
                             n_block = n_block_first
                             while n_block >= n_block_min or n_block == Int32(self.generate_block_incomplete):
                                 while n_block >= n_block_min:
-                                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = softmax_step(
+                                    (
+                                        mma_si_consumer_phase,
+                                        si_corr_producer_phase,
+                                        s0_s1_sequence_phase,
+                                        load_startend_row_indices_consumer_state,
+                                    ) = softmax_step(
                                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
                                         mask_fn=partial(
                                             mask_fn,
                                             mask_seqlen=True,
-                                            load_startend_row_indices_consumer_state=load_startend_row_indices_consumer_state,
+                                            load_startend_row_indices_consumer_state=(
+                                                load_startend_row_indices_consumer_state
+                                            ),
                                             n_block_idx=n_block_idx,
                                             encode_n_block=self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx),
-                                            causal_active=n_block >= n_block_min_causal_local_mask or n_block == n_block_last,
+                                            causal_active=(
+                                                n_block >= n_block_min_causal_local_mask or n_block == n_block_last
+                                            ),
                                         ),
                                     )
                                     n_block_idx += 1
@@ -3734,7 +3802,12 @@ class FlashAttentionForwardSm100:
                                     n_block_idx = 0
                                     n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
                         else:
-                            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = softmax_step(
+                            (
+                                mma_si_consumer_phase,
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
+                                load_startend_row_indices_consumer_state,
+                            ) = softmax_step(
                                 mma_si_consumer_phase,
                                 si_corr_producer_phase,
                                 s0_s1_sequence_phase,
@@ -3756,12 +3829,24 @@ class FlashAttentionForwardSm100:
                                 n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                                     seqlen, m_block, n_block_min
                                 )
-                                # advance n_block_idx right before a n_block_getter call, so n_block_idx is reserved for mask_fn (to check whether a block is fully masked)
+                                # advance n_block_idx right before a n_block_getter
+                                # call, so n_block_idx is reserved for mask_fn (to
+                                # check whether a block is fully masked)
                                 n_block_idx += 1
                                 n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
-                                while n_block >= n_block_max - 1 - (n_block_max - n_block_min_causal_local_mask - 1) or n_block == Int32(self.generate_block_incomplete):
-                                    while n_block >= n_block_max - 1 - (n_block_max - n_block_min_causal_local_mask - 1):
-                                        mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = (
+                                while (
+                                    n_block >= n_block_max - 1 - (n_block_max - n_block_min_causal_local_mask - 1)
+                                    or n_block == Int32(self.generate_block_incomplete)
+                                ):
+                                    while (
+                                        n_block >= n_block_max - 1 - (n_block_max - n_block_min_causal_local_mask - 1)
+                                    ):
+                                        (
+                                            mma_si_consumer_phase,
+                                            si_corr_producer_phase,
+                                            s0_s1_sequence_phase,
+                                            load_startend_row_indices_consumer_state,
+                                        ) = (
                                             softmax_step(
                                                 mma_si_consumer_phase,
                                                 si_corr_producer_phase,
@@ -3770,29 +3855,54 @@ class FlashAttentionForwardSm100:
                                                 mask_fn=partial(
                                                     mask_fn,
                                                     mask_seqlen=False,
-                                                    load_startend_row_indices_consumer_state=load_startend_row_indices_consumer_state,
+                                                    load_startend_row_indices_consumer_state=(
+                                                        load_startend_row_indices_consumer_state
+                                                    ),
                                                     n_block_idx=n_block_idx,
-                                                    encode_n_block=self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx)
+                                                    encode_n_block=(
+                                                        self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx)
+                                                    )
                                                 ),
                                             )
                                         )
                                         n_block_idx += 1
-                                        n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                        n_block = self.n_block_getter(
+                                            s_n_block_cur_stage,
+                                            s_extra_flags_cur_stage,
+                                            n_block_idx,
+                                        )
 
                                     if n_block == Int32(self.generate_block_incomplete):
-                                        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
+                                        cute.arch.mbarrier_arrive(
+                                            mbar_ptr
+                                            + self.mbar_generate_block_empty_offset
+                                            + generate_block_consumer_state.index,
+                                        )
                                         generate_block_consumer_state.advance()
-                                        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_generate_block_full_offset + generate_block_consumer_state.index, generate_block_consumer_state.phase)
+                                        cute.arch.mbarrier_wait(
+                                            mbar_ptr
+                                            + self.mbar_generate_block_full_offset
+                                            + generate_block_consumer_state.index,
+                                            generate_block_consumer_state.phase,
+                                        )
                                         s_n_block_cur_stage = cute.make_tensor(
-                                                                  s_n_block.iterator + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
-                                                                  cute.make_layout(self.generate_block_buffer_block_count),
-                                                              )
+                                            s_n_block.iterator
+                                            + (
+                                                generate_block_consumer_state.index
+                                                * self.generate_block_buffer_block_count
+                                            ),
+                                            cute.make_layout(self.generate_block_buffer_block_count),
+                                        )
                                         s_extra_flags_cur_stage = cute.make_tensor(
-                                                                      s_extra_flags.iterator + generate_block_consumer_state.index,
-                                                                      cute.make_layout(1),
-                                                                  )
+                                            s_extra_flags.iterator + generate_block_consumer_state.index,
+                                            cute.make_layout(1),
+                                        )
                                         n_block_idx = 0
-                                        n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                        n_block = self.n_block_getter(
+                                            s_n_block_cur_stage,
+                                            s_extra_flags_cur_stage,
+                                            n_block_idx,
+                                        )
 
                                 n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
                             else:
@@ -3804,9 +3914,17 @@ class FlashAttentionForwardSm100:
                                 seqlen, m_block, n_block_min
                             )
 
-                            while n_block >= n_block_max - (n_block_max - n_block_min_before_local_mask - 1) - 1 or n_block == Int32(self.generate_block_incomplete):
+                            while (
+                                n_block >= n_block_max - (n_block_max - n_block_min_before_local_mask - 1) - 1
+                                or n_block == Int32(self.generate_block_incomplete)
+                            ):
                                 while n_block >= n_block_max - (n_block_max - n_block_min_before_local_mask - 1) - 1:
-                                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = softmax_step(
+                                    (
+                                        mma_si_consumer_phase,
+                                        si_corr_producer_phase,
+                                        s0_s1_sequence_phase,
+                                        load_startend_row_indices_consumer_state,
+                                    ) = softmax_step(
                                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
                                         # These blocks lie entirely inside the causal / local band, so only
                                         # the flashmask part of mask_fn applies (the non-flashmask path below
@@ -3818,7 +3936,9 @@ class FlashAttentionForwardSm100:
                                             mask_seqlen=False,
                                             mask_causal=False,
                                             mask_local=False,
-                                            load_startend_row_indices_consumer_state=load_startend_row_indices_consumer_state,
+                                            load_startend_row_indices_consumer_state=(
+                                                load_startend_row_indices_consumer_state
+                                            ),
                                             n_block_idx=n_block_idx,
                                             encode_n_block=self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx)
                                         ),
@@ -3845,9 +3965,17 @@ class FlashAttentionForwardSm100:
                             # Separate iterations with local masking on the left
                             if const_expr(self.is_local and block_info.window_size_left is not None):
                                 n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
-                                while n_block >= n_block_max - 1 - (n_block_max - n_block_min - 1) or n_block == Int32(self.generate_block_incomplete):
+                                while (
+                                    n_block >= n_block_max - 1 - (n_block_max - n_block_min - 1)
+                                    or n_block == Int32(self.generate_block_incomplete)
+                                ):
                                     while n_block >= n_block_max - 1 - (n_block_max - n_block_min - 1):
-                                        mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, load_startend_row_indices_consumer_state = (
+                                        (
+                                            mma_si_consumer_phase,
+                                            si_corr_producer_phase,
+                                            s0_s1_sequence_phase,
+                                            load_startend_row_indices_consumer_state,
+                                        ) = (
                                             softmax_step(
                                                 mma_si_consumer_phase,
                                                 si_corr_producer_phase,
@@ -3856,30 +3984,57 @@ class FlashAttentionForwardSm100:
                                                 mask_fn=partial(
                                                     mask_fn,
                                                     mask_seqlen=False,
-                                                    load_startend_row_indices_consumer_state=load_startend_row_indices_consumer_state,
+                                                    load_startend_row_indices_consumer_state=(
+                                                        load_startend_row_indices_consumer_state
+                                                    ),
                                                     n_block_idx=n_block_idx,
-                                                    encode_n_block=self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx)
+                                                    encode_n_block=(
+                                                        self.mask_n_block_getter(s_n_block_cur_stage, n_block_idx)
+                                                    )
                                                 ),
                                             )
                                         )
                                         n_block_idx += 1
-                                        n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
-                                        # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
+                                        n_block = self.n_block_getter(
+                                            s_n_block_cur_stage,
+                                            s_extra_flags_cur_stage,
+                                            n_block_idx,
+                                        )
+                                        # Now that we no longer already have
+                                        # the 1st iteration, need
+                                        # mask_seqlen=True here
 
                                     if n_block == Int32(self.generate_block_incomplete):
-                                        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
+                                        cute.arch.mbarrier_arrive(
+                                            mbar_ptr
+                                            + self.mbar_generate_block_empty_offset
+                                            + generate_block_consumer_state.index,
+                                        )
                                         generate_block_consumer_state.advance()
-                                        cute.arch.mbarrier_wait(mbar_ptr + self.mbar_generate_block_full_offset + generate_block_consumer_state.index, generate_block_consumer_state.phase)
+                                        cute.arch.mbarrier_wait(
+                                            mbar_ptr
+                                            + self.mbar_generate_block_full_offset
+                                            + generate_block_consumer_state.index,
+                                            generate_block_consumer_state.phase,
+                                        )
                                         s_n_block_cur_stage = cute.make_tensor(
-                                                                  s_n_block.iterator + generate_block_consumer_state.index * self.generate_block_buffer_block_count,
-                                                                  cute.make_layout(self.generate_block_buffer_block_count),
-                                                              )
+                                            s_n_block.iterator
+                                            + (
+                                                generate_block_consumer_state.index
+                                                * self.generate_block_buffer_block_count
+                                            ),
+                                            cute.make_layout(self.generate_block_buffer_block_count),
+                                        )
                                         s_extra_flags_cur_stage = cute.make_tensor(
-                                                                      s_extra_flags.iterator + generate_block_consumer_state.index,
-                                                                      cute.make_layout(1),
-                                                                  )
+                                            s_extra_flags.iterator + generate_block_consumer_state.index,
+                                            cute.make_layout(1),
+                                        )
                                         n_block_idx = 0
-                                        n_block = self.n_block_getter(s_n_block_cur_stage, s_extra_flags_cur_stage, n_block_idx)
+                                        n_block = self.n_block_getter(
+                                            s_n_block_cur_stage,
+                                            s_extra_flags_cur_stage,
+                                            n_block_idx,
+                                        )
 
                         # TODO: softmax.reset() will deal with tile that all blocks of which are skipped.
                         # Dense path always writes scale / signals
@@ -4352,7 +4507,12 @@ class FlashAttentionForwardSm100:
             next_mma_si = mma_si_consumer_phase + 1  # next global block
         else:
             next_mma_si = mma_si_consumer_phase ^ 1
-        return (next_mma_si, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1, load_startend_row_indices_consumer_state)
+        return (
+            next_mma_si,
+            si_corr_producer_phase ^ 1,
+            s0_s1_sequence_phase ^ 1,
+            load_startend_row_indices_consumer_state,
+        )
 
     @cute.jit
     def correction_loop(
@@ -4464,6 +4624,9 @@ class FlashAttentionForwardSm100:
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min
+                if const_expr(not self.is_split_kv):
+                    # Same as the MMA warp: an empty KV range still runs one fully masked block.
+                    total_block_count = cutlass.max(total_block_count, Int32(1))
                 has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:

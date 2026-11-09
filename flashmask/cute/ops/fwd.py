@@ -371,11 +371,17 @@ def _flash_attn_fwd(
         # On SM100 a query block without any KV block skips its O store, so O keeps the
         # zero-fill, except at d == dv == 256: with flashmask the kernel writes those tiles'
         # zeros itself (zero_empty_o_tiles), and without flashmask every query block has a
-        # KV block unless causal leaves rows past seqlen_k empty.
+        # KV block unless causal leaves rows past seqlen_k empty or a local window is set.
+        # window_size_* is only normalized into causal/local further below, so derive both here.
+        fwd_causal = causal or (window_size_left is None and window_size_right == 0)
+        fwd_local = not fwd_causal and (window_size_left is not None or window_size_right is not None)
         o_fully_written = compute_capability == 9 or (
             head_dim == 256
             and head_dim_v == 256
-            and (startend_row_indices is not None or not causal or seqlen_q <= seqlen_k)
+            and (
+                startend_row_indices is not None
+                or (not fwd_local and (not fwd_causal or seqlen_q <= seqlen_k))
+            )
         )
         out = (be.empty if o_fully_written else be.zeros)(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_framework_dtype
@@ -500,7 +506,7 @@ def _flash_attn_fwd(
         # instead of letting the kernel assert. GQA/MQA stays correct via qhead_per_kvhead,
         # just without the packing optimization (which only pays off when seqlen_q per head
         # is too small to fill the M tile, i.e. decode).
-        if is_bigd_fwd or use_hd256_2cta:
+        if is_bigd_fwd or use_hd256_2cta or (head_dim > 192 and head_dim == head_dim_v):
             pack_gqa = False
         # Single q-stage (q_stage=1) for d=dv=256, and for the head_dim=576 per-pass
         # config: both need q_stage=1 so O (head_dim_v cols) fits alongside S/P in the
@@ -657,11 +663,18 @@ def _flash_attn_fwd(
     # configs it schedules persistently; passing it is harmless otherwise.
     sched_counter_tensor = None
     if compute_capability == 10:
-        sched_key = (str(be.device_of(q)), be.cuda_stream())
-        sched_counter = _flash_attn_fwd.sched_counters.get(sched_key)
-        if sched_counter is None:
+        if be.is_stream_capturing():
+            # Graphs captured on one stream may be replayed concurrently on different
+            # streams, so each captured launch gets its own counter. The list keeps it alive
+            # for as long as the graph may replay it.
             sched_counter = be.zeros([2], dtype=be.int32)
-            _flash_attn_fwd.sched_counters[sched_key] = sched_counter
+            _flash_attn_fwd.sched_counters_captured.append(sched_counter)
+        else:
+            sched_key = (str(be.device_of(q)), be.cuda_stream())
+            sched_counter = _flash_attn_fwd.sched_counters.get(sched_key)
+            if sched_counter is None:
+                sched_counter = be.zeros([2], dtype=be.int32)
+                _flash_attn_fwd.sched_counters[sched_key] = sched_counter
         sched_counter_tensor = from_dlpack(sched_counter, assumed_align=4)
 
     compile_key = (
@@ -829,3 +842,4 @@ def _flash_attn_fwd(
 
 _flash_attn_fwd.compile_cache = {}
 _flash_attn_fwd.sched_counters = {}
+_flash_attn_fwd.sched_counters_captured = []
