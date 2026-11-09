@@ -662,3 +662,216 @@ class SingleTileLPTBwdScheduler:
             values = values[n_items:]
         return self.__class__(*(tuple(obj_list)), loc=self._loc)
 
+
+
+class DynamicPersistentTileScheduler:
+    """Persistent scheduler with dynamic (atomic-ticket) work distribution.
+
+    One CTA per SM; the first tile of a CTA is ``blockIdx.x``, every further tile is drawn
+    from a global ticket counter (``atomicAdd + gridDim.x``), so a CTA that finishes a light
+    tile early simply takes the next one (no static round-robin imbalance).
+
+    Only the *producer* warp (``is_producer=True``) draws tickets. It publishes each ticket
+    through a small smem ring (``sched_tile[ring_stages]`` + full/empty mbarriers); every
+    other warp of the CTA reads the same sequence from the ring. ``full`` expects one arrive
+    (producer lane 0), ``empty`` one arrive per consumer thread. Each warp role must call
+    ``advance_to_next_work`` exactly once per tile, including the last one, which returns the
+    invalid sentinel (``tile_idx >= total_blocks``).
+
+    Ticket -> tile: (batch, head)-major so the CTAs in flight share K/V in L2, and inside a
+    (batch, head) the m_blocks go from the last to the first (longest-processing-time first
+    for causal-like masks). The counter (``counter[0]``) and a finished-CTA count
+    (``counter[1]``) are reset by the last CTA to draw its final ticket, so the buffer is
+    reusable by the next launch on the stream without a host-side memset.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block: Int32
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        total_blocks: Int32
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "DynamicPersistentTileScheduler.Params":
+            total_blocks = args.num_block * args.num_head * args.num_batch
+            return DynamicPersistentTileScheduler.Params(
+                args.num_block,
+                FastDivmodDivisor(args.num_block),
+                FastDivmodDivisor(args.num_head),
+                total_blocks,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        ring_idx: Int32,
+        ring_phase: Int32,
+        sched_tile: cute.Tensor,
+        sched_mbar: cute.Pointer,
+        counter: cute.Tensor,
+        ring_stages: int,
+        num_consumer_threads: int,
+        is_producer: bool,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._ring_idx = ring_idx
+        self._ring_phase = ring_phase
+        self._sched_tile = sched_tile
+        self._sched_mbar = sched_mbar
+        self._counter = counter
+        self._ring_stages = ring_stages
+        self._num_consumer_threads = num_consumer_threads
+        self._is_producer = is_producer
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return DynamicPersistentTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(
+        params: Params,
+        sched_tile: cute.Tensor = None,
+        sched_mbar: cute.Pointer = None,
+        counter: cute.Tensor = None,
+        ring_stages: int = 4,
+        num_consumer_threads: int = 0,
+        is_producer: bool = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "DynamicPersistentTileScheduler":
+        return DynamicPersistentTileScheduler(
+            params,
+            Int32(cute.arch.block_idx()[0]),
+            Int32(0),
+            Int32(0),
+            sched_tile,
+            sched_mbar,
+            counter,
+            ring_stages,
+            num_consumer_threads,
+            is_producer,
+            loc=loc,
+            ip=ip,
+        )
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
+        sm_count = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
+        return (cutlass.min(sm_count, params.total_blocks), Int32(1), Int32(1))
+
+    @staticmethod
+    def init_barriers(sched_mbar: cute.Pointer, ring_stages: int, num_consumer_threads: int):
+        """Called by one warp before the CTA-wide barrier-init sync."""
+        for i in range(ring_stages):  # plain helper (not @cute.jit): Python-unrolled
+            cute.arch.mbarrier_init(sched_mbar + i, 1)
+            cute.arch.mbarrier_init(sched_mbar + ring_stages + i, num_consumer_threads)
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        bh_idx, block_rev = divmod(self._tile_idx, self.params.num_block_divmod)
+        batch_idx, head_idx = divmod(bh_idx, self.params.num_head_divmod)
+        block_idx = self.params.num_block - 1 - block_rev
+        is_valid = self._tile_idx < self.params.total_blocks
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    @cute.jit
+    def _producer_next(self) -> Int32:
+        """Producer warp: draw the next ticket and publish it in the ring."""
+        full = self._sched_mbar + self._ring_idx
+        empty = self._sched_mbar + self._ring_stages + self._ring_idx
+        # Slot free once every consumer thread has read the ticket published there
+        # ring_stages tiles ago (phase starts at 1 so the first lap passes).
+        cute.arch.mbarrier_wait(empty, self._ring_phase ^ 1)
+        lane = cute.arch.lane_idx()
+        ticket = Int32(0)
+        if lane == 0:
+            ticket = (
+                cute.arch.atomic_add(self._counter.iterator, Int32(1), sem="relaxed", scope="gpu")
+                + cute.arch.grid_dim()[0]
+            )
+            self._sched_tile[self._ring_idx] = ticket
+            if ticket >= self.params.total_blocks:
+                # This CTA drew its last ticket. The last CTA to get here resets the
+                # counters for the next launch: every other CTA has already drawn its
+                # final ticket, so no further atomic touches counter[0].
+                done = cute.arch.atomic_add(
+                    self._counter.iterator + 1, Int32(1), sem="acq_rel", scope="gpu"
+                )
+                if done == cute.arch.grid_dim()[0] - 1:
+                    self._counter[0] = Int32(0)
+                    self._counter[1] = Int32(0)
+            # mbarrier.arrive has release semantics: the ticket store is visible to the
+            # consumers that observe the phase flip.
+            cute.arch.mbarrier_arrive(full)
+        ticket = cute.arch.shuffle_sync(ticket, 0)
+        return ticket
+
+    @cute.jit
+    def _consumer_next(self) -> Int32:
+        full = self._sched_mbar + self._ring_idx
+        empty = self._sched_mbar + self._ring_stages + self._ring_idx
+        cute.arch.mbarrier_wait(full, self._ring_phase)
+        ticket = self._sched_tile[self._ring_idx]
+        cute.arch.mbarrier_arrive(empty)
+        return ticket
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        if const_expr(self._is_producer):
+            ticket = self._producer_next()
+        else:
+            ticket = self._consumer_next()
+        self._tile_idx = ticket
+        # Plain arithmetic (no dynamic `if`): attributes of self cannot be carried out of an
+        # scf.if region.
+        next_idx = (self._ring_idx + 1) % self._ring_stages
+        self._ring_phase = self._ring_phase ^ Int32(next_idx == 0)
+        self._ring_idx = next_idx
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self.params, self._tile_idx, self._ring_idx, self._ring_phase,
+            self._sched_tile, self._sched_mbar, self._counter,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self.params, self._tile_idx, self._ring_idx, self._ring_phase,
+                self._sched_tile, self._sched_mbar, self._counter,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return DynamicPersistentTileScheduler(
+            *obj_list,
+            self._ring_stages,
+            self._num_consumer_threads,
+            self._is_producer,
+            loc=self._loc,
+        )
