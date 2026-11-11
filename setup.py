@@ -152,7 +152,7 @@ def _ensure_deps(deps):
     #   only exists once the DSL package is present.
     #   apache-tvm-ffi installs `tvm_ffi`, not `tvm.ffi`.
     _IMPORT_MAP = {
-        'nvidia-cutlass': 'cutlass',
+        'nvidia-cutlass': 'cutlass_library',
         'nvidia-cutlass-dsl': 'cutlass.base_dsl',
         'apache-tvm-ffi': 'tvm_ffi',
         'typing_extensions': 'typing_extensions',
