@@ -44,6 +44,120 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
 
 
 @cute.jit
+def flashmask_count_le(s: cute.Tensor, base: Int32, n: cutlass.Constexpr[int], row: Int32) -> Int32:
+    """Count the c in [0, n) with s[base + c] <= row, for s non-decreasing over c.
+
+    Branchless lower bound: the steps sum to n - 1, the last probe adds the final 1.
+
+    Args:
+        s: Row-index tensor, non-decreasing over [base, base + n).
+        base: Offset of the first element in s.
+        n: Number of elements, a power of 2.
+        row: Row index to compare against.
+
+    Returns:
+        The number of elements <= row.
+    """
+    pos = Int32(0)
+    for k in cutlass.range_constexpr(n.bit_length() - 1):
+        step = const_expr(n >> (k + 1))
+        pos = pos + step if s[base + pos + step - 1] <= row else pos
+    pos = pos + 1 if s[base + pos] <= row else pos
+    return pos
+
+
+@cute.jit
+def flashmask_warp_not_monotone(s: cute.Tensor, base: Int32, n: cutlass.Constexpr[int]) -> Int32:
+    """Check whether s[base + c] decreases anywhere over c in [0, n), per lane.
+
+    Each lane checks the pairs (c, c + 1) for c = lane, lane + 32, ...; the last pair
+    compares s[n - 1] with itself.
+
+    Args:
+        s: Row-index tensor.
+        base: Offset of the first element in s.
+        n: Number of elements, a multiple of 32.
+
+    Returns:
+        Nonzero if this lane found a decreasing pair.
+    """
+    lane = cute.arch.lane_idx()
+    bad = Int32(0)
+    for k in cutlass.range_constexpr(n // 32):
+        c = lane + k * 32
+        nxt = cutlass.min(c + 1, n - 1)
+        bad = bad + 1 if s[base + c] > s[base + nxt] else bad
+    return bad
+
+
+@cute.jit
+def mask_r2p_ranges(
+    X: cute.Tensor,
+    lo1: Int32,
+    hi1: Int32,
+    lo2: Int32,
+    hi2: Int32,
+    two_ranges: cutlass.Constexpr[bool],
+    lo1_open: cutlass.Constexpr[bool],
+    hi2_open: cutlass.Constexpr[bool],
+) -> None:
+    """Set X[c] = -inf for c in [lo1, hi1) or [lo2, hi2).
+
+    Same register-index layout as mask_r2p (tScS_t2r[i][1] == i). An empty range
+    (lo >= hi) masks nothing.
+
+    Args:
+        X: Accumulator fragment, masked in place.
+        lo1: Start of the first range (ignored if lo1_open).
+        hi1: End of the first range.
+        lo2: Start of the second range (ignored unless two_ranges).
+        hi2: End of the second range (ignored if hi2_open).
+        two_ranges: Whether the second range is applied.
+        lo1_open: The first range starts at 0; lo1 is not built.
+        hi2_open: The second range ends at ncol; hi2 is not built.
+    """
+    ncol = const_expr(cute.size(X.shape))
+    for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
+        # Shifts >= 32 give 0 (shl clamps), so (1 << n) - 1 is all ones past the chunk.
+        mask = (1 << max(hi1 - s * 24, 0)) - 1
+        if const_expr(not lo1_open):
+            mask = mask & (((1 << max(lo1 - s * 24, 0)) - 1) ^ -1)
+        if const_expr(two_ranges):
+            mask2 = ((1 << max(lo2 - s * 24, 0)) - 1) ^ -1
+            if const_expr(not hi2_open):
+                mask2 = mask2 & ((1 << max(hi2 - s * 24, 0)) - 1)
+            mask = mask | mask2
+        for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
+            masked = cutlass.Boolean(mask & (1 << i))
+            c = s * 24 + i
+            X[c] = -Float32.inf if masked else X[c]
+
+
+@cute.jit
+def mask_cols_ge(
+    acc_S: cute.Tensor,
+    tScS_t2r: cute.Tensor,
+    col_limit: Int32,
+    ncol: cutlass.Constexpr[int],
+    r2p: cutlass.Constexpr[bool],
+) -> None:
+    """Set acc_S to -inf for every column >= col_limit.
+
+    Args:
+        acc_S: Score fragment, masked in place.
+        tScS_t2r: Coordinates of acc_S; [i][1] is the column of element i.
+        col_limit: First masked column.
+        ncol: Number of elements in acc_S.
+        r2p: Use the R2P bit-mask path (requires tScS_t2r[i][1] == i).
+    """
+    if const_expr(not r2p):
+        for i in cutlass.range(ncol, unroll_full=True):
+            acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit else acc_S[i]
+    else:
+        mask_r2p(acc_S, col_limit, arch=100, rank1=True)
+
+
+@cute.jit
 def mask_r2p_transposed(
     X: cute.Tensor, row_limit_top: Int32, num_rep: int, row_group_stride=None
 ) -> None:
@@ -284,6 +398,7 @@ class AttentionMask:
         encode_n_block: Int32 = None,
         generate_block_buffer_usable_block_count: Int32 = None,
         use_r2p: cutlass.Constexpr[bool] = True,
+        causal_active: Optional[cutlass.Boolean] = None,
     ) -> Optional[cutlass.pipeline.PipelineState]:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -306,7 +421,11 @@ class AttentionMask:
         r2p = const_expr(use_r2p)
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
-                if const_expr(not r2p):
+                if const_expr(causal_active is not None):
+                    # The caller gates the seqlen_k pass to the blocks that can need it.
+                    if causal_active:
+                        mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
+                elif const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         # if tScS_t2r[i][1] >= seqlenk_col_limit:
                         #     acc_S[i] = -Float32.inf
@@ -325,11 +444,12 @@ class AttentionMask:
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 ncol = const_expr(cute.size(tScS_t2r.shape))
-                if const_expr(not r2p):
-                    for i in cutlass.range(ncol, unroll_full=True):
-                        acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= col_limit_right else acc_S[i]
-                else:
-                    mask_r2p(acc_S, col_limit_right, arch=100, rank1=True)
+                if const_expr(causal_active is None):
+                    mask_cols_ge(acc_S, tScS_t2r, col_limit_right, ncol, r2p)
+                elif causal_active:
+                    # fm_one_softmax: the caller runs one softmax_step instance for every block and only
+                    # the causal diagonal / seqlen_k edge blocks need this pass.
+                    mask_cols_ge(acc_S, tScS_t2r, col_limit_right, ncol, r2p)
             else:
                 local_row_offset_right = (
                     causal_row_offset + self.window_size_right
@@ -374,36 +494,124 @@ class AttentionMask:
                 # fragment then lives in local memory and every access in softmax becomes
                 # an ld.local/st.local (measured: ~16KB of local traffic per KV tile).
                 nelem = const_expr(cute.size(tScS_t2r.shape))
-                if const_expr(has_ut_start):
-                    for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        uts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 2] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if (tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte) or (tScS_t2r[i][0] >= uts and tScS_t2r[i][0] < ute):
-                            acc_S[i] = -cutlass.Float32.inf
-                elif const_expr(has_lt_end):
-                    for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        lte = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts and tScS_t2r[i][0] < lte:
-                            acc_S[i] = -cutlass.Float32.inf
-                elif const_expr(has_ut_end):
-                    for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        ute = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1] + self.tile_n * 3] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts or tScS_t2r[i][0] < ute:
-                            acc_S[i] = -cutlass.Float32.inf
+                # Compare in global row space: row + m_block * tile_m against the raw
+                # bounds, instead of rebasing every loaded LTS/LTE/UTS/UTE by
+                # m_block * tile_m. Same integer inequality rearranged
+                # (row >= lts - off <=> row + off >= lts; Int32, no overflow for
+                # seqlen < 2^31), so the mask is bit-identical for every layout
+                # (any head dim, q_stage, 2-CTA, folded). Each element keeps its own row
+                # coordinate; where a thread owns one full S row (M=128 non-folded) those
+                # are all equal and the add folds to one per thread.
+                row_offset = m_block * self.tile_m
+                s_base = load_startend_row_indices_consumer_state.index * 4 * self.tile_n
+                # Where a thread owns one whole S row r (the R2P layout) and every bound is
+                # non-decreasing over the block's columns, {c: LTS[c] <= r} is a prefix
+                # [0, a) and {c: LTE[c] > r} a suffix [b, N), so the masked columns are the
+                # range [b, a) (UTS/UTE likewise). Binary-search the range ends in smem and
+                # mask with R2P instead of comparing every element; bit-identical result.
+                # Blocks whose bounds are not monotone take the per-element loop.
+                # Only with 2+ bounds: LTS alone is already one compare + select per element;
+                # there the monotone check only adds latency (B300 A/B: SW -2.6%, Share
+                # Question -5.6%, Causal Doc -1.9%), while GSW (4 bounds) gained 11%.
+                tn = const_expr(self.tile_n)
+                multi_bound = const_expr(any((has_ut_start, has_lt_end, has_ut_end)))
+                use_ranges = const_expr(
+                    all((
+                        r2p,
+                        nelem == tn,
+                        tn % 32 == 0,
+                        tn & (tn - 1) == 0,
+                        multi_bound,
+                    ))
+                )
+                if const_expr(use_ranges):
+                    s = s_startend_row_indices
+                    bad = flashmask_warp_not_monotone(s, s_base, tn)
+                    if const_expr(has_ut_start):
+                        bad = bad + flashmask_warp_not_monotone(s, s_base + tn, tn)
+                        bad = bad + flashmask_warp_not_monotone(s, s_base + tn * 2, tn)
+                        bad = bad + flashmask_warp_not_monotone(s, s_base + tn * 3, tn)
+                    elif const_expr(has_lt_end):
+                        bad = bad + flashmask_warp_not_monotone(s, s_base + tn, tn)
+                    elif const_expr(has_ut_end):
+                        bad = bad + flashmask_warp_not_monotone(s, s_base + tn * 3, tn)
+                    if cute.arch.vote_any_sync(bad != 0):
+                        self._apply_flashmask_elementwise(
+                            acc_S, tScS_t2r, s, s_base, row_offset,
+                            has_lt_end, has_ut_start, has_ut_end,
+                        )
+                    else:
+                        row_g = tScS_t2r[0][0] + row_offset
+                        a = flashmask_count_le(s, s_base, tn, row_g)
+                        if const_expr(has_ut_start):
+                            b = flashmask_count_le(s, s_base + tn, tn, row_g)
+                            a2 = flashmask_count_le(s, s_base + tn * 2, tn, row_g)
+                            b2 = flashmask_count_le(s, s_base + tn * 3, tn, row_g)
+                            mask_r2p_ranges(acc_S, b, a, b2, a2, True, False, False)
+                        elif const_expr(has_lt_end):
+                            b = flashmask_count_le(s, s_base + tn, tn, row_g)
+                            mask_r2p_ranges(acc_S, b, a, b, a, False, False, False)
+                        elif const_expr(has_ut_end):
+                            b2 = flashmask_count_le(s, s_base + tn * 3, tn, row_g)
+                            mask_r2p_ranges(acc_S, a, a, b2, b2, True, True, True)
+                        else:
+                            mask_r2p_ranges(acc_S, a, a, a, a, False, True, False)
                 else:
-                    for i in cutlass.range_constexpr(nelem):
-                        lts = s_startend_row_indices[load_startend_row_indices_consumer_state.index * 4 * self.tile_n + tScS_t2r[i][1]] - m_block * self.tile_m
-                        if tScS_t2r[i][0] >= lts:
-                            acc_S[i] = -cutlass.Float32.inf
+                    self._apply_flashmask_elementwise(
+                        acc_S, tScS_t2r, s_startend_row_indices, s_base, row_offset,
+                        has_lt_end, has_ut_start, has_ut_end,
+                    )
 
             cute.arch.mbarrier_arrive(
                 mbar_ptr + mbar_load_startend_row_indices_empty_offset + stage * kv_stage + load_startend_row_indices_consumer_state.index)
             load_startend_row_indices_consumer_state.advance()
         return load_startend_row_indices_consumer_state
+
+    @cute.jit
+    def _apply_flashmask_elementwise(
+        self,
+        acc_S: cute.Tensor,
+        tScS_t2r: cute.Tensor,
+        s_startend_row_indices: cute.Tensor,
+        s_base: Int32,
+        row_offset: Int32,
+        has_lt_end: cutlass.Constexpr[bool],
+        has_ut_start: cutlass.Constexpr[bool],
+        has_ut_end: cutlass.Constexpr[bool],
+    ) -> None:
+        nelem = const_expr(cute.size(tScS_t2r.shape))
+        if const_expr(has_ut_start):
+            for i in cutlass.range_constexpr(nelem):
+                row_g = tScS_t2r[i][0] + row_offset
+                col = tScS_t2r[i][1]
+                lts = s_startend_row_indices[s_base + col]
+                lte = s_startend_row_indices[s_base + col + self.tile_n]
+                uts = s_startend_row_indices[s_base + col + self.tile_n * 2]
+                ute = s_startend_row_indices[s_base + col + self.tile_n * 3]
+                if (row_g >= lts and row_g < lte) or (row_g >= uts and row_g < ute):
+                    acc_S[i] = -cutlass.Float32.inf
+        elif const_expr(has_lt_end):
+            for i in cutlass.range_constexpr(nelem):
+                row_g = tScS_t2r[i][0] + row_offset
+                col = tScS_t2r[i][1]
+                lts = s_startend_row_indices[s_base + col]
+                lte = s_startend_row_indices[s_base + col + self.tile_n]
+                if row_g >= lts and row_g < lte:
+                    acc_S[i] = -cutlass.Float32.inf
+        elif const_expr(has_ut_end):
+            for i in cutlass.range_constexpr(nelem):
+                row_g = tScS_t2r[i][0] + row_offset
+                col = tScS_t2r[i][1]
+                lts = s_startend_row_indices[s_base + col]
+                ute = s_startend_row_indices[s_base + col + self.tile_n * 3]
+                if row_g >= lts or row_g < ute:
+                    acc_S[i] = -cutlass.Float32.inf
+        else:
+            for i in cutlass.range_constexpr(nelem):
+                row_g = tScS_t2r[i][0] + row_offset
+                lts = s_startend_row_indices[s_base + tScS_t2r[i][1]]
+                if row_g >= lts:
+                    acc_S[i] = -cutlass.Float32.inf
 
     @cute.jit
     def apply_flashmask_sm90(

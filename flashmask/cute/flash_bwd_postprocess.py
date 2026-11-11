@@ -191,6 +191,29 @@ class FlashAttentionBackwardPostprocess:
             self.sdQ_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
             )
+            if const_expr(self.use_2cta_instrs):
+                # 2-CTA loads dQaccum straight into registers, so smem only backs sdQ. The
+                # allocator still sizes the buffer from sdQaccum_layout: make it a placeholder
+                # of sdQ's byte size instead of a full fp32 tile (which would cap occupancy
+                # at one CTA per SM).
+                self.sdQaccum_layout = cute.make_layout(
+                    cute.size_in_bytes(self.dtype, self.sdQ_layout) * 8 // Float32.width
+                )
+
+    def _dQaccum_tile_layout_2cta(self) -> cute.Layout:
+        """(tile_m, hdim) -> offset in the flat 2-CTA accumulate tile.
+
+        The 2-CTA reduce writes one 64 * hdim block per CTA of the pair. In a block the TMEM
+        lane is row % 64 + 64 * column half, and the reduce streams 4-column vectors of every
+        lane before moving to the next 4 columns, so the two column halves interleave 4
+        columns at a time.
+        """
+        assert self.tile_m == 128, "the 2-CTA order pairs two 64-row CTA blocks"
+        half = self.tile_m // 2
+        return cute.make_layout(
+            ((half, 2), (4, self.tile_hdim // 8, 2)),
+            stride=((4, half * self.tile_hdim), (1, 8 * half, 4 * half)),
+        )
 
     @cute.jit
     def __call__(
@@ -346,7 +369,8 @@ class FlashAttentionBackwardPostprocess:
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
 
             if const_expr(self.arch // 10 in [10, 11] and self.use_2cta_instrs):
-                # 2-CTA: remap dQaccum layout into TMEM view before writing sdQ
+                # 2-CTA: read dQaccum straight into the TMEM-fragment register order
+                # (thread tidx owns row tidx), then write sdQ
                 num_reduce_threads = self.num_threads
                 thr_mma_dsk = tiled_mma.get_slice(tidx)
                 dQacc_shape = thr_mma_dsk.partition_shape_C((self.tile_m, self.tile_hdim))
@@ -360,16 +384,6 @@ class FlashAttentionBackwardPostprocess:
                 thr_tmem_ld = tiled_tmem_ld.get_slice(tidx)
 
                 cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
-                tdQcdQ = thr_mma_dsk.partition_C(cdQ)
-                tdQcdQ_tensor = cute.make_tensor(tdQcdQ.iterator, tdQcdQ.layout)
-                tdQrdQ = thr_tmem_ld.partition_D(tdQcdQ_tensor)
-
-                tiled_copy_accum = s2r_tiled_copy_dQaccum
-                g2s_thr_copy = tiled_copy_accum.get_slice(tidx)
-
-                # S -> R
-                tdQrdQ_fp32 = cute.make_rmem_tensor(tdQrdQ.shape, cutlass.Float32)
-                tdQrdQ_s2r = cute.make_tensor(tdQrdQ_fp32.iterator, tdQrdQ_fp32.shape)
 
                 smem_copy_atom = sm100_utils_basic.get_smem_store_op(
                     LayoutEnum.ROW_MAJOR, self.dtype, cutlass.Float32, tiled_tmem_ld
@@ -382,75 +396,28 @@ class FlashAttentionBackwardPostprocess:
                 tdQsdQ_r2s = thr_tmem_ld.partition_D(thr_mma_dsk.partition_C(sdQ))
                 tdQrdQ_r2s = cute.make_rmem_tensor(tdQsdQ_r2s.shape, self.dtype)
 
-                num_stages = cute.size(tdQrdQ_fp32, mode=[1])
-                stage_stride = self.dQ_reduce_ncol
-                row_groups = 2
-                assert num_stages % row_groups == 0
-                assert num_reduce_threads % row_groups == 0
-                stage_groups = num_stages // row_groups
-                threads_per_row_group = num_reduce_threads // row_groups
-                stage_loads = tuple((row_group, row_group) for row_group in range(row_groups))
-                stage_iters = tuple(
-                    (row_group, row_group * threads_per_row_group)
-                    for row_group in range(row_groups)
+                # G -> R: view the gmem tile in the 2-CTA reduce's storage order, so thread
+                # tidx reads row tidx, 4 consecutive columns (16 B) per load. Per warp, each
+                # load covers 32 consecutive rows = 512 contiguous bytes. All loads are
+                # independent, with no smem staging or barrier in between.
+                gdQaccum_mn = cute.make_tensor(gdQaccum.iterator, self._dQaccum_tile_layout_2cta())
+                g2r_tiled_copy = cute.make_tiled_copy_tv(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+                    ),
+                    cute.make_layout((num_reduce_threads, 1)),
+                    cute.make_layout((1, 128 // Float32.width)),
                 )
-                s2r_lane = tidx % threads_per_row_group
-                s2r_buf = tidx // threads_per_row_group
+                g2r_thr_copy = g2r_tiled_copy.get_slice(tidx)
+                tdQgdQaccum = g2r_thr_copy.partition_S(gdQaccum_mn)
+                tdQrdQaccum = cute.make_rmem_tensor(tdQgdQaccum.shape, Float32)
+                cute.copy(g2r_thr_copy, tdQgdQaccum, tdQrdQaccum)
 
-                gdQaccum_layout_g2s = cute.make_layout(
-                    shape=(self.tile_m * self.dQ_reduce_ncol, 1), stride=(1, 0)
+                # Both register tensors are compact with slot k <-> column k of row tidx
+                tdQrdQaccum_r2s = cute.make_tensor(
+                    tdQrdQaccum.iterator, cute.make_layout(tdQrdQ_r2s.shape)
                 )
-                sdQaccum_g2s = g2s_thr_copy.partition_D(sdQaccum)
-
-                # G -> S
-                for stage_group in cutlass.range_constexpr(stage_groups):
-                    for stage_offset, smem_buf in stage_loads:
-                        stage_idx = stage_group + stage_offset * stage_groups
-                        gdQaccum_stage = cute.local_tile(
-                            gdQaccum,
-                            (self.tile_m * self.dQ_reduce_ncol,),
-                            (stage_idx,),
-                        )
-                        gdQaccum_stage_g2s = cute.make_tensor(
-                            gdQaccum_stage.iterator,
-                            gdQaccum_layout_g2s,
-                        )
-                        tdQgdQ = g2s_thr_copy.partition_S(gdQaccum_stage_g2s)
-                        cute.copy(
-                            g2s_thr_copy,
-                            tdQgdQ[None, None, 0],
-                            sdQaccum_g2s[None, None, smem_buf],
-                        )
-
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.barrier(barrier_id=6, number_of_threads=num_reduce_threads)
-
-                    # S -> R
-                    for stage_offset, lane_offset in stage_iters:
-                        stage_idx = stage_group + stage_offset * stage_groups
-                        s2r_src_tidx = s2r_lane + lane_offset
-                        s2r_thr_copy = tiled_copy_accum.get_slice(s2r_src_tidx)
-                        sdQaccum_src = s2r_thr_copy.partition_S(sdQaccum)[None, None, s2r_buf]
-
-                        tdQrdQ_s2r_cpy = tdQrdQ_s2r[None, stage_idx, None, None]
-                        tdQrdQ_r2s_cpy = cute.make_tensor(
-                            tdQrdQ_s2r_cpy.iterator, cute.make_layout(sdQaccum_src.shape)
-                        )
-                        cute.copy(s2r_thr_copy, sdQaccum_src, tdQrdQ_r2s_cpy)
-                        cute.arch.fence_view_async_shared()
-                        cute.arch.barrier(barrier_id=7, number_of_threads=num_reduce_threads)
-
-                        # R -> S
-                        stage_lo = stage_idx % stage_stride
-                        stage_hi = stage_idx // stage_stride
-                        tdQrdQ_r2s_cpy = cute.make_tensor(
-                            cute.recast_ptr(tdQrdQ_r2s_cpy.iterator),
-                            tdQrdQ_r2s[((None, 0), (stage_lo, stage_hi), 0, 0)].shape,
-                        )
-                        dQ_vec = tdQrdQ_r2s_cpy.load() * scale
-                        tdQrdQ_r2s[((None, 0), (stage_lo, stage_hi), 0, 0)].store(
-                            dQ_vec.to(self.dtype)
-                        )
+                tdQrdQ_r2s.store((tdQrdQaccum_r2s.load() * scale).to(self.dtype))
 
                 # R -> S
                 cute.copy(

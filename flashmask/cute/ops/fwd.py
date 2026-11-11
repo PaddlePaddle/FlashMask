@@ -106,6 +106,7 @@ def _flash_attn_fwd(
 
     q, k, v = [maybe_contiguous(t, be) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
+    head_dim_v = v.shape[-1]
     batch_size, seqlen_q = q.shape[:2]
     total_q = batch_size * seqlen_q
 
@@ -126,9 +127,9 @@ def _flash_attn_fwd(
     # The features the folded accumulator cannot express are therefore not supported at
     # head_dim_v > 256 -- assert instead of silently taking a measurably slower route. See
     # also the folded_acc asserts in FlashAttentionForwardSm100.__init__.
-    if compute_capability == 10 and head_dim > 256 and v.shape[-1] > 256:
-        assert v.shape[-1] <= 512, (
-            f"head_dim={head_dim}/{v.shape[-1]}: the folded accumulator supports "
+    if compute_capability == 10 and head_dim > 256 and head_dim_v > 256:
+        assert head_dim_v <= 512, (
+            f"head_dim={head_dim}/{head_dim_v}: the folded accumulator supports "
             "head_dim_v <= 512 (O takes head_dim_v / 2 TMEM columns)"
         )
         assert num_splits == 1, (
@@ -157,7 +158,7 @@ def _flash_attn_fwd(
         # (non-flashmask) d256 case: flashmask keeps 64 so the block max/min scan
         # + block-list tiling (kBlockN) agree (and leave headroom for s_rowidx);
         # head_dim=192 keeps 64 (dv=128 tile is a different smem shape).
-        if head_dim == 256 and v.shape[-1] == 256 and startend_row_indices is None:
+        if head_dim == 256 and head_dim_v == 256 and startend_row_indices is None:
             n_block_size = 80
 
     # SM100 per-pass config for head_dim=576 (head_dim_v <= 256 after the split above).
@@ -198,7 +199,7 @@ def _flash_attn_fwd(
         # i.e. the only way to avoid the redundant QK of a multi-pass split. The price is
         # half the arithmetic intensity per KV tile (the pair covers 128 query rows
         # instead of 256).
-        if v.shape[-1] > 256:
+        if head_dim_v > 256:
             m_block_size = 64
         else:
             m_block_size = 128
@@ -208,13 +209,27 @@ def _flash_attn_fwd(
         # of the A-operand SMEM layout (asserted in softmax_loop).
         n_block_size = 64
     fwd_cta_group_size = 2 if use_2cta_instrs else 1
+    # d == dv == 256 without flashmask: CTA pair with 128 x 128 tiles per CTA (pair tile
+    # 256 x 128), q_stage 1, S ping-pong, P over S in TMEM. Flashmask stays on the 1-CTA
+    # kernel: a 256-row pair tile covers 6 KV blocks of a 512-key window, a 128-row tile 5.
+    use_hd256_2cta = (
+        compute_capability == 10
+        and head_dim == 256
+        and head_dim_v == 256
+        and startend_row_indices is None
+    )
+    if use_hd256_2cta:
+        use_2cta_instrs = True
+        m_block_size = 128
+        n_block_size = 128
+        fwd_cta_group_size = 2
 
     # Each SM100 CTA processes q_stage * m_block_size query rows; single_q_stage
     # (d>192, d==dv) uses q_stage=1 to fit the TMEM budget. Must match
     # FlashAttentionForwardSm100.q_stage (= 1 if single_q_stage else 2). Computed
     # once here so the flashmask valid_block_count and the block-sparse M-block
     # normalization below share the identical M granularity.
-    q_stage = 1 if ((head_dim > 192 and head_dim == v.shape[-1]) or is_bigd_fwd) else 2
+    q_stage = 1 if ((head_dim > 192 and head_dim == head_dim_v) or is_bigd_fwd) else 2
     # Query rows per work tile. This is the M granularity that the flashmask
     # valid_block_count / block lists are built at; with a 2-CTA UMMA one work tile is
     # handled by a CTA *pair*, so it covers cta_group_size * q_stage * m_block_size rows.
@@ -293,7 +308,6 @@ def _flash_attn_fwd(
     else:
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
     if enable_overlap:
         # Skip the [batch, seqlen_k, ...] shape assert: k/v are LOCAL (S_local),
         # while seqlen_k is the gathered S_total. The SRBuffer view (built below
@@ -354,10 +368,22 @@ def _flash_attn_fwd(
         # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
         # out as 0. So on SM90 use an uninitialized buffer to skip the O
         # zero-fill that dominates short-seq / high-sparsity calls (measured fwd speedup).
-        # On SM100 the flashmask fwd skips the O store for a fully-masked query block
-        # (valid_block_count == 0) and has no zero-writer for it, so that O tile would
-        # be left uninitialized -- keep the zero-filled allocation on SM100.
-        out = (be.empty if compute_capability == 9 else be.zeros)(
+        # On SM100 a query block without any KV block skips its O store, so O keeps the
+        # zero-fill, except at d == dv == 256: with flashmask the kernel writes those tiles'
+        # zeros itself (zero_empty_o_tiles), and without flashmask every query block has a
+        # KV block unless causal leaves rows past seqlen_k empty or a local window is set.
+        # window_size_* is only normalized into causal/local further below, so derive both here.
+        fwd_causal = causal or (window_size_left is None and window_size_right == 0)
+        fwd_local = not fwd_causal and (window_size_left is not None or window_size_right is not None)
+        o_fully_written = compute_capability == 9 or (
+            head_dim == 256
+            and head_dim_v == 256
+            and (
+                startend_row_indices is not None
+                or (not fwd_local and (not fwd_causal or seqlen_q <= seqlen_k))
+            )
+        )
+        out = (be.empty if o_fully_written else be.zeros)(
             shape=[*q_batch_seqlen_shape, num_head, head_dim_v], dtype=out_framework_dtype
         )
     else:
@@ -480,7 +506,7 @@ def _flash_attn_fwd(
         # instead of letting the kernel assert. GQA/MQA stays correct via qhead_per_kvhead,
         # just without the packing optimization (which only pays off when seqlen_q per head
         # is too small to fill the M tile, i.e. decode).
-        if is_bigd_fwd:
+        if is_bigd_fwd or use_hd256_2cta or (head_dim > 192 and head_dim == head_dim_v):
             pack_gqa = False
         # Single q-stage (q_stage=1) for d=dv=256, and for the head_dim=576 per-pass
         # config: both need q_stage=1 so O (head_dim_v cols) fits alongside S/P in the
@@ -630,6 +656,27 @@ def _flash_attn_fwd(
         overlap_spin_timeout_ns = None
         overlap_bhsd_layout = None
 
+    # DynamicPersistentTileScheduler ticket counter (SM100 hd256 flashmask): int32[2], zeroed
+    # once and reset by the kernel itself, so no per-call memset. Launches on one stream are
+    # serialized, but kernels on different streams may run concurrently and must not share
+    # a counter, so there is one per (device, stream). The kernel only uses it for the
+    # configs it schedules persistently; passing it is harmless otherwise.
+    sched_counter_tensor = None
+    if compute_capability == 10:
+        if be.is_stream_capturing():
+            # Graphs captured on one stream may be replayed concurrently on different
+            # streams, so each captured launch gets its own counter. The list keeps it alive
+            # for as long as the graph may replay it.
+            sched_counter = be.zeros([2], dtype=be.int32)
+            _flash_attn_fwd.sched_counters_captured.append(sched_counter)
+        else:
+            sched_key = (str(be.device_of(q)), be.cuda_stream())
+            sched_counter = _flash_attn_fwd.sched_counters.get(sched_key)
+            if sched_counter is None:
+                sched_counter = be.zeros([2], dtype=be.int32)
+                _flash_attn_fwd.sched_counters[sched_key] = sched_counter
+        sched_counter_tensor = from_dlpack(sched_counter, assumed_align=4)
+
     compile_key = (
         dtype,
         head_dim,
@@ -724,6 +771,7 @@ def _flash_attn_fwd(
                 if compute_capability == 10
                 else {}
             ),
+            **({"mSchedCounter": sched_counter_tensor} if compute_capability == 10 else {}),
             **(
                 {
                     "overlap_k_addr": overlap_k_addr,
@@ -764,6 +812,7 @@ def _flash_attn_fwd(
             if compute_capability == 10
             else {}
         ),
+        **({"mSchedCounter": sched_counter_tensor} if compute_capability == 10 else {}),
         **(
             {
                 "overlap_k_addr": overlap_k_addr,
@@ -792,3 +841,5 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = {}
+_flash_attn_fwd.sched_counters = {}
+_flash_attn_fwd.sched_counters_captured = []

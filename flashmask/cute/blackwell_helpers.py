@@ -422,7 +422,13 @@ def gemm_ptx_partial(
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
+    desc_scratch_smem_addr: Optional[Int32] = None,
 ) -> None:
+    # desc_scratch_smem_addr: 8 bytes of smem. When given, the descriptor start addresses
+    # are bounced through it with a volatile load inside the asm, so ptxas cannot hoist the
+    # per-k 64-bit descriptors out of the surrounding loops. In a persistent kernel the
+    # hoisted descriptors stay live for the whole tile loop and get spilled to local memory
+    # (L1 is almost entirely carved out for smem here, so every refill goes to L2).
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
@@ -492,7 +498,12 @@ def gemm_ptx_partial(
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
                 Int32(not zero_init).ir_value(),
                 Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-            ],
+            ]
+            + (
+                [Int32(desc_scratch_smem_addr).ir_value()]
+                if const_expr(desc_scratch_smem_addr is not None)
+                else []
+            ),
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
             ".reg .pred p;\n\t"
@@ -508,6 +519,15 @@ def gemm_ptx_partial(
             f"mov.b32 tmem_acc, $3;\n\t"
             "mov.b32 smem_desc_a_lo_start, $0;\n\t"
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            + (
+                "st.shared.u32 [$4], smem_desc_a_lo_start;\n\t"
+                "st.shared.u32 [$4+4], smem_desc_b_lo_start;\n\t"
+                "ld.volatile.shared.u32 smem_desc_a_lo_start, [$4];\n\t"
+                "ld.volatile.shared.u32 smem_desc_b_lo_start, [$4+4];\n\t"
+                if const_expr(desc_scratch_smem_addr is not None)
+                else ""
+            )
+            +
             f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
@@ -528,7 +548,7 @@ def gemm_ptx_partial(
             )
             + "}\n",
             # "r,r,r",
-            "r,r,r,r",
+            "r,r,r,r" + (",r" if const_expr(desc_scratch_smem_addr is not None) else ""),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -558,6 +578,15 @@ def gemm_ptx_partial(
             )
         else:
             mbar_wait_str = ""
+        scratch_idx = len(input_args)
+        if const_expr(desc_scratch_smem_addr is not None):
+            input_args.append(Int32(desc_scratch_smem_addr).ir_value())
+            scratch_str = (
+                f"st.shared.u32 [${scratch_idx}], smem_desc_b_lo_start;\n\t"
+                f"ld.volatile.shared.u32 smem_desc_b_lo_start, [${scratch_idx}];\n\t"
+            )
+        else:
+            scratch_str = ""
         llvm.inline_asm(
             None,
             # [
@@ -583,7 +612,8 @@ def gemm_ptx_partial(
             f"mov.b32 tmem_acc, $3;\n\t"
             f"mov.b32 tmem_a, $0;\n\t"
             f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            + scratch_str
+            + f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
             f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
@@ -617,7 +647,8 @@ def gemm_ptx_partial(
                 else ""
             )
             + "}\n",
-            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+            ("r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r")
+            + (",r" if const_expr(desc_scratch_smem_addr is not None) else ""),
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
