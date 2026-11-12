@@ -61,6 +61,9 @@ ContextPtr create_context(const uint8_t* unique_id, int rank, int nranks);
 int rank(const Context& context);
 int nranks(const Context& context);
 int num_lsa_ranks(const Context& context);
+// Process exit: releasing the context then aborts the NCCL communicator (local) instead of
+// destroying it (waits in an intra-node barrier for every local rank of the communicator).
+void set_local_teardown(Context& context) noexcept;
 
 // Signal windows need NCCL_WIN_STRICT_ORDERING when reached through GIN; data windows don't.
 enum class WindowKind {

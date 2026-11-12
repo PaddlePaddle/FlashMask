@@ -263,9 +263,17 @@ public:
             cudaFree(barrier_value_);
             barrier_value_ = nullptr;
         }
-        ncclCommDestroy(comm_);
+        // ncclCommDestroy waits in an intra-node barrier for every local rank of the communicator;
+        // ncclCommAbort releases this rank's share without them.
+        if (local_teardown_) {
+            ncclCommAbort(comm_);
+        } else {
+            ncclCommDestroy(comm_);
+        }
         comm_ = nullptr;
     }
+
+    void set_local_teardown() noexcept { local_teardown_ = true; }
 
 private:
     // One line per rank at init. This is the only place that knows the real
@@ -318,6 +326,7 @@ private:
     int num_qps_ = 0;
     bool use_rail_ = false;
     unsigned long long spin_timeout_ns_ = 0;
+    bool local_teardown_ = false;
     std::vector<HostRegion> regions_;
 };
 
@@ -334,6 +343,7 @@ void ContextDeleter::operator()(Context* context) const noexcept {
 int rank(const Context& context) { return context.rank(); }
 int nranks(const Context& context) { return context.nranks(); }
 int num_lsa_ranks(const Context& context) { return context.num_lsa_ranks(); }
+void set_local_teardown(Context& context) noexcept { context.set_local_teardown(); }
 void* alloc(Context& context, size_t bytes, WindowKind kind) { return context.allocate(bytes, kind); }
 void free(Context& context, void* ptr) { context.release(ptr); }
 void free_noexcept(Context& context, void* ptr) noexcept { context.release_noexcept(ptr); }

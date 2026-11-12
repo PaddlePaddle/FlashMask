@@ -103,6 +103,8 @@ public:
     void wait_wptr_init();
     // Collective; call before freeing or rezeroing any window (see gin::quiesce).
     void quiesce() { sig_buffer->quiesce(); }
+    // Process exit: tear down without waiting for the other ranks (see gin::set_local_teardown).
+    void set_local_teardown() noexcept { gin::set_local_teardown(*gin_context_); }
 
     void* k_data() const { return kv_buffer->k_data(); }
     // Shared K/V leaves the V region ungathered, so consumers must read K instead.

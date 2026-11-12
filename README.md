@@ -149,6 +149,8 @@ Overlap also assumes the following usage contract, which it does not check:
 
 `FLASHMASK_SPIN_TIMEOUT_S` (default `300`, `0` disables) bounds how long an Overlap communication kernel waits for a peer before it prints a diagnostic and traps, like NCCL's collective timeout. The same budget bounds the attention kernels' waits on the gathered KV; on timeout they print the stuck flag and fail with a device-side assert. Raise it if ranks can legitimately drift apart for longer before an overlap call, e.g. rank-0-only checkpoint saving or evaluation.
 
+At process exit each rank releases its Overlap communicator locally (`ncclCommAbort`) without waiting for the other ranks, so a rank that fails exits right away and the launcher can stop the job, instead of hanging in NCCL's teardown barrier.
+
 <details>
 <summary>Using Overlap on SM90 (Hopper)</summary>
 
