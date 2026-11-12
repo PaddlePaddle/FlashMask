@@ -882,7 +882,22 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
 // explicit instantiation and singleton management
 
 template class OverlapCommunicator<cutlass::bfloat16_t>;
-static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> overlap_comm = nullptr;
+// Owns the process's communicator; its destructor runs only at process exit. Ranks reach exit at
+// unrelated times, and when one fails the others never do, so the collective ncclCommDestroy would
+// block that rank's exit in NCCL's intra-node barrier and the job would hang instead of failing.
+// Exit therefore tears down locally. A group rebuild below stays collective: all ranks switch at
+// the same call.
+struct CommunicatorHolder {
+    std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>> comm;
+    ~CommunicatorHolder() {
+        if (comm) {
+            comm->set_local_teardown();
+        }
+    }
+};
+static CommunicatorHolder overlap_comm_holder;
+static std::unique_ptr<flashmask::OverlapCommunicator<cutlass::bfloat16_t>>& overlap_comm =
+    overlap_comm_holder.comm;
 // UID of the live communicator; a different UID means a different group.
 static ncclUniqueId overlap_comm_uid;
 static uint64_t overlap_comm_generation = 0;
