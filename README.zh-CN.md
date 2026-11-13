@@ -254,7 +254,7 @@ FlashAttention-4 `mask_mod` 在 SM100 上不支持 `d=256, dv=256`，因此这�
 - **GPU**：Hopper（SM90）或 Blackwell（SM100）。
 - **深度学习框架**：已启用 CUDA 的 PaddlePaddle 或 PyTorch（二者均不会被自动安装）。
 - **构建工具**：`setuptools>=64`。
-- **自动安装的依赖**：`nvidia-cutlass==4.2.0.0`、`nvidia-cutlass-dsl[cu13]==4.5.2`、`apache-tvm-ffi>=0.1.5,<0.2.0`。它们由 `setup.py` 在构建时安装，因此安装命令需要加 `--no-build-isolation`。
+- **自动安装的依赖**：`nvidia-cutlass==4.2.0.0`、`nvidia-cutlass-dsl[cu13]==4.8.1`、`apache-tvm-ffi>=0.1.5,<0.2.0`。它们由 `setup.py` 在构建时安装，因此安装命令需要加 `--no-build-isolation`。
 - **Overlap（`ovl`）额外要求**：
   - NCCL >= 2.30.5（如 `nvidia-nccl-cu13`，或通过 `NCCL_HOME` 指定）以及 cutlass C++ 头文件（`nvidia-cutlass`，或 `FM4_OVERLAP_CUTLASS_INC`）。
   - `FLASHMASK_BUILD` 显式包含 `ovl`（如 `ovl`、`utils+ovl`）时，NCCL 缺失或版本过低、cutlass 头文件缺失都会使构建失败并给出原因；使用 `all` 时只告警并跳过该组件，核心内核不受影响。
