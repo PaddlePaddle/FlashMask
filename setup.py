@@ -118,7 +118,7 @@ packages = find_packages(exclude=exclude_packages)
 install_requires = [
     'typing_extensions',
     'nvidia-cutlass==4.2.0.0',
-    'nvidia-cutlass-dsl[cu13]==4.5.2',
+    'nvidia-cutlass-dsl[cu13]==4.8.1',
     "apache-tvm-ffi>=0.1.5,<0.2.0",
 ]
 

@@ -504,15 +504,7 @@ class AttentionMask:
                 # are all equal and the add folds to one per thread.
                 row_offset = m_block * self.tile_m
                 s_base = load_startend_row_indices_consumer_state.index * 4 * self.tile_n
-                # Where a thread owns one whole S row r (the R2P layout) and every bound is
-                # non-decreasing over the block's columns, {c: LTS[c] <= r} is a prefix
-                # [0, a) and {c: LTE[c] > r} a suffix [b, N), so the masked columns are the
-                # range [b, a) (UTS/UTE likewise). Binary-search the range ends in smem and
-                # mask with R2P instead of comparing every element; bit-identical result.
-                # Blocks whose bounds are not monotone take the per-element loop.
-                # Only with 2+ bounds: LTS alone is already one compare + select per element;
-                # there the monotone check only adds latency (B300 A/B: SW -2.6%, Share
-                # Question -5.6%, Causal Doc -1.9%), while GSW (4 bounds) gained 11%.
+
                 tn = const_expr(self.tile_n)
                 multi_bound = const_expr(any((has_ut_start, has_lt_end, has_ut_end)))
                 use_ranges = const_expr(

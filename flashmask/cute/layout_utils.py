@@ -108,7 +108,7 @@ def reshape_acc_to_frgA(acc: cute.Tensor) -> cute.Tensor:
 
 
 def mma_partition_C_vec(
-    sVec: cute.Tensor, thr_mma: cute.core.ThrMma, expand_shape: int, is_colvec: bool
+    sVec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1

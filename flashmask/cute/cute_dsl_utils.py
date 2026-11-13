@@ -26,46 +26,6 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
-def _dsl_version_tuple():
-    """Leading numeric components of cutlass.__version__, e.g. "4.6.0.dev0" -> (4, 6, 0)."""
-    parts = []
-    for tok in str(getattr(cutlass, "__version__", "")).split("."):
-        if not tok.isdigit():
-            break
-        parts.append(int(tok))
-    return tuple(parts)
-
-
-def _patch_dsl_user_op_frame_walk():
-    """Skip the per-op Python stack walk in cutlass-dsl 4.5.0 - 4.6.0.
-
-    `dsl_user_op` calls `_find_user_frame` on every MLIR op it builds so that
-    locations point at user code instead of cutlass internals. It is meant to be
-    gated by `_ENABLE_FRAME_FILTERING` (driven by the `generate_line_info`
-    compile option, which defaults to False), but the wrapper never reads that
-    flag, so the walk always runs. The frame it lands on lives in a large user
-    file (flash_fwd_sm100.py is ~256KB), which makes the following
-    `inspect.getframeinfo()` far more expensive and roughly doubles JIT trace
-    time. Upstream wires the flag up in 4.6.1, so only patch the affected range.
-
-    Replacing the walk with the identity gives the immediate caller frame, i.e.
-    what 4.4.x used. Locations then point into cutlass internals, which only
-    affects error messages and IR dumps.
-    """
-    if not ((4, 5, 0) <= _dsl_version_tuple() < (4, 6, 1)):
-        return
-    from cutlass.base_dsl._mlir_helpers import op as _op
-
-    if getattr(_op, "_find_user_frame", None) is None:
-        return
-    # Resolved via LOAD_GLOBAL inside the wrapper, so this also affects the ops
-    # that were already decorated at import time.
-    _op._find_user_frame = lambda start_frame: start_frame
-
-
-_patch_dsl_user_op_frame_walk()
-
-
 @lru_cache
 def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)

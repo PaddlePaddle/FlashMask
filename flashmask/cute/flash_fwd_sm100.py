@@ -1285,12 +1285,14 @@ class FlashAttentionForwardSm100:
         # generation *window*: generate_block() streams the real seqlen_k in chunks
         # (`num_chunks = ceil(num_blocks / usable_block_count)`), so a large seqlen_k
         # just refills more often.
+        # Keep these as Python ints: they size SharedStorage fields, and cutlass-dsl >= 4.8
+        # treats Int32(...) as a dynamic value, which makes the smem layout non-static.
         if const_expr(self.n_block_size >= 64):
-            self.generate_block_seqlen_k = Int32(1024 * 16)
+            self.generate_block_seqlen_k = 1024 * 16
         else:
-            self.generate_block_seqlen_k = Int32(64 * self.n_block_size)
-        self.generate_block_buffer_block_count = Int32(Int32(((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 31)) & 0xffffffe0)
-        self.generate_block_buffer_usable_block_count = Int32(((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 3) // 4 * 4)
+            self.generate_block_seqlen_k = 64 * self.n_block_size
+        self.generate_block_buffer_block_count = ((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 31) & 0xffffffe0
+        self.generate_block_buffer_usable_block_count = ((self.generate_block_seqlen_k + self.n_block_size - 1) // self.n_block_size + 3) // 4 * 4
         assert self.generate_block_buffer_usable_block_count % (len(self.generate_block_warp_ids) * cute.arch.WARP_SIZE) == 0
 
         @cute.struct
@@ -2559,8 +2561,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def load(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -2942,8 +2944,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def mma(
         self,
-        tiled_mma_qk: cute.core.ThrMma,
-        tiled_mma_pv: cute.core.ThrMma,
+        tiled_mma_qk: cute.ThrMma,
+        tiled_mma_pv: cute.ThrMma,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -3462,7 +3464,7 @@ class FlashAttentionForwardSm100:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -4168,7 +4170,7 @@ class FlashAttentionForwardSm100:
         softmax: SoftmaxSm100,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: Optional[cute.CopyAtom],
         # Dead (their cute.copy calls are commented out) and None with the folded
@@ -4222,7 +4224,7 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
 
-        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         if const_expr(self.use_s_ping_pong):
             # mma_si_consumer_phase is the global block counter here (see softmax_loop).
             pp_slot = mma_si_consumer_phase & 1
@@ -4297,7 +4299,7 @@ class FlashAttentionForwardSm100:
             # floor-div by the power-of-two block_size via arithmetic shift, which
             # rounds toward -inf for the (abs_col - bos) < 0 (pre-document) columns.
             base_blk = (n_block * self.n_block_size - bos) >> self.block_size_log2
-            blk_max = cute.make_fragment(self.n_block_slots, Float32)
+            blk_max = cute.make_rmem_tensor(self.n_block_slots, Float32)
             for b in cutlass.range_constexpr(self.n_block_slots):
                 blk_max[b] = -Float32.inf
             n_elems = const_expr(cute.size(tScS_t2r_blk.shape))
@@ -4387,7 +4389,7 @@ class FlashAttentionForwardSm100:
             row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
+            # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
             # tSrScale_r2t[0] = acc_scale
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
@@ -4404,7 +4406,7 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(not self.folded_acc):
-            tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+            tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
             tSrP_r2t = cute.make_tensor(
                 cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
                 tSrS_t2r.layout,
@@ -4413,7 +4415,7 @@ class FlashAttentionForwardSm100:
             # P goes straight to SMEM, so there is no f32-packed TMEM staging view: allocate
             # the bf16 fragment directly, one element per S element this thread holds.
             tSrP_r2t_f32 = None
-            tSrP_r2t = cute.make_fragment(tSrS_t2r.layout, self.q_dtype)
+            tSrP_r2t = cute.make_rmem_tensor(tSrS_t2r.layout, self.q_dtype)
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         # Preserve old `e2e=mask_fn is None and head_dim_padded<=128` semantics:
         # when that condition was False, old code went pure-hardware exp2 ⇒ ex2_emu_freq=0.
@@ -4517,8 +4519,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_loop(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtOs: tuple[cute.Tensor],
         sScale: cute.Tensor,
@@ -4647,7 +4649,7 @@ class FlashAttentionForwardSm100:
                 softmax_corr_consumer_phase ^= 1
 
                 if const_expr(not self.folded_acc):
-                    tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                    tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_s_stages):
                         # wait for S0 / S1
@@ -4896,7 +4898,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         scale: Float32,
@@ -4951,7 +4953,7 @@ class FlashAttentionForwardSm100:
 
         frg_count = self.tmem_cols(self.head_dim_v_padded) // corr_tile_size
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(thr_tmem_load, tOtO_t2r[None, 0, 0, i], tOrO_frg)
             # range_constexpr, not range(..., unroll_full=True): the latter emits a real
             # loop with a dynamic induction variable, and a dynamically indexed store into
@@ -4970,7 +4972,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_epilogue(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         stage: Int32,
@@ -4998,7 +5000,7 @@ class FlashAttentionForwardSm100:
         5. Preparation for efficient TMA store operations
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
         :param scale: Final scaling factor to apply to the output
@@ -5100,14 +5102,14 @@ class FlashAttentionForwardSm100:
                 )
                 for k in cutlass.range_constexpr(tiles_per_chunk):
                     i = c * tiles_per_chunk + k
-                    tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, 0].shape, self.pv_acc_dtype)
+                    tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, 0].shape, self.pv_acc_dtype)
                     cute.copy(tiled_tmem_load, tOtO_t2r[None, 0, 0, i], tOrO_frg)
                     for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
                         tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
                             (tOrO_frg[j], tOrO_frg[j + 1]),
                             (scale, scale),
                         )
-                    tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
+                    tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
                     tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
                     cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_s2r[None, 0, 0, i])
                 # Chunk complete in smem: make it visible to the TMA store, hand it over.
@@ -5130,14 +5132,14 @@ class FlashAttentionForwardSm100:
                         o_chunk_mbar + self.o_chunk_stages + o_chunk_slot,
                         ((o_chunk_idx // self.o_chunk_stages) & 1) ^ 1,
                     )
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
                 tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
-            tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
+            tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             if const_expr(not self.folded_acc):
                 cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)

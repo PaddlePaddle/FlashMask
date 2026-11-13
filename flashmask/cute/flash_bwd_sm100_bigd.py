@@ -574,7 +574,7 @@ def _bigd_drain_wg_iteration(
             )
             for si in cutlass.range_constexpr(len(my_slices)):
                 s = cutlass.const_expr(my_slices[si])
-                frag = cute.make_fragment(shape_out_slice, Float32)
+                frag = cute.make_rmem_tensor(shape_out_slice, Float32)
                 tmem_src = cute.make_tensor(
                     out_base_ptr + slot_base + s * ncol, out_slice_layout
                 )
@@ -2837,16 +2837,16 @@ class FlashAttentionBackwardSm100BigD:
                 tScS = thr_copy_t2r.partition_D(cS)
                 # Four separate f32 fragments, on purpose. Tried and REVERTED: aliasing
                 # them in pairs (P overwriting S, dS overwriting dP) to cut the live
-                # count in half measured much slower. make_fragment lowers to an alloca,
+                # count in half measured much slower. make_rmem_tensor lowers to an alloca,
                 # and reading and writing the same alloca inside one unrolled loop
                 # defeats its promotion to registers, so the whole buffer lands in local
                 # memory. Left separate, ptxas sees that S dies after the P loop (and dP
                 # after the dS loop) and reuses those registers itself. Shrinking the
                 # fragments is the fix; aliasing is not.
-                tSrS = cute.make_fragment(tScS.shape, Float32)
-                tSrP = cute.make_fragment(tScS.shape, Float32)
-                tSrdP = cute.make_fragment(tScS.shape, Float32)
-                tSrdS = cute.make_fragment(tScS.shape, Float32)
+                tSrS = cute.make_rmem_tensor(tScS.shape, Float32)
+                tSrP = cute.make_rmem_tensor(tScS.shape, Float32)
+                tSrdP = cute.make_rmem_tensor(tScS.shape, Float32)
+                tSrdS = cute.make_rmem_tensor(tScS.shape, Float32)
                 frag_len = cutlass.const_expr(cute.size(tSrS))
                 # This chunk's W values of LSE / dPsum, staged out of SMEM once per
                 # chunk instead of read per element.
@@ -2866,8 +2866,8 @@ class FlashAttentionBackwardSm100BigD:
                 # overlap (LSE dies at the end of the P loop, dPsum is only live in the
                 # dS loop) so ptxas shares the registers anyway, and aliasing one alloca
                 # is what defeats promotion (see the note above).
-                tSrLSE = cute.make_fragment(W, Float32)
-                tSrdPsum = cute.make_fragment(W, Float32)
+                tSrLSE = cute.make_rmem_tensor(W, Float32)
+                tSrdPsum = cute.make_rmem_tensor(W, Float32)
 
                 # R2T machinery: P and dS go back into the upper halves of the S / dP
                 # regions as bf16, where they are the A operands of the dV / dK gemms.
@@ -2900,10 +2900,10 @@ class FlashAttentionBackwardSm100BigD:
                         tdPtdP.iterator + self.tmem_s_to_p_offset, tdS_chunk_layout
                     ),
                 ).get_slice(compute_tidx)
-                tSrP_r2t_f32 = cute.make_fragment(
+                tSrP_r2t_f32 = cute.make_rmem_tensor(
                     thr_store_P.partition_S(cP).shape, Float32
                 )
-                tSrdS_r2t_f32 = cute.make_fragment(
+                tSrdS_r2t_f32 = cute.make_rmem_tensor(
                     thr_store_dS.partition_S(cP).shape, Float32
                 )
                 tSrP_r2t = cute.make_tensor(
@@ -3502,7 +3502,7 @@ class FlashAttentionBackwardSm100BigD:
                                 # r*(num_drain_threads*4) + t*4 + v -- which is what the 16
                                 # vector atomics below write. Each is 16B aligned (t*4 f32)
                                 # and a warp's 32 lanes cover 512 contiguous bytes.
-                                frag = cute.make_fragment(shape_out_slice, Float32)
+                                frag = cute.make_rmem_tensor(shape_out_slice, Float32)
                                 tmem_src = cute.make_tensor(
                                     out_base_ptr + slot_base + s * ncol, out_slice_layout
                                 )
