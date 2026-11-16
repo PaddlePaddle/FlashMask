@@ -5593,3 +5593,11 @@ class FlashAttentionBackwardSm100:
             pipeline_dKV.consumer_release(consumer_state_dKV)
         consumer_state_dKV.advance()
         return consumer_state_dKV
+
+
+# Drop the "cutlass" component from the kernel's symbol name. ptxas applies a
+# cutlass-specific optimization recipe to kernels whose name contains "cutlass";
+# on this kernel it degrades register allocation and causes local-memory spills
+# (masked bwd variants are hit hardest). Without the symbol ptxas compiles it like
+# any other kernel, matching -O2 codegen. See NVIDIA/cutlass#3707.
+FlashAttentionBackwardSm100.kernel.set_name_prefix("", remove_cutlass_symbol=True)
