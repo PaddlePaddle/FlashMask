@@ -386,9 +386,9 @@ class FlashAttentionForwardCombine:
 
             # Precompute these values to avoid recomputing them in the loop
             num_rows = const_expr(cute.size(tOcO, mode=[1]))
-            tOmidx = cute.make_fragment(num_rows, cutlass.Int32)
-            tOhidx = cute.make_fragment(num_rows, cutlass.Int32)
-            tOrOptr = cute.make_fragment(num_rows, cutlass.Int64)
+            tOmidx = cute.make_rmem_tensor(num_rows, cutlass.Int32)
+            tOhidx = cute.make_rmem_tensor(num_rows, cutlass.Int32)
+            tOrOptr = cute.make_rmem_tensor(num_rows, cutlass.Int64)
             for m in cutlass.range(num_rows, unroll_full=True):
                 mi = tOcO[0, m, 0][0]  # m coordinate
                 idx = m_block * self.m_block_size + mi
@@ -397,7 +397,7 @@ class FlashAttentionForwardCombine:
                 if idx >= max_idx:
                     tOhidx[m] = -1
 
-            tOpO = cute.make_fragment(cute.size(tOcO, [2]), cutlass.Boolean)
+            tOpO = cute.make_rmem_tensor(cute.size(tOcO, [2]), cutlass.Boolean)
             if const_expr(not self.is_even_k):
                 for k in cutlass.range(cute.size(tOpO), unroll_full=True):
                     tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
@@ -437,10 +437,10 @@ class FlashAttentionForwardCombine:
             # Step 4: Compute final LSE along split dimension
             # ===============================
 
-            lse_sum = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Float32)
+            lse_sum = cute.make_rmem_tensor(cute.size(ts2rrLSE, mode=[2]), Float32)
             ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE)
             # We compute the max valid split for each row to short-circuit the computation later
-            max_valid_split = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Int32)
+            max_valid_split = cute.make_rmem_tensor(cute.size(ts2rrLSE, mode=[2]), Int32)
             assert cute.size(ts2rrLSE, mode=[0]) == 1
             # Compute max, scales, and final LSE for each row
             for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
@@ -517,7 +517,7 @@ class FlashAttentionForwardCombine:
             # Main accumulation loop
             for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
                 # Get scales for this split
-                scale = cute.make_fragment(num_rows, Float32)
+                scale = cute.make_rmem_tensor(num_rows, Float32)
                 for m in cutlass.range(num_rows, unroll_full=True):
                     scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
 

@@ -406,7 +406,7 @@ def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
 
 
 def partition_D_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+    thr_copy: cute.ThrCopy, tensor: cute.Tensor
 ) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_D(tensor).iterator),
