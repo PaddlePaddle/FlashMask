@@ -59,6 +59,7 @@ from .decode import (
     swapab_num_splits,
     swapab_occupancy,
 )
+from .workspace import FwdWorkspace, tensormap_workspace_ctas
 
 __all__ = ["_flash_attn_fwd"]
 
@@ -92,6 +93,7 @@ def _flash_attn_fwd(
     block_bos: Optional[Tensor] = None,
     group=None,
     seqlen_meta: Optional[SeqlenMeta] = None,
+    workspace: Optional[FwdWorkspace] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Forward pass for FlashAttention.
 
@@ -130,22 +132,47 @@ def _flash_attn_fwd(
                 other page_size gathers rows with cp.async. Rows past seqused_k in a
                 sequence's last used page must be finite (P = 0 times NaN is NaN); pages a
                 sequence does not reach may hold anything.
+            num_splits_dynamic (B,): split-KV count of sequence b, in [1, num_splits]. The
+                grid keeps num_splits splits; splits at or past num_splits_dynamic[b] get
+                an empty KV range, write LSE = -inf and are skipped. Needs num_splits > 1.
+                Values are not checked on the host.
             Lengths stay on the device: nothing here is read on the host. Not supported
                 with block sparsity, block_logit / block_bos, or overlap. A column mask
                 keeps its (B, H_m, max seqlen_k, num_vecs) shape; with seqused_k only its
                 first seqused_k[b] columns count, and causal is bottom-right aligned to
                 seqused_k[b].
+        workspace: a FwdWorkspace (SM100). Its buffers replace every per-call allocation
+            except out / lse when those are not passed, and nothing is read back to the
+            host. The split count is workspace.max_splits (num_splits must be <= 1 or
+            equal to it); with max_splits > 1 and no seqlen_meta.num_splits_dynamic, the
+            per-batch counts come from workspace.num_splits_dynamic (see FwdWorkspace.plan).
     """
     be = get_backend(q, k, v)
 
     q, k, v = [maybe_contiguous(t, be) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
+    if workspace is not None:
+        if num_splits > 1 and num_splits != workspace.max_splits:
+            raise ValueError(f"num_splits={num_splits} differs from workspace.max_splits={workspace.max_splits}")
+        num_splits = workspace.max_splits
+        if num_splits > 1 and (seqlen_meta is None or seqlen_meta.num_splits_dynamic is None):
+            seqlen_meta = (seqlen_meta if seqlen_meta is not None else SeqlenMeta())._replace(
+                num_splits_dynamic=workspace.num_splits_dynamic[: q.shape[0]]
+            )
+        unsupported = {
+            "block_sparse_tensors": block_sparse_tensors,
+            "block_logit": block_logit,
+            "block_bos": block_bos,
+            "group (FM-4 overlap)": group,
+        }
+        for name, value in unsupported.items():
+            if value is not None:
+                raise NotImplementedError(f"workspace is not supported with {name}")
     seqused_k = seqlen_meta.seqused_k if seqlen_meta is not None else None
     page_table = seqlen_meta.page_table if seqlen_meta is not None else None
+    num_splits_dynamic = seqlen_meta.num_splits_dynamic if seqlen_meta is not None else None
     if seqlen_meta is not None:
-        if seqlen_meta.num_splits_dynamic is not None:
-            raise NotImplementedError("seqlen_meta.num_splits_dynamic is not wired yet")
         unsupported = {
             "block_sparse_tensors": block_sparse_tensors,
             "block_logit": block_logit,
@@ -155,7 +182,7 @@ def _flash_attn_fwd(
         for name, value in unsupported.items():
             if value is not None:
                 raise NotImplementedError(f"seqlen_meta is not supported with {name}")
-        for name, t in (("seqused_k", seqused_k),):
+        for name, t in (("seqused_k", seqused_k), ("num_splits_dynamic", num_splits_dynamic)):
             if t is not None:
                 assert t.dtype == be.int32 and t.ndim == 1 and be.is_gpu(t), f"{name} must be int32 1-D on GPU"
         if page_table is not None:
@@ -166,6 +193,8 @@ def _flash_attn_fwd(
     batch_size, seqlen_q = q.shape[:2]
     if seqused_k is not None:
         assert seqused_k.shape[0] == batch_size, "seqused_k must have batch entries"
+    if num_splits_dynamic is not None:
+        assert num_splits_dynamic.shape[0] == batch_size, "num_splits_dynamic must have batch entries"
     if page_table is not None:
         assert page_table.shape[0] == batch_size, "page_table must have batch rows"
         assert k.ndim == 4, "with page_table, k / v must be (num_pages, page_size, H_kv, D)"
@@ -178,6 +207,8 @@ def _flash_attn_fwd(
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     if seqlen_meta is not None and compute_capability != 10:
         raise NotImplementedError("paged seqlen metadata is only wired on SM100")
+    if workspace is not None and compute_capability != 10:
+        raise NotImplementedError("FwdWorkspace is only wired on SM100")
 
     # SM100 single-token forward without autograd runs the SwapAB decode kernel (the branch
     # before the main kernel's compile below). It applies the main kernel's mask semantics:
@@ -409,7 +440,13 @@ def _flash_attn_fwd(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
         )
-        prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
+        if workspace is not None:
+            workspace.check_mask(startend_row_indices)
+        prepare_block_maxmin(
+            flashmask_info,
+            kBlockN=n_block_size,
+            **(workspace.flashmask_kwargs() if workspace is not None else {}),
+        )
         # valid_block_count (produced by reduce_block_count) feeds only the SM100
         # path. The SM90 fwd kernel iterates the block-sparse lists built below
         # (build_flashmask_block_lists) and never reads valid_block_count, so skip
@@ -448,6 +485,10 @@ def _flash_attn_fwd(
         )
         assert list(v.shape) == [*k_lead, num_head_kv, head_dim_v]
 
+    if workspace is not None:
+        workspace.check_call(
+            batch_size, seqlen_q, seqlen_k, num_head, num_head_kv, head_dim, head_dim_v, q.dtype
+        )
     assert q.dtype in [be.float16, be.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     if learnable_sink is not None:
@@ -725,8 +766,12 @@ def _flash_attn_fwd(
         # this split's KV range. SwapAB decode deals its splits over the mask's
         # surviving blocks and is handled in its own branch below.
         raise NotImplementedError("FlashMask (startend_row_indices) is not supported with SplitKV.")
+    if num_splits_dynamic is not None and not is_split_kv:
+        raise ValueError("seqlen_meta.num_splits_dynamic needs num_splits > 1 (the grid's split count)")
     if is_split_kv:
-        if use_swapab_decode:
+        if workspace is not None:
+            out_partial, lse_partial = workspace.partials(batch_size, seqlen_q)
+        elif use_swapab_decode:
             # The SwapAB kernel keeps the split axis separate: O is (ns, b, 1, h, dv)
             # and LSE is (ns, b, h, 1).
             out_partial = be.empty(
@@ -871,6 +916,7 @@ def _flash_attn_fwd(
                 if page_table is not None
                 else None
             ),
+            num_splits_dynamic=to_cute_i32(num_splits_dynamic),
         )
 
     # With seqused_k and V loaded by TMA, the kernel rewrites a per-CTA copy of the V
@@ -879,12 +925,19 @@ def _flash_attn_fwd(
     # batch and query shape.
     tensormap_workspace_tensor = None
     if page_table is None and seqused_k is not None:
-        q_mult = qhead_per_kvhead if pack_gqa else 1
-        n_q_rows = batch_size * seqlen_q * q_mult
-        m_blocks_bound = n_q_rows // m_block_size + 2 * batch_size + 1
-        n_heads_sched = num_head_kv if pack_gqa else num_head
-        n_ctas = max(m_blocks_bound * n_heads_sched * num_splits, 2 * be.multi_processor_count()) + 8
-        tensormap_workspace = be.empty(shape=[n_ctas, 16], dtype=be.int64)
+        n_ctas = tensormap_workspace_ctas(
+            batch_size,
+            seqlen_q,
+            qhead_per_kvhead if pack_gqa else 1,
+            m_block_size,
+            num_head_kv if pack_gqa else num_head,
+            num_splits,
+            be.multi_processor_count(),
+        )
+        if workspace is not None:
+            tensormap_workspace = workspace.tensormap_for(n_ctas)
+        else:
+            tensormap_workspace = be.empty(shape=[n_ctas, 16], dtype=be.int64)
         tensormap_workspace_tensor = from_dlpack(
             tensormap_workspace.detach(), assumed_align=128
         ).mark_layout_dynamic(leading_dim=1)
@@ -964,7 +1017,12 @@ def _flash_attn_fwd(
         # counts tiles of the packed (qhead_per_kvhead, seqlen_q) axis.
         fm_qhpk = qhead_per_kvhead if pack_gqa else 1
         num_m_blocks = (seqlen_q * fm_qhpk + fwd_m_tile_rows - 1) // fwd_m_tile_rows
-        flashmask_info.valid_block_count = be.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=be.int32)
+        vbc_shape = [fm_batch_size, fm_heads, num_m_blocks]
+        flashmask_info.valid_block_count = (
+            workspace.valid_block_count_view(vbc_shape)
+            if workspace is not None
+            else be.empty(vbc_shape, dtype=be.int32)
+        )
         cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         # With seqused_k the count stops at each batch's KV length, the same block range
         # the main kernel walks.
@@ -1008,7 +1066,9 @@ def _flash_attn_fwd(
     # configs it schedules persistently; passing it is harmless otherwise.
     sched_counter_tensor = None
     if compute_capability == 10:
-        if be.is_stream_capturing():
+        if workspace is not None:
+            sched_counter = workspace.sched_counter
+        elif be.is_stream_capturing():
             # Graphs captured on one stream may be replayed concurrently on different
             # streams, so each captured launch gets its own counter. The list keeps it alive
             # for as long as the graph may replay it.
@@ -1050,6 +1110,8 @@ def _flash_attn_fwd(
         kv_shared_fwd,
         # seqused_k adds a kernel argument, so it must select its own artifact.
         seqused_k is not None,
+        # per-batch split counts (#26) add a kernel argument too
+        num_splits_dynamic is not None,
         # paged KV: TMA per page vs cp.async rows
         page_table is not None,
         paged_kv_non_tma,

@@ -47,8 +47,9 @@ def _flash_attn_fwd_combine(
             not checked (it would need a device-to-host copy) and a larger value reads
             out of bounds. A value of 1 makes the combine skip batch b entirely and leave
             out / lse untouched, so the producer must have written that batch's final
-            out / lse itself. The SM100 forward does neither: it always cuts every batch
-            into out_partial.shape[0] ranges and writes only out_partial, which is why
+            out / lse itself. The SM100 forward does neither: it keeps out_partial.shape[0]
+            splits per batch (with seqlen_meta.num_splits_dynamic the splits past batch b's
+            count are empty and write LSE = -inf) and writes only out_partial, which is why
             _flash_attn_fwd does not pass this argument.
         semaphore_to_reset: Semaphore for synchronization
 

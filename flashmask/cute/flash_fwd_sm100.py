@@ -884,8 +884,8 @@ class FlashAttentionForwardSm100:
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             for t in (mQ, mK, mV, mO)
         ]
-        if const_expr(seqlen_meta is not None):
-            assert seqlen_meta.num_splits_dynamic is None, "per-batch num_splits is not wired yet"
+        if const_expr(seqlen_meta is not None and seqlen_meta.num_splits_dynamic is not None):
+            assert self.is_split_kv, "num_splits_dynamic needs the split-KV kernel"
         # Paged KV: K / V are (num_pages, page_size, h_k, d) pools and page_table
         # (b, max_pages) maps a sequence's logical page to a pool page.
         mPageTable = seqlen_meta.page_table if const_expr(seqlen_meta is not None) else None

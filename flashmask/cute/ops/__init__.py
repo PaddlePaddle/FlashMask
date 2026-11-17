@@ -12,8 +12,10 @@ from ._common import _check_cutedsl_supported
 from .bwd import _flash_attn_bwd
 from .combine import _flash_attn_fwd_combine
 from .fwd import _flash_attn_fwd
+from .workspace import FwdWorkspace
 
 __all__ = [
+    "FwdWorkspace",
     "_check_cutedsl_supported",
     "_flash_attn_bwd",
     "_flash_attn_fwd",

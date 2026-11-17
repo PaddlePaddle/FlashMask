@@ -48,6 +48,11 @@ class BlockInfo:
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
+            # Per-batch split count (#26): the grid keeps num_splits (the maximum) and the
+            # splits at or past this batch's count get an empty range, which has_kv_work
+            # skips; their LSE partial is still written as -inf.
+            if const_expr(seqlen_info.num_splits_dynamic is not None):
+                num_splits = seqlen_info.num_splits_dynamic
             num_n_blocks_per_split = (
                 cutlass.Int32(0)
                 if n_block_max <= n_block_min

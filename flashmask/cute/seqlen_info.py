@@ -38,10 +38,13 @@ class SeqlenMeta(NamedTuple):
 
 
 def seqlen_info_kwargs(meta: Optional[SeqlenMeta]) -> dict:
-    """Return the optional per-batch KV length argument for SeqlenInfoQK."""
+    """Return the optional per-batch arguments (KV length, split count) for SeqlenInfoQK."""
     if meta is None:
         return {}
-    return dict(mSeqUsedK=meta.seqused_k)
+    return dict(
+        mSeqUsedK=meta.seqused_k,
+        mNumSplitsDynamic=meta.num_splits_dynamic,
+    )
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,11 @@ class SeqlenInfoQK:
     m_block_offset: Int32
     block_idx_offset: Int32
     num_n_blocks: Int32
+    has_seqused_k: cutlass.Constexpr[bool]
+    has_cu_block_idx_offsets: cutlass.Constexpr[bool] = False
+    # Split-KV: the number of KV ranges this batch is cut into (#26), read from
+    # SeqlenMeta.num_splits_dynamic. None means every batch uses the grid's split count.
+    num_splits_dynamic: Optional[Int32] = None
 
     @staticmethod
     def create(
@@ -94,6 +102,7 @@ class SeqlenInfoQK:
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        mNumSplitsDynamic: Optional[cute.Tensor] = None,
     ):
         # Fixed-length only: q/k offsets are always 0 and seqlen_q is the static shape.
         # mSeqUsedK (int32 [batch]) gives each batch's KV length, else the static shape.
@@ -122,6 +131,11 @@ class SeqlenInfoQK:
             m_block_offset,
             block_idx_offset,
             num_n_blocks,
+            has_seqused_k=mSeqUsedK is not None,
+            has_cu_block_idx_offsets=mCuBlockIdxOffsets is not None,
+            num_splits_dynamic=(
+                mNumSplitsDynamic[batch_idx] if const_expr(mNumSplitsDynamic is not None) else None
+            ),
         )
 
     def offset_batch_Q(

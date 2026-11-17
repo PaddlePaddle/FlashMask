@@ -220,11 +220,15 @@ def _scan_max_min(
 
 _scan_max_min.compile_cache = {}
 
-def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128):
+def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128, alloc=None, column_scratch=None):
     """Prepare block-sparse max/min tensors for flashmask.
 
     The function will compute derived pointers/offsets and call scanMaxMinGpu
     for each existing input pointer.
+
+    alloc(shape) -> int32 tensor and column_scratch(shape) -> int32 tensor let a
+    preallocated FwdWorkspace (#26) supply the nblock buffers and the contiguous copy of a
+    strided mask column, so the call allocates nothing.
     """
     be = get_backend(flashmask_info.startend_row_indices)
 
@@ -232,31 +236,41 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
     # nblocks is rounded up to a multiple of 4; scan_max_min_kernel writes the tail too,
     # so the buffers can be allocated uninitialized (no zero-fill launch per tensor).
     nblocks = _compute_nblock_seqlen(seqlen_k, kBlockN)
+    if alloc is None:
+        alloc = lambda shape: be.empty(shape, dtype=be.int32)
+
+    def column(i):
+        col = flashmask_info.startend_row_indices[..., i]
+        if column_scratch is None or col.is_contiguous():
+            return col
+        buf = column_scratch(list(col.shape))
+        buf.copy_(col, False)
+        return buf
 
     if num_vecs == 1 and flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None:
-        flashmask_info.LTS_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
     elif num_vecs == 2 and flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.LTE_nblock_max is None and flashmask_info.LTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
     elif num_vecs == 2 and not flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
     elif num_vecs == 4 and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.LTE_nblock_max is None and flashmask_info.LTE_nblock_min is None and
@@ -264,18 +278,18 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
             
     ):
-        flashmask_info.LTS_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTS_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTS_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_max = be.empty([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_min = be.empty([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 2], batch * heads, seqlen_k, flashmask_info.UTS_nblock_max, flashmask_info.UTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 3], batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
+        _scan_max_min(column(2), batch * heads, seqlen_k, flashmask_info.UTS_nblock_max, flashmask_info.UTS_nblock_min, kBlockN)
+        _scan_max_min(column(3), batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
     else:
         raise ValueError(f"Unsupported num_vecs={num_vecs} in flashmask_info")
     
