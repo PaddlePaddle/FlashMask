@@ -54,14 +54,37 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         *args,
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
+        kv_shared: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        # kv_shared (v = k[..., :head_dim_v]): V is the first head_dim_v columns of the
+        # sK tile, so only K is loaded and a K stage is released after P @ V instead of
+        # after Q @ K^T.
+        self.kv_shared = kv_shared
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
+        # head_dim_v > 256 (d = dv = 512): a 64 x dv fp32 O no longer fits one WG's
+        # registers (256 regs/thread at dv = 512), so the two MMA WGs split N of both
+        # GEMMs instead of M. WG w computes S[:, w*N/2:(w+1)*N/2] and owns
+        # O[:, w*dv/2:(w+1)*dv/2]; thread t of both WGs owns the same rows. Per KV
+        # block the WGs exchange the row max through sRowStats (barrier PEmpty) and
+        # both halves of P go through sP (barrier PFull) before P @ V.
+        self.split_n = self.tile_hdimv > 256
+        if self.split_n:
+            assert self.tile_m == 64, "split_n: tile_m must be 64 (one WGMMA M atom)"
+            assert self.tile_hdimv % 128 == 0 and self.tile_n % 16 == 0
+            assert not self.mma_pv_is_rs, "split_n: P @ V reads all of P from smem"
+            assert not self.intra_wg_overlap, "split_n: intra-WG overlap not implemented"
+            assert not self.Q_in_regs
+            assert not self.is_local, "split_n: local (window) attention not supported yet"
+            assert not self.pack_gqa, "split_n: pack_gqa not supported"
+        if self.kv_shared:
+            assert self.split_n, "kv_shared is only wired up for the split_n (dv > 256) path"
+            assert self.tile_hdimv <= self.tile_hdim
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -88,14 +111,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
     def _get_tiled_mma(self):
+        # split_n: (1, 2, 1) puts the two WGs side by side along N.
+        atom_layout_mnk = (1, 2, 1) if self.split_n else (self.tile_m // 64, 1, 1)
+        num_wg_n = atom_layout_mnk[1]
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),
-            tiler_mn=(64, self.tile_n),
+            atom_layout_mnk=atom_layout_mnk,
+            tiler_mn=(64, self.tile_n // num_wg_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -103,8 +129,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            atom_layout_mnk=atom_layout_mnk,
+            tiler_mn=(64, self.tile_hdimv // num_wg_n),
             a_source=warpgroup.OperandSource.RMEM
             if self.mma_pv_is_rs
             else warpgroup.OperandSource.SMEM,
@@ -118,6 +144,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ]
             for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
         ]
+        if const_expr(self.kv_shared):
+            sV_struct = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, 0], self.buffer_align_bytes
+            ]  # sV is a view of sK
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
@@ -134,6 +164,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         mbar_ptr_rowidx_struct = cute.struct.MemRange[cutlass.Int64, rowidx_mbar_count]
         s_rowidx_struct = cute.struct.MemRange[Int32, rowidx_smem_count]
+        # split_n: cross-WG row max / row sum (empty otherwise).
+        row_stats_count = cute.cosize(self._row_stats_layout()) if const_expr(self.split_n) else 0
+        sRowStats_struct = cute.struct.MemRange[Float32, row_stats_count]
 
         @cute.struct
         class SharedStorageQKV:
@@ -142,6 +175,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_V: mbar_ptr_V_struct
             mbar_ptr_rowidx: mbar_ptr_rowidx_struct
             s_rowidx: s_rowidx_struct
+            sRowStats: sRowStats_struct
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -154,11 +188,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_V: mbar_ptr_V_struct
             mbar_ptr_rowidx: mbar_ptr_rowidx_struct
             s_rowidx: s_rowidx_struct
+            sRowStats: sRowStats_struct
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
 
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
+
+    def _row_stats_layout(self):
+        # (thread_in_wg, row, wg, kind): kind 0 = row max, 1 = row sum. Thread index
+        # innermost so the 128 threads of a WG hit distinct banks. A 64-row WGMMA
+        # accumulator holds 2 rows per thread.
+        return cute.make_layout((self.num_threads_per_warp_group, 2, 2, 2))
 
     @cute.jit
     def __call__(
@@ -230,7 +271,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_scheduler_barrier = (
             (self.num_wg_mma >= 2 and self.tile_hdim <= 128)
             if const_expr(self.intra_wg_overlap)
-            else (self.num_wg_mma == 2)
+            else (self.num_wg_mma == 2 and not self.split_n)
         )
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
@@ -251,6 +292,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (mO, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
+        if const_expr(self.kv_shared):
+            # sV views the first tile_hdimv columns of each sK stage: compose sK's
+            # (tile_n, tile_hdim, stage) layout with a column-truncating map.
+            self.sV_layout = cute.composition(
+                self.sK_layout,
+                cute.make_layout(
+                    (self.tile_n, self.tile_hdimv, self.num_stages),
+                    stride=(1, self.tile_n, self.tile_n * self.tile_hdim),
+                ),
+            )
         self.sP_layout = None
         if const_expr(not self.mma_pv_is_rs):
             self.sP_layout = sm90_utils.make_smem_layout(
@@ -299,13 +350,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             (self.tile_n, self.tile_hdim),
             1,  # No mcast for now
         )
-        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-            gmem_tiled_copy_KV,
-            mV,
-            cute.select(self.sV_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdimv),
-            1,  # No mcast for now
-        )
+        if const_expr(self.kv_shared):
+            tma_atom_V, tma_tensor_V = tma_atom_K, tma_tensor_K  # V is never loaded
+        else:
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                gmem_tiled_copy_KV,
+                mV,
+                cute.select(self.sV_layout, mode=[0, 1]),
+                (self.tile_n, self.tile_hdimv),
+                1,  # No mcast for now
+            )
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
             mO_tma = mO_og if const_expr(self.pack_gqa) else mO
@@ -492,7 +546,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        if const_expr(not self.Q_in_regs):
+        if const_expr(self.kv_shared):
+            sV = storage.sK.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        elif const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         else:
             sV = storage.sQ.get_tensor(
@@ -512,6 +568,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             s_rowidx = storage.s_rowidx.get_tensor(
                 cute.make_layout(4 * self.tile_n * self.num_stages)
             )
+        sRowStats = None
+        if const_expr(self.split_n):
+            sRowStats = storage.sRowStats.get_tensor(self._row_stats_layout())
 
         block_info = BlockInfo(
             self.tile_m,
@@ -607,6 +666,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 flashmask_info,
                 s_rowidx,
                 mbar_ptr_rowidx,
+                sRowStats,
             )
 
     @cute.jit
@@ -757,10 +817,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
                     if is_kv_load_warp:
                         if const_expr(not self.intra_wg_overlap):
-                            pipeline_v.producer_acquire(kv_producer_state)
-                            load_V(
-                                block=n_block, producer_state=kv_producer_state
-                            )
+                            if const_expr(not self.kv_shared):
+                                pipeline_v.producer_acquire(kv_producer_state)
+                                load_V(
+                                    block=n_block, producer_state=kv_producer_state
+                                )
                             kv_producer_state.advance()
 
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
@@ -894,7 +955,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We only need producer_tail on V since that's the last that's loaded, we don't
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
-                pipeline_v.producer_tail(kv_producer_state)
+                if const_expr(self.kv_shared):
+                    pipeline_k.producer_tail(kv_producer_state)
+                else:
+                    pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
     def _produce_flashmask_bs(
@@ -984,8 +1048,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             s_rowidx, flashmask_info, mbar_ptr_rowidx, seqlen_k, m_block, seqlen_q,
                             is_partial=self._mask_partial_at(mask_idx, mask_cnt, p),
                         )
-                    pipeline_v.producer_acquire(kv_producer_state)
-                    tma_load_V_fn(src_idx=n_block, producer_state=kv_producer_state)
+                    if const_expr(not self.kv_shared):
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        tma_load_V_fn(src_idx=n_block, producer_state=kv_producer_state)
                     kv_producer_state.advance()
         return kv_producer_state
 
@@ -1054,8 +1119,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         loop-carried state correct (mirrors load_block_list)."""
         pipeline_k.producer_acquire(kv_producer_state)
         load_K(block=n_block, producer_state=kv_producer_state)
-        pipeline_v.producer_acquire(kv_producer_state)
-        load_V(block=n_block, producer_state=kv_producer_state)
+        if const_expr(not self.kv_shared):
+            pipeline_v.producer_acquire(kv_producer_state)
+            load_V(block=n_block, producer_state=kv_producer_state)
         if const_expr(self.enable_flashmask):
             self.load_startend_row_indices(
                 batch_idx,
@@ -1192,11 +1258,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         flashmask_info: Optional[FlashMaskInfo] = None,
         s_rowidx: Optional[cute.Tensor] = None,
         mbar_ptr_rowidx: Optional[cute.Pointer] = None,
+        sRowStats: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
+        # split_n: what a WG needs to exchange row stats with the other WG.
+        row_stats = None
+        if const_expr(self.split_n):
+            row_stats = SimpleNamespace(
+                sRowStats=sRowStats,
+                tidx_in_wg=tidx % self.num_threads_per_warp_group,
+                wg_idx=warp_group_idx,
+            )
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
@@ -1253,6 +1328,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_copy_params=smem_copy_params,
             check_inf=True,
             scores_scale=scores_scale,
+            **({"row_stats": row_stats} if const_expr(self.split_n) else {}),
         )
 
         process_first_half_block = partial(
@@ -1504,6 +1580,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
 
             # normalize acc_O by row_sum and calculate the lse
+            if const_expr(self.split_n):
+                self.combine_row_sum_split_n(softmax, row_stats)
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
@@ -1821,13 +1899,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         flashmask_is_partial: Optional[Int32] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        row_stats: Optional[SimpleNamespace] = None,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
-        pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(not self.kv_shared):  # kv_shared: the K stage is also V, see below
+            pipeline_k.consumer_release(smem_pipe_read)
 
         # handle masking
         if const_expr(mask_fn is not None):
@@ -1837,7 +1917,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(flashmask_fn is not None):
             flashmask_fn(acc_S, smem_pipe_read, n_block, is_partial=flashmask_is_partial)
 
-        row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+        if const_expr(self.split_n):
+            row_scale = self.online_softmax_split_n(
+                softmax, acc_S, row_stats, is_first=is_first_n_block, check_inf=check_inf
+            )
+        else:
+            row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
             tOrP
@@ -1856,14 +1941,93 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+            if const_expr(self.split_n):
+                # P @ V reads both WGs' halves of P.
+                self._barrier_split_n(NamedBarrierFwd.PFull)
+            else:
+                cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+        if const_expr(not self.kv_shared):
+            pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
-        pipeline_v.consumer_release(smem_pipe_read)
+        if const_expr(self.kv_shared):
+            pipeline_k.consumer_release(smem_pipe_read)
+        else:
+            pipeline_v.consumer_release(smem_pipe_read)
         smem_pipe_read.advance()
         return smem_pipe_read
+
+    def _barrier_split_n(self, barrier: NamedBarrierFwd):
+        cute.arch.barrier(barrier_id=int(barrier), number_of_threads=self.num_mma_threads)
+
+    @cute.jit
+    def online_softmax_split_n(
+        self,
+        softmax: Softmax,
+        acc_S: cute.Tensor,
+        row_stats: SimpleNamespace,
+        is_first: cutlass.Constexpr[bool] = False,
+        check_inf: cutlass.Constexpr[bool] = True,
+    ) -> cute.Tensor:
+        """Softmax.online_softmax with the row max taken over both WGs' halves of S.
+
+        The row sum stays a per-WG partial; combine_row_sum_split_n adds the halves
+        once before finalize.
+        """
+        sRowStats, t, wg = row_stats.sRowStats, row_stats.tidx_in_wg, row_stats.wg_idx
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        row_scale = cute.make_fragment_like(softmax.row_max, Float32)
+        row_max_local = cute.make_fragment_like(softmax.row_max, Float32)
+        row_max = softmax.row_max
+        row_sum = softmax.row_sum
+        scale_log2 = softmax.scale_log2
+        # Local max over this WG's columns (and the previous global max), quad-reduced.
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            m = utils.fmax_reduce(
+                acc_S_mn[r, None].load(),
+                init_val=row_max[r] if const_expr(not is_first) else None,
+                arch=softmax.arch,
+            )
+            m = cute.arch.warp_reduction_max(m, threads_in_group=4)
+            row_max_local[r] = m
+            sRowStats[t, r, wg, 0] = m
+        # Publishes the max. It also means both WGs finished the previous P @ V
+        # (wait_group 0), so sP may be overwritten below.
+        self._barrier_split_n(NamedBarrierFwd.PEmpty)
+        for r in cutlass.range(cute.size(row_max), unroll_full=True):
+            row_max_cur = utils.fmax(row_max_local[r], sRowStats[t, r, 1 - wg, 0])
+            row_max_prev = row_max[r]
+            row_max[r] = row_max_cur
+            if const_expr(check_inf):
+                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
+            acc_S_row_exp = cute.math.exp2(
+                acc_S_mn[r, None].load() * scale_log2 - row_max_cur * scale_log2, fastmath=True
+            )
+            if const_expr(is_first):
+                row_scale[r] = 1.0
+                row_sum[r] = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=softmax.arch)
+            else:
+                row_scale[r] = cute.math.exp2(
+                    (row_max_prev - row_max_cur) * scale_log2, fastmath=True
+                )
+                row_sum[r] = utils.fadd_reduce(
+                    acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=softmax.arch
+                )
+            acc_S_mn[r, None].store(acc_S_row_exp)
+        return row_scale
+
+    @cute.jit
+    def combine_row_sum_split_n(self, softmax: Softmax, row_stats: SimpleNamespace):
+        """Add the other WG's per-thread partial row sum. Thread t of both WGs owns the
+        same rows, so the quad reduction in Softmax.finalize then yields the full sum."""
+        sRowStats, t, wg = row_stats.sRowStats, row_stats.tidx_in_wg, row_stats.wg_idx
+        row_sum = softmax.row_sum
+        for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            sRowStats[t, r, wg, 1] = row_sum[r]
+        self._barrier_split_n(NamedBarrierFwd.PFull)
+        for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            row_sum[r] += sRowStats[t, r, 1 - wg, 1]
 
     @cute.jit
     def mma_one_n_block_intrawg_overlap(

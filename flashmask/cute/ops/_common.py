@@ -72,30 +72,18 @@ def _get_compute_capability(be):
 
 
 def _is_valid_flash_dims(query, key, value, compute_capability):
+    # SM90 and SM100 (the only archs with kernels) support the same head-dim combos,
+    # so compute_capability does not narrow the set.
     q_headdim, k_headdim, v_headdim = query.shape[-1], key.shape[-1], value.shape[-1]
-    if (
+    return (
         (q_headdim <= 128 and k_headdim <= 128 and v_headdim <= 128)
-        or (q_headdim == 192 and k_headdim == 192 and v_headdim == 128)
-        or (q_headdim == 256 and k_headdim == 256 and v_headdim == 256)
-    ):
-        return True
-    # SM100 large head_dim, forward + backward.
-    # has been run end to end.
-    #   512/512 : forward + backward verified
-    if compute_capability == 10:
-        if (
-            (q_headdim == 512 and k_headdim == 512 and v_headdim == 512) or
-            (q_headdim == 576 and k_headdim == 576 and v_headdim == 512)
-        ):
-            return True
-    return False
+        or (q_headdim, k_headdim, v_headdim)
+        in ((192, 192, 128), (256, 256, 256), (512, 512, 512), (576, 576, 512))
+    )
 
 
 _SUPPORTED_HEAD_DIMS_DESC = (
-    "q/k/v all <= 128, or 192/192/128, or 256/256/256"
-)
-_SUPPORTED_HEAD_DIMS_DESC_SM100 = (
-    _SUPPORTED_HEAD_DIMS_DESC + ", or 512/512/512, or 576/576/512"
+    "q/k/v all <= 128, or 192/192/128, or 256/256/256, or 512/512/512, or 576/576/512"
 )
 
 
@@ -119,11 +107,7 @@ def _check_cutedsl_supported(query, key, value, be):
         "unsupported head_dim combination "
         f"(q={query.shape[-1]}, k={key.shape[-1]}, v={value.shape[-1]}) "
         f"on SM{compute_capability}0. Supported: "
-        + (
-            _SUPPORTED_HEAD_DIMS_DESC_SM100
-            if compute_capability == 10
-            else _SUPPORTED_HEAD_DIMS_DESC
-        )
+        + _SUPPORTED_HEAD_DIMS_DESC
     )
 
 
@@ -152,7 +136,7 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False, kv_shared=False, gqa=False):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -211,6 +195,37 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
             )
+    elif head_dim > 256:
+        # hdim 512 (FlashAttentionBackwardSm90.dQ_chunked): the d256 flag set with
+        # tile_n = 32. Resident dK + dV are 2 * 32 * 512 fp32 = 128 regs/thread over the
+        # two MMA WGs, and smem is Q 64K + dO 64K + K 32K + V 32K + P/dS 8K ~= 201 KB, so
+        # every pipeline is single-stage. dQ is chunked and atomicAdd'ed (non-deterministic).
+        assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
+            f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
+            f"(got {head_dim}/{head_dim_v})"
+        )
+        # 576 = 9 x 64 cannot be halved across the two WGs along head_dim (the 512
+        # layout puts head_dim on the M atoms of dK^T / dQ^T), so 576/512 splits the
+        # WGs along tile_n for dK/dV (576x16 / 512x16 per WG, 136 regs/thread) and
+        # along tile_m for dQ (9 slices of 64 rows). smem ~= 212 KB.
+        split_hdim_atoms = head_dim % 128 == 0
+        # kv_shared merges dV into dK's accumulator and drops sV, which buys a larger
+        # KV tile for 512: n=64 (dKV 128 regs/thread, Q 64K + dO 64K + K 64K + P/dS 16K
+        # ~= 208 KB). 576 stays at n=32: n=64 would need ~232 KB, and n=48 gives each WG
+        # 24 columns of dK^T/dV^T (AtomLayoutNdKV=2), which computes a wrong dK on the
+        # H card (MHA) and breaks the GQA dK accum postprocess.
+        if kv_shared and split_hdim_atoms:
+            n_block_size = 64
+        else:
+            n_block_size = 32
+        return BwdConfig(
+            m_block_size=64, n_block_size=n_block_size,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
+            AtomLayoutMSdP=1,
+            AtomLayoutNdKV=1 if split_hdim_atoms else 2,
+            AtomLayoutMdQ=1 if split_hdim_atoms else 2,
+        )
     else:
         # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90); dKV/dQ MMAs
         # use swapAB. The dQ-accumulation path drives the smem budget and must

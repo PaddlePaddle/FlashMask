@@ -102,7 +102,18 @@ def _flash_attn_bwd(
     # 512-col TMEM budget, so that kernel chunks the head_dim axes and drains every
     # output through the fp32 gmem accumulators. See flash_bwd_sm100_bigd.py.
     is_bigd_bwd = compute_capability == 10 and (head_dim > 256 or head_dim_v > 256)
-    assert is_bigd_bwd or (head_dim <= 256 and head_dim_v <= 256), (
+    # SM90 512/512 and 576/512 run on FlashAttentionBackwardSm90 with dQ_chunked (tile 64 x 32,
+    # resident dK/dV, dQ atomicAdd'ed in head_dim slices). kv_shared (detected below)
+    # merges dV into dK's accumulator, like the SM100 big-d kernel.
+    is_bigd_bwd_sm90 = compute_capability == 9 and (head_dim > 256 or head_dim_v > 256)
+    if is_bigd_bwd_sm90:
+        assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
+            f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
+            f"(got {head_dim}/{head_dim_v})"
+        )
+        # causal and flashmask run on the shared mainloop (mask_fn / flashmask segments).
+        assert group is None, "SM90 hd512 bwd: overlap not supported"
+    assert is_bigd_bwd or is_bigd_bwd_sm90 or (head_dim <= 256 and head_dim_v <= 256), (
         f"backward does not support head_dim={head_dim}, head_dim_v={head_dim_v} "
         f"on sm_{compute_capability}0"
     )
@@ -121,7 +132,7 @@ def _flash_attn_bwd(
     # zero-fill columns 512..575; that keeps d_chunk at the measured 192 instead
     # of narrowing it.
     kv_shared = (
-        is_bigd_bwd
+        (is_bigd_bwd or is_bigd_bwd_sm90)
         and (head_dim, head_dim_v) in ((512, 512), (576, 512))
         and k.dtype == v.dtype
         and list(k.shape[:-1]) == list(v.shape[:-1])
@@ -166,6 +177,8 @@ def _flash_attn_bwd(
             sparse_block_size_q=None,
             flashmask=flashmask_info is not None,
             deterministic=deterministic,
+            kv_shared=kv_shared,
+            gqa=num_head != num_head_kv,
         ).n_block_size
 
     # FM-4 backward consumes one split-AG segment at a time and gates each KV tile
@@ -247,6 +260,8 @@ def _flash_attn_bwd(
             sparse_block_size_q=sparse_q,
             flashmask=cute_flashmask_info is not None,
             deterministic=deterministic,
+            kv_shared=kv_shared,
+            gqa=num_head != num_head_kv,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -316,7 +331,9 @@ def _flash_attn_bwd(
         for t in (q, k, v, out, dout, lse)
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256 or is_bigd_bwd, "head_dim must be less than or equal to 256"
+    assert head_dim <= 256 or is_bigd_bwd or is_bigd_bwd_sm90, (
+        "head_dim must be less than or equal to 256"
+    )
     alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
@@ -611,6 +628,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             deterministic,
+            kv_shared,
         )
     else:
         compile_key = (
@@ -666,6 +684,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 # subtile_factor=subtile_factor,
                 # dQ_single_wg=dQ_single_wg,
+                kv_shared=kv_shared,
             )
 
             # Compile with FA4-style fake tensors (fully-symbolic dims with stride
@@ -1181,9 +1200,11 @@ def _flash_attn_bwd(
                 tag,
             )
     else:
+        # SM90 kv_shared folded softmax_scale into dS, so dQ and dK(+dV) arrive scaled.
+        post_scale = cutlass.Float32(1.0) if kv_shared else softmax_scale
         # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
         _postprocess_run(
-            dq_accum_tensor, dq_tensor, softmax_scale,
+            dq_accum_tensor, dq_tensor, post_scale,
             head_dim, m_block_size, AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs, 1, "dq",
         )
@@ -1192,10 +1213,11 @@ def _flash_attn_bwd(
             _postprocess_run(
                 _kv_accum_cute(dk_accum, dk_accum_tensor, head_dim_rounded),
                 _kv_out_cute(dk, dk_tensor),
-                softmax_scale,
+                post_scale,
                 head_dim, n_block_size_kv_post, AtomLayoutNdKV, dKV_swapAB,
                 dKV_accum_folded, cluster_size, "dk",
             )
+        if qhead_per_kvhead > 1 and not kv_shared:  # kv_shared: dv is the zero gradient
             _postprocess_run(
                 _kv_accum_cute(dv_accum, dv_accum_tensor, head_dim_v_rounded),
                 _kv_out_cute(dv, dv_tensor),
