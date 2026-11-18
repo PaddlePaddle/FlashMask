@@ -88,15 +88,14 @@ class FlashAttentionBackwardSm90:
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
         self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
-        # kv_shared (v = k[..., :head_dim_v], big head dim only): V is read from sK, so the
-        # dv axis is padded to head_dim. The dO TMA zero-fills columns head_dim_v..head_dim,
-        # which keeps dP = dO V^T exact and makes dV^T the same shape as dK^T: the dV GEMM
-        # accumulates straight into acc_dK (one dKV accumulator), and softmax_scale moves
-        # into dS so the merged accumulator needs no per-term scaling.
+        # kv_shared (v = k[..., :head_dim_v], big head dim only): V is the first head_dim_v
+        # columns of sK and dV^T lands in the first head_dim_v rows of dK^T, so the dV GEMM
+        # accumulates straight into acc_dK (one dKV accumulator). softmax_scale moves into
+        # dS so the merged accumulator needs no per-term scaling. dv is not padded to d
+        # (576/512 keeps dO, dP and dV at 512 columns).
         self.kv_shared = kv_shared
         if kv_shared:
             assert head_dim > 256 and head_dim_v <= head_dim
-            self.tile_hdimv = self.tile_hdim
         # Can save registers (and hence be faster) if we don't have to check hdim predication
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
@@ -258,8 +257,13 @@ class FlashAttentionBackwardSm90:
             self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv), None
         )
         if const_expr(self.kv_shared):
-            # sV is sK (same tile, tile_hdimv == tile_hdim), so it must use sK's layout.
+            # sV is sK, or (dv < d) the view of sK's first tile_hdimv columns.
             self.sV_layout = self.sK_layout
+            if const_expr(self.tile_hdimv != self.tile_hdim):
+                self.sV_layout = cute.composition(
+                    self.sK_layout,
+                    cute.make_layout((self.tile_n, self.tile_hdimv), stride=(1, self.tile_n)),
+                )
         # Accomodate both S and S.T
         wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
         wg_n_dKV = self.AtomLayoutNdKV
@@ -527,12 +531,15 @@ class FlashAttentionBackwardSm90:
             for name, mX, layout in [
                 ("Q", mQ, self.sQ_layout),
                 ("K", mK, self.sK_layout),
-                ("V", mK if const_expr(self.kv_shared) else mV, self.sV_layout),
                 ("dO", mdO, self.sdO_layout),
             ]
         }
         if const_expr(self.kv_shared):
             self.tma_copy_bytes["V"] = 0  # V is never loaded: it is the sK tile
+        else:
+            self.tma_copy_bytes["V"] = cute.size_in_bytes(
+                mV.element_type, cute.select(self.sV_layout, mode=[0, 1])
+            )
         self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = (
@@ -553,12 +560,15 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sK_layout, mode=[0, 1]),
             (self.tile_n, self.tile_hdim),
         )
-        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mK if const_expr(self.kv_shared) else mV,  # unused under kv_shared
-            cute.select(self.sV_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdimv),
-        )
+        if const_expr(self.kv_shared):
+            tma_atom_V, tma_tensor_V = tma_atom_K, tma_tensor_K  # unused: V is never loaded
+        else:
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mV,
+                cute.select(self.sV_layout, mode=[0, 1]),
+                (self.tile_n, self.tile_hdimv),
+            )
         tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             mdO,
@@ -755,8 +765,10 @@ class FlashAttentionBackwardSm90:
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        if const_expr(self.kv_shared):
+        if const_expr(self.kv_shared and self.tile_hdimv == self.tile_hdim):
             sV = sK  # no sV storage: V is the K tile
+        elif const_expr(self.kv_shared):
+            sV = storage.sK.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         else:
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sP = None
@@ -1231,9 +1243,16 @@ class FlashAttentionBackwardSm90:
         else:
             mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrQt)
         if const_expr(self.kv_shared):
-            # dV^T has dK^T's shape (tile_hdimv == tile_hdim): one dKV accumulator.
+            # One dKV accumulator: dV^T is dK^T, or (dv < d) its first tile_hdimv rows. The
+            # WGs split tile_n, so both tiled MMAs walk the same 64-row M tiles in order and
+            # dV's (MMA_M = dv/64) accumulator is a prefix of dK's (MMA_M = d/64).
+            acc_dKV_v = acc_dK
+            if const_expr(self.tile_hdimv != self.tile_hdim):
+                assert cute.size(acc_dK, mode=[2]) == 1 and cute.size(acc_dV, mode=[2]) == 1
+                assert acc_dK.layout.stride[1] == acc_dV.layout.stride[1]
+                acc_dKV_v = cute.make_tensor(acc_dK.iterator, acc_dV.layout)
             mma_pdo_fn = partial(
-                gemm_w_idx, tiled_mma_dV, acc_dK, tdVrPt, tdVrdOt, swap_AB=self.dKV_swapAB
+                gemm_w_idx, tiled_mma_dV, acc_dKV_v, tdVrPt, tdVrdOt, swap_AB=self.dKV_swapAB
             )
         # dQ = dS @ K
         sKt = layout_utils.transpose_view(sK)
@@ -1435,6 +1454,10 @@ class FlashAttentionBackwardSm90:
                         mask_local=self.is_local,
                     )
                     dKV_accumulate = False
+                    if const_expr(self.kv_shared and self.tile_hdimv != self.tile_hdim):
+                        # dV only covers dK^T's first dv rows: zero the whole accumulator
+                        # up front and let both GEMMs accumulate.
+                        acc_dK.fill(0.0)
                     # flashmask: stage this n_block's startend_row_indices into smem
                     # once (fixed across the whole m loop), and build the apply fn.
                     flashmask_fn = None
@@ -1920,7 +1943,10 @@ class FlashAttentionBackwardSm90:
             # Each dQ slice is atomicAdd'ed as soon as its MMA completes, so only one
             # slice of acc_dQ is live at a time.
             mma_pdo_fn(
-                A_idx=smem_idx_PdS, B_idx=smem_idx_dO, zero_init=not dKV_accumulate, wg_wait=-1
+                A_idx=smem_idx_PdS, B_idx=smem_idx_dO,
+                zero_init=not dKV_accumulate
+                and not (self.kv_shared and self.tile_hdimv != self.tile_hdim),
+                wg_wait=-1,
             )
             cute.arch.fence_view_async_shared()
             PdS_barrier.arrive_and_wait()

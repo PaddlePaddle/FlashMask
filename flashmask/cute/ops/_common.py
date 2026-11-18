@@ -210,14 +210,11 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         # along tile_m for dQ (9 slices of 64 rows). smem ~= 212 KB.
         split_hdim_atoms = head_dim % 128 == 0
         # kv_shared merges dV into dK's accumulator and drops sV, which buys a larger
-        # KV tile for 512: n=64 (dKV 128 regs/thread, Q 64K + dO 64K + K 64K + P/dS 16K
-        # ~= 208 KB). 576 stays at n=32: n=64 would need ~232 KB, and n=48 gives each WG
-        # 24 columns of dK^T/dV^T (AtomLayoutNdKV=2), which computes a wrong dK on the
-        # H card (MHA) and breaks the GQA dK accum postprocess.
-        if kv_shared and split_hdim_atoms:
-            n_block_size = 64
-        else:
-            n_block_size = 32
+        # KV tile: n=64 (512: dKV 128 regs/thread, Q 64K + dO 64K + K 64K + P/dS 16K ~= 208
+        # KB; 576: dKV 144 regs/thread, Q 72K + dO 64K + K 72K + P/dS 16K ~= 225 KB, dO
+        # stays 512 wide). n=48 is out: 24 columns of dK^T/dV^T per WG (AtomLayoutNdKV=2)
+        # computes a wrong dK on the H card and breaks the GQA dK accum postprocess.
+        n_block_size = 64 if kv_shared else 32
         return BwdConfig(
             m_block_size=64, n_block_size=n_block_size,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
