@@ -85,6 +85,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if self.kv_shared:
             assert self.split_n, "kv_shared is only wired up for the split_n (dv > 256) path"
             assert self.tile_hdimv <= self.tile_hdim
+        # kv_shared with d > dv (576/512): two K stages of 576 columns do not fit next to
+        # Q, so K is split into a main part (the first dv columns, which is also V; one
+        # buffer per stage, released after P @ V) and a "rope" part (the last d - dv
+        # columns; a single buffer, released after Q @ K^T). Q @ K^T runs as two GEMMs.
+        # The rope part uses the V pipeline slot (V itself is never loaded).
+        self.k_rope = self.kv_shared and self.tile_hdim != self.tile_hdimv
+        if self.k_rope:
+            self.tile_hdim_rope = self.tile_hdim - self.tile_hdimv
+            assert self.tile_hdim_rope == 64 and self.tile_hdimv % self.tile_hdim_rope == 0
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -193,7 +202,33 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sK: sK_struct
             sP: sP_struct
 
+        if const_expr(self.k_rope):
+            sKr_struct = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, cute.cosize(self._sKr_layout())],
+                self.buffer_align_bytes,
+            ]
+
+            @cute.struct
+            class SharedStorageQKRope:
+                mbar_ptr_Q: mbar_ptr_Q_struct
+                mbar_ptr_K: mbar_ptr_K_struct
+                mbar_ptr_V: mbar_ptr_V_struct  # the rope pipeline (1 stage)
+                mbar_ptr_rowidx: mbar_ptr_rowidx_struct
+                s_rowidx: s_rowidx_struct
+                sRowStats: sRowStats_struct
+                sQ: sQ_struct
+                sK: sK_struct
+                sKr: sKr_struct
+                sP: sP_struct
+
+            return SharedStorageQKRope
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
+
+    def _sKr_layout(self):
+        # k_rope: the single K rope buffer, (tile_n, d - dv, 1 stage).
+        return sm90_utils.make_smem_layout(
+            self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdim_rope), 1
+        )
 
     def _row_stats_layout(self):
         # (thread_in_wg, row, wg, kind): kind 0 = row max, 1 = row sum. Thread index
@@ -292,7 +327,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (mO, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
-        if const_expr(self.kv_shared):
+        if const_expr(self.k_rope):
+            # sK holds only the main (first tile_hdimv) columns, which are V as is.
+            self.sK_layout = sm90_utils.make_smem_layout(
+                mK.element_type, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv),
+                self.num_stages,
+            )
+            self.sV_layout = self.sK_layout
+        elif const_expr(self.kv_shared):
             # sV views the first tile_hdimv columns of each sK stage: compose sK's
             # (tile_n, tile_hdim, stage) layout with a column-truncating map.
             self.sV_layout = cute.composition(
@@ -330,6 +372,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 ("V", mV, self.sV_layout),
             ]
         }
+        if const_expr(self.k_rope):
+            self.tma_copy_bytes["V"] = cute.size_in_bytes(
+                mK.element_type, cute.select(self._sKr_layout(), mode=[0, 1])
+            )
         make_tiled_tma_atom_fn = (
             partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
             if const_expr(self.pack_gqa)
@@ -347,10 +393,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             gmem_tiled_copy_KV,
             mK,
             cute.select(self.sK_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdim),
+            (self.tile_n, self.tile_hdimv if const_expr(self.k_rope) else self.tile_hdim),
             1,  # No mcast for now
         )
-        if const_expr(self.kv_shared):
+        if const_expr(self.k_rope):
+            # The V slot carries the K rope columns.
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                gmem_tiled_copy_KV,
+                mK,
+                cute.select(self._sKr_layout(), mode=[0, 1]),
+                (self.tile_n, self.tile_hdim_rope),
+                1,
+            )
+        elif const_expr(self.kv_shared):
             tma_atom_V, tma_tensor_V = tma_atom_K, tma_tensor_K  # V is never loaded
         else:
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
@@ -531,7 +586,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         pipeline_v = pipeline_custom.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_V.data_ptr(),
-            num_stages=self.num_stages,
+            num_stages=1 if const_expr(self.k_rope) else self.num_stages,
             producer_group=tma_warp,
             consumer_group=mma_warps,
             tx_count=self.tma_copy_bytes["V"],
@@ -546,7 +601,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        if const_expr(self.kv_shared):
+        sQm = sQr = sKr = None
+        if const_expr(self.k_rope):
+            sV = sK
+            # Q's first dv columns (main) and its last d - dv columns (rope).
+            sQm_layout = cute.composition(
+                sQ_layout, cute.make_layout((self.tile_m, self.tile_hdimv), stride=(1, self.tile_m))
+            )
+            sQm = storage.sQ.get_tensor(sQm_layout.outer, swizzle=sQm_layout.inner)
+            sQr = cute.local_tile(
+                sQ, (self.tile_m, self.tile_hdim_rope), (0, self.tile_hdimv // self.tile_hdim_rope)
+            )
+            sKr_layout = self._sKr_layout()
+            sKr = storage.sKr.get_tensor(sKr_layout.outer, swizzle=sKr_layout.inner)
+        elif const_expr(self.kv_shared):
             sV = storage.sK.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         elif const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
@@ -615,7 +683,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mV,
                 sQ,
                 sK,
-                sV,
+                sKr if const_expr(self.k_rope) else sV,  # k_rope: the V slot loads the rope part
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -667,6 +735,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 s_rowidx,
                 mbar_ptr_rowidx,
                 sRowStats,
+                sQm=sQm,
+                sQr=sQr,
+                sKr=sKr,
             )
 
     @cute.jit
@@ -733,8 +804,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
                     None, None, head_idx_kv
                 ]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                if const_expr(self.k_rope):
+                    # mV is the rope TMA tensor (all d columns); sV is the rope buffer.
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                    gV = cute.local_tile(
+                        mV_cur,
+                        (self.tile_n, self.tile_hdim_rope),
+                        (None, self.tile_hdimv // self.tile_hdim_rope),
+                    )
+                else:
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                 # TODO: mcast
                 tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_K, 0, cute.make_layout(1), gK, sK,
@@ -744,6 +824,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     tma_atom_V, 0, cute.make_layout(1), gV, sV,
                 )
                 tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
+                if const_expr(self.k_rope):
+                    # Every K load (all producer paths go through tma_load_K_fn) also
+                    # loads the rope part on its own 1-stage pipeline.
+                    tma_load_K_fn = partial(
+                        self._load_K_main_rope, tma_load_K_fn, tma_load_V_fn, pipeline_v
+                    )
 
                 load_K = partial(
                     self.load_KV,
@@ -957,6 +1043,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if is_kv_load_warp:
                 if const_expr(self.kv_shared):
                     pipeline_k.producer_tail(kv_producer_state)
+                    if const_expr(self.k_rope):
+                        pipeline_v.producer_tail(self._rope_state(kv_producer_state, True))
                 else:
                     pipeline_v.producer_tail(kv_producer_state)
 
@@ -1139,6 +1227,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         kv_producer_state.advance()
         return kv_producer_state
 
+    @staticmethod
+    def _rope_state(kv_state: pipeline.PipelineState, producer: bool) -> pipeline.PipelineState:
+        """k_rope: the 1-stage rope pipeline state for the same KV block as kv_state
+        (the rope buffer is filled and drained once per block, in KV order)."""
+        count = kv_state.count
+        phase = (count & 1) ^ 1 if producer else count & 1
+        return pipeline.PipelineState(1, count, Int32(0), phase)
+
+    def _load_K_main_rope(
+        self, tma_load_main_fn, tma_load_rope_fn, pipeline_kr, src_idx, producer_state, **kwargs
+    ):
+        """k_rope: load the K main part into the (already acquired) K stage, then the
+        rope part once the rope buffer is free (released after the previous Q @ K^T)."""
+        tma_load_main_fn(src_idx=src_idx, producer_state=producer_state, **kwargs)
+        rope_state = self._rope_state(producer_state, True)
+        pipeline_kr.producer_acquire(rope_state)
+        tma_load_rope_fn(src_idx=src_idx, producer_state=rope_state)
+
+    def _mma_qk_rope(self, tiled_mma, shape, tSrQm, tSrK, tSrQr, tSrKr, B_idx=None, wg_wait=-1):
+        """k_rope: S = Q[:, :dv] @ Kmain^T + Q[:, dv:] @ Krope^T."""
+        acc = sm90_utils.gemm_zero_init(tiled_mma, shape, tSrQm, tSrK, B_idx=B_idx, wg_wait=-1)
+        sm90_utils.gemm(
+            tiled_mma, acc, tSrQr, tSrKr[None, None, None, 0], zero_init=False, wg_wait=wg_wait
+        )
+        return acc
+
     @cute.jit
     def load_KV(
         self,
@@ -1259,6 +1373,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         s_rowidx: Optional[cute.Tensor] = None,
         mbar_ptr_rowidx: Optional[cute.Pointer] = None,
         sRowStats: Optional[cute.Tensor] = None,
+        sQm: Optional[cute.Tensor] = None,
+        sQr: Optional[cute.Tensor] = None,
+        sKr: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1275,12 +1392,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
-        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
-            wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
-        )
-        mma_qk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
-        )
+        if const_expr(self.k_rope):
+            _, tSrQm, tSrK = sm90_utils.partition_fragment_ABC(
+                wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdimv), sQm, sK
+            )
+            _, tSrQr, tSrKr = sm90_utils.partition_fragment_ABC(
+                wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim_rope), sQr, sKr
+            )
+            mma_qk_fn = partial(
+                self._mma_qk_rope, tiled_mma_qk, (self.tile_m, self.tile_n),
+                tSrQm, tSrK, tSrQr, tSrKr,
+            )
+        else:
+            _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+                wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
+            )
+            mma_qk_fn = partial(
+                sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
+            )
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
@@ -1902,12 +2031,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         row_stats: Optional[SimpleNamespace] = None,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        if const_expr(self.k_rope):  # pipeline_v carries the K rope part
+            rope_read = self._rope_state(smem_pipe_read, False)
+            pipeline_v.consumer_wait(rope_read, pipeline_v.consumer_try_wait(rope_read))
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         if const_expr(not self.kv_shared):  # kv_shared: the K stage is also V, see below
             pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(self.k_rope):
+            pipeline_v.consumer_release(rope_read)
 
         # handle masking
         if const_expr(mask_fn is not None):

@@ -176,10 +176,10 @@ def _flash_attn_fwd(
         assert group is None, "SM90 hd512 fwd: overlap not supported"
         m_block_size = 64
         n_block_size = 64
-        # 512 shared: Q 64K + 2 K stages 128K + P 8K + row stats 4K ~= 205 KB.
-        # 576 shared keeps one stage (2 x 72K K stages do not fit); n=48 is not an option
-        # either, the per-WG N of 24 breaks the P smem copy.
-        sm90_num_stages = 2 if kv_shared_fwd and head_dim == head_dim_v else 1
+        # kv shared: 2 K stages. 512: Q 64K + 2 x K 64K + P 8K + row stats 4K ~= 205 KB.
+        # 576: K is split into a 512-column main part (2 stages, also V) and a 64-column
+        # rope part (1 stage): Q 72K + 2 x 64K + 8K + P 8K + 4K ~= 220 KB.
+        sm90_num_stages = 2 if kv_shared_fwd else 1
         pack_gqa = False
 
     # num_stages=2 exceeds Hopper's per-block shared-memory limit at hdim > 128
