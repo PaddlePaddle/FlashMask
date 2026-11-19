@@ -70,10 +70,49 @@ __global__ void __launch_bounds__(rows_per_work / 4) ChunkMaskKernel(
     if (threadIdx.x == 0) copy_chunk_mask[blockIdx.y * num_works + blockIdx.x] = masked;
 }
 
+// Hierarchical Phase-1 skip: a relay fetches its congruence partners' chunks for the whole node
+// (Phase 2 reads them from it), so it skips a work only if every same-node rank masks it. Ranks
+// publish copy_chunk_mask before HierSetFull (update_kv_buffer) and rewrite it only after the
+// next wait_sr_buffer_empty, i.e. after all same-node ranks finished this pass's AG.
+// A Phase-1 position d sits on the same-node rank k slots below at d + k * num_nodes
+// (hier_map_chunk): entry + k * peer_step there, peer_step = -/+ num_nodes * work_per_chunk (fwd/bwd).
+
+// CTA-wide; leaves the bits for HierNotifyEmpty / HierNotifySegmentEmpty to consume.
+
+__device__ __forceinline__ void wait_node_masks_published(
+    const int64_t* const sema_intra, const int num_effective_batch, const int my_pe,
+    const int gpus_per_node
+) {
+    const int peer = my_pe - my_pe % gpus_per_node + static_cast<int>(threadIdx.x);
+    if (static_cast<int>(threadIdx.x) < gpus_per_node && peer != my_pe) {
+        sema::ag::wait_full_all_batch(sema_intra, num_effective_batch, peer, peer, "node_mask_ready");
+    }
+    // Extends each waiter's acquire to the whole CTA's LSA loads.
+    __syncthreads();
+}
+
+// Entry `entry` of this rank's copy_chunk_mask ANDed over the node's published masks.
+__device__ __forceinline__ int node_masked(
+    const int* const copy_chunk_mask, const int* const published_mask, const int entry,
+    const int peer_step, const int my_pe, const int gpus_per_node
+) {
+    const int my_slot = my_pe % gpus_per_node;
+    int masked = copy_chunk_mask[entry];
+    for (int k = 1; k < gpus_per_node; ++k) {
+        const int peer = my_pe - my_slot + (my_slot - k + gpus_per_node) % gpus_per_node;
+        const int* const peer_mask = static_cast<const int*>(gin::get_lsa_ptr(published_mask, peer));
+        masked &= cuda::atomic_ref<const int, cuda::thread_scope_system>(peer_mask[entry + k * peer_step])
+            .load(cuda::memory_order_relaxed);
+    }
+    return masked;
+}
+
 /**
  * 'Sparse' means that we will check whether the 512-row work can be skipped or not.
  * @param copy_chunk_mask Pre-computed by `ChunkMaskKernel`: mask[work] = 1 if all rows of the work are masked.
  *  Each chunk is cut into ceil(S_chunk / 512) works from its first row, so its last work may be shorter.
+ * @param published_mask Hierarchical: copy_chunk_mask's published copy in the SR window, for the
+ *  node-wide Phase-1 skip; needs 4 * B * (num_nodes - 1) * work_per_chunk B of dynamic smem.
  * @param  block_cnt_semaphore Used in dynamic scheduling. Since each CTA is responsible for remote-getting
  *  one entire chunk (256/512 rows), if the chunk is masked then the computation power will be wasted. To avoid
  *  load-imbalance for this communication kernel (which is crucial to overlap performance), a chunk-cnt semaphore
@@ -98,7 +137,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const __restrict__ rank_empty_counters = nullptr,
     const int gpus_per_node = 1,
     const int sema_inter_size = 0,
-    const int num_heads_per_batch = 1   // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
+    const int num_heads_per_batch = 1,  // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
+    const int* const __restrict__ published_mask = nullptr
 ) {
     announce_comm_cta(stream_coordinator);
     constexpr int row_per_block = num_warps * row_per_warp;     // 256 or 512 row per block (32 or 64 per warp)
@@ -184,11 +224,27 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         cached_semaphores[threadIdx.x] = 0;
     }
 
+    // Hierarchical: Phase-1 entries ANDed over the node, [batch][logical position - 1][work];
+    // the first update_wptr_and_work_id_sync's barrier publishes them to the CTA.
+    extern __shared__ int node_phase1_mask[];
+    const int num_nodes = total_n_pes / gpus_per_node;
+    const int phase1_works = (num_nodes - 1) * work_per_chunk;
+    if constexpr (use_hierarchical) {
+        wait_node_masks_published(sema_intra, num_batch, my_pe, gpus_per_node);
+        for (int i = threadIdx.x; i < num_batch / num_heads_per_batch * phase1_works; i += blockDim.x) {
+            const int logical_pos = i % phase1_works / work_per_chunk + 1;
+            const int entry = i / phase1_works * chunk_per_batch
+                + (total_n_pes - 1 - logical_pos) * work_per_chunk + i % work_per_chunk;
+            node_phase1_mask[i] = node_masked(copy_chunk_mask, published_mask, entry,
+                -num_nodes * work_per_chunk, my_pe, gpus_per_node);
+        }
+    }
+
     for (int work_id = update_wptr_and_work_id_sync(0); work_id <= total_chunks;) {
         const int work_id_m1 = work_id - 1;
         const int batch_id = work_id_m1 / chunk_per_batch;
         const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
-        int mask_index = 0;
+        int mask_index = 0, should_skip = 0;
         int seqlen_id = 0, remote_pe = 0, rows = row_per_block;
         int64_t src_addr = 0;
         bool is_phase1 = true;
@@ -211,6 +267,11 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             // copy_chunk_mask: work row_within_chunk of SR chunk nranks-1-logical_pos (ChunkMaskKernel grid)
             mask_index = (batch_id / num_heads_per_batch) * chunk_per_batch
                 + (total_n_pes - 1 - logical_pos) * work_per_chunk + row_within_chunk;
+            // Phase 1 also serves the node's Phase-2 readers, so it skips only what all of them mask.
+            should_skip = is_phase1
+                ? node_phase1_mask[(batch_id / num_heads_per_batch) * phase1_works
+                                   + (logical_pos - 1) * work_per_chunk + row_within_chunk]
+                : copy_chunk_mask[mask_index];
 
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
@@ -228,18 +289,9 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
             src_addr = batch_id * batch_stride + (seqlen_offset + row_in_chunk) * row_stride;
             mask_index = chunk_per_batch * (batch_id / num_heads_per_batch) + e;
-        }
-
-        bool should_skip = false;
-        if constexpr (use_hierarchical) {
-            // Sparse skip: Phase 1 (cross-node) must NEVER skip because same-node
-            // ranks may need the data via Phase 2. Only Phase 2 can be skipped.
-            // TODO(heqianyue): we can actually use sparse comm if we reduce-and all the 
-            // copy_chunk_mask across the local ranks (the union of all the required chunks)
-            should_skip = (!is_phase1) && copy_chunk_mask[mask_index];
-        } else {
             should_skip = copy_chunk_mask[mask_index];
         }
+
         if (should_skip) {
             try_congruence_notify(target_rank, is_phase1, batch_id);
             __syncthreads();
@@ -251,19 +303,19 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
                 // Phase 1: wait_full only (wait_empty done by host wait_sr_buffer_empty)
                 if (threadIdx.x == 0 && cached_semaphores[target_rank] == 0) {
                     const int target_node = target_rank / gpus_per_node;
-                    sema::ag::wait_full(sema_inter, target_node);
+                    sema::ag::wait_full(sema_inter, target_node, target_rank);
                     cached_semaphores[target_rank] = 1;
                 }
             } else {
                 // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                 // Waits until the specific batch_id bit is set by congruence_notify
                 if (threadIdx.x == 0) {
-                    sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
+                    sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch, remote_pe);
                 }
             }
         } else {
             if (threadIdx.x == 0 && cached_semaphores[target_rank] == 0) {
-                sema::ag::wait_full(semaphores, target_rank);
+                sema::ag::wait_full(semaphores, target_rank, target_rank);
                 cached_semaphores[target_rank] = 1;
             }
         }
@@ -314,7 +366,8 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
     int* const __restrict__ rank_empty_counters = nullptr,
     const int gpus_per_node = 1,        // only used when use_hierarchical=true
     const int sema_inter_size = 0,
-    const int num_heads_per_batch = 1   // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
+    const int num_heads_per_batch = 1,  // >1: num_batch = B*H, mask indexed by batch_id/num_heads_per_batch
+    const int* const __restrict__ published_mask = nullptr  // hierarchical, see the forward kernel
 ) {
     announce_comm_cta(stream_coordinator);
     // segment has only a local chunk, nothing to remote-get.
@@ -351,12 +404,33 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
 
     // Load copy_chunk_mask into shared memory (block-stride loop for total_works > blockDim.x).
     // Barrier: first update_wptr_and_work_id_sync call has __syncthreads() before any read.
+    // Hierarchical Phase-1 entries are ANDed over the node, as in the forward kernel: once per real
+    // batch (its first head), then copied to the other heads.
+    const int num_nodes = total_n_pes / gpus_per_node;
+    bool node_and = false;
+    if constexpr (use_hierarchical) node_and = segment_idx * num_chunks < num_nodes;
+    if (node_and) wait_node_masks_published(sema_intra, num_batch, my_pe, gpus_per_node);
     for (int i = threadIdx.x; i < total_works; i += blockDim.x) {
         const int batch_id = i / work_per_seg;
         const int real_batch = batch_id / num_heads_per_batch;
-        auto* src_ptr = copy_chunk_mask + (segment_idx + real_batch * num_segments) * work_per_seg
-            + (i % work_per_seg);
-        smem_chunk_mask[i] = *src_ptr;
+        const int entry = (segment_idx + real_batch * num_segments) * work_per_seg + (i % work_per_seg);
+        const int pos = segment_idx * num_chunks + i % work_per_seg / work_per_chunk;
+        if (!node_and || pos == 0 || pos >= num_nodes) {
+            smem_chunk_mask[i] = copy_chunk_mask[entry];
+        } else if (batch_id % num_heads_per_batch == 0) {
+            smem_chunk_mask[i] = node_masked(copy_chunk_mask, published_mask, entry,
+                num_nodes * work_per_chunk, my_pe, gpus_per_node);
+        }
+    }
+    if (node_and && num_heads_per_batch > 1) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < total_works; i += blockDim.x) {
+            const int head = i / work_per_seg % num_heads_per_batch;
+            const int pos = segment_idx * num_chunks + i % work_per_seg / work_per_chunk;
+            if (head != 0 && pos > 0 && pos < num_nodes) {
+                smem_chunk_mask[i] = smem_chunk_mask[i - head * work_per_seg];
+            }
+        }
     }
 
     if (threadIdx.x < total_n_pes) {
@@ -429,7 +503,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
         // dst: segment-local row (hierarchical: k_sr is already advanced to this segment's region)
         const int seqlen_id = chunk_id * S_chunk + row_in_chunk;
 
-        // Compute remote PE and src address (done early so masked-skip can check Phase 1)
+        // Compute remote PE and src address (a skipped Phase-1 work still notifies its target)
         int remote_pe = 0;
         int64_t src_addr = 0;
         bool is_phase1 = false;
@@ -459,12 +533,7 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
             src_addr = batch_id * local_batch_stride + row_in_chunk * row_stride;
         }
 
-        bool should_skip = false;
-        if constexpr (use_hierarchical) {
-            should_skip = (!is_phase1) && smem_chunk_mask[work_id_m1];
-        } else {
-            should_skip = smem_chunk_mask[work_id_m1];
-        }
+        const bool should_skip = smem_chunk_mask[work_id_m1];
 
         if (should_skip) {
             try_congruence_notify(chunk_id, target_rank, is_phase1, batch_id);
@@ -478,18 +547,18 @@ __global__ void __launch_bounds__(num_warps * 32, shmem::comm_min_blocks_per_sm(
                 // Phase 1: wait_full only (wait_empty done by host wait_sr_buffer_empty)
                 if (threadIdx.x == 0 && cached_semaphores[target_rank] == 0) {
                     const int target_node = target_rank / gpus_per_node;
-                    sema::ag::wait_full(sema_inter, target_node);
+                    sema::ag::wait_full(sema_inter, target_node, target_rank);
                     cached_semaphores[target_rank] = 1;
                 }
             } else {
                 // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                 if (threadIdx.x == 0) {
-                    sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
+                    sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch, remote_pe);
                 }
             }
         } else {
             if (threadIdx.x == 0 && cached_semaphores[target_rank] == 0) {
-                sema::ag::wait_full(semaphores, target_rank);
+                sema::ag::wait_full(semaphores, target_rank, target_rank);
                 cached_semaphores[target_rank] = 1;
             }
         }

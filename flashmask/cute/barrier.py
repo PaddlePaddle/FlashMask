@@ -39,6 +39,13 @@ def spin_timeout_ns_from_env() -> int:
     return min(int(digits) * _NS_PER_SECOND, _INT64_MAX)
 
 
+def gate_timeout_ns() -> int:
+    """Budget of the attention gates: they wait on this rank's own comm kernel, so they get 60 s
+    more (kLocalWaitSlackNs) to let that kernel's wait on another rank time out and report first."""
+    budget = spin_timeout_ns_from_env()
+    return min(budget + 60 * _NS_PER_SECOND, _INT64_MAX) if budget else 0
+
+
 @dsl_user_op
 def globaltimer_ns(*, loc=None, ip=None) -> Int64:
     """``%globaltimer``: GPU-wide nanosecond timer."""
@@ -125,8 +132,10 @@ def _spin_watchdog_check(
             new_start_ns = now_ns
         elif now_ns - start_ns > timeout_ns:
             cute.printf(
-                "[FlashMask spin] " + site + ": FLASHMASK_SPIN_TIMEOUT_S exceeded, "
-                "block (%d,%d,%d) thread %d addr 0x%llx expected %d actual %d",
+                "[FlashMask overlap] " + site + ": attention waited past its spin budget for this "
+                "rank's FlashMask comm kernel, which is blocked on another rank (a timeout there "
+                "is reported first, naming the rank). block (%d,%d,%d) thread %d addr 0x%llx "
+                "expected %d actual %d",
                 sreg_u32_cold("%ctaid.x"),
                 sreg_u32_cold("%ctaid.y"),
                 sreg_u32_cold("%ctaid.z"),

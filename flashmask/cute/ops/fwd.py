@@ -18,7 +18,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ...backend import Tensor, get_backend
 from .. import utils
-from ..barrier import spin_timeout_ns_from_env
+from ..barrier import gate_timeout_ns
 from ..block_sparsity import (
     BlockSparseTensorsPaddle,
     normalize_block_sparse_tensors,
@@ -643,7 +643,7 @@ def _flash_attn_fwd(
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
         overlap_local_kv_size = cutlass.Int32(overlap_ag_args.local_kv_seqlen)
-        overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
+        overlap_spin_timeout_ns = cutlass.Int64(gate_timeout_ns())
     else:
         overlap_k_addr = None
         overlap_v_addr = None

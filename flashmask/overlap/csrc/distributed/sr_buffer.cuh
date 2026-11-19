@@ -68,6 +68,7 @@ private:
     KVType* _k_sr = nullptr;
     KVType* _v_sr = nullptr;
     SemaphoreType* _semaphores = nullptr;
+    int* _published_mask = nullptr;
     bool _allocated = false;
     size_t _numel = 0;
 
@@ -77,8 +78,10 @@ private:
     SRBuffer& operator=(SRBuffer&&) = delete;
 
 public:
+    // Window layout: [K][V][semaphores][published chunk mask]; same-node ranks read the mask over
+    // LSA for the hierarchical Phase-1 skip (wait_node_masks_published).
     explicit SRBuffer(gin::Context& context, size_t numel, int semaphore_size = 0,
-                      int kv_components = 2)
+                      int kv_components = 2, int mask_ints = 0)
         : _context(context) {
         if (numel == 0) {
             throw std::invalid_argument("SRBuffer: numel must be positive");
@@ -88,7 +91,7 @@ public:
         }
 
         const size_t total_bytes = kv_components * numel * sizeof(KVType) +
-                                   semaphore_size * sizeof(SemaphoreType);
+                                   semaphore_size * sizeof(SemaphoreType) + mask_ints * sizeof(int);
         _k_sr = static_cast<KVType*>(gin::alloc(_context, total_bytes));
         // ncclMemAlloc memory is uninitialized; compute may read never-fetched rows, and
         // 0 * NaN garbage would poison dQ/dK. Also clears the semaphores.
@@ -102,6 +105,7 @@ public:
         // silently landing in the semaphores.
         _v_sr = kv_components == 2 ? _k_sr + numel : nullptr;
         _semaphores = reinterpret_cast<SemaphoreType*>(_k_sr + kv_components * numel);
+        _published_mask = mask_ints > 0 ? reinterpret_cast<int*>(_semaphores + semaphore_size) : nullptr;
         _allocated = true;
         _numel = numel;
     }
@@ -127,12 +131,14 @@ public:
     KVType* k_data() const noexcept { return _k_sr; }
     KVType* v_data() const noexcept { return _v_sr; }
     SemaphoreType* semaphores() const noexcept { return _semaphores; }
+    int* published_mask() const noexcept { return _published_mask; }
 
 private:
     void reset() noexcept {
         _k_sr = nullptr;
         _v_sr = nullptr;
         _semaphores = nullptr;
+        _published_mask = nullptr;
         _allocated = false;
         _numel = 0;
     }

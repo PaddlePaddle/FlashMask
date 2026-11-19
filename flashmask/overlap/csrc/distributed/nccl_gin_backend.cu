@@ -18,6 +18,7 @@
 namespace flashmask::gin {
 
 __device__ __constant__ DeviceState g_device_state;
+__device__ int g_spin_reported = 0;
 
 namespace {
 
@@ -78,7 +79,7 @@ __global__ void DrainSendKernel(uint64_t* drain_signal) {
 }
 
 __global__ void DrainWaitKernel(const uint64_t* drain_signal, uint64_t want) {
-    signal_wait_exact(drain_signal, want, "drain");
+    signal_wait_exact(drain_signal, want, "drain", kAnyPeer);
 }
 
 }  // namespace

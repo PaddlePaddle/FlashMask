@@ -18,7 +18,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ...backend import Tensor, get_backend
-from ..barrier import spin_timeout_ns_from_env
+from ..barrier import gate_timeout_ns
 from ..flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from ..flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from ..flash_bwd_sink import FlashAttentionBackwardDsink
@@ -513,7 +513,7 @@ def _flash_attn_bwd(
         overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
         overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
         overlap_work_done_addr = cutlass.Int64(overlap_ag_args.work_done_addr)
-        overlap_spin_timeout_ns = cutlass.Int64(spin_timeout_ns_from_env())
+        overlap_spin_timeout_ns = cutlass.Int64(gate_timeout_ns())
         _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)

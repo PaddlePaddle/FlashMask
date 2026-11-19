@@ -48,7 +48,7 @@ static __global__ void RsWaitFullKernel(
 ) {
     const uint64_t want = *rs_expected_seg + num_producers;
     *rs_expected_seg = want;
-    gin::signal_wait_exact(rs_full_seg, want, "rs_full");
+    gin::signal_wait_exact(rs_full_seg, want, "rs_full", gin::kAnyPeer);
 }
 
 /**
@@ -68,7 +68,7 @@ __device__ void producer_wait_empty(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    gin::wait_until(semaphores + target_pe, gin::Compare::NotEqual, 0, "rs_empty");
+    gin::wait_until(semaphores + target_pe, gin::Compare::NotEqual, 0, "rs_empty", target_pe);
 }
 
 // ---------------------------------------------------------------------------
