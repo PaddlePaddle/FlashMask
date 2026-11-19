@@ -67,12 +67,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
-        # head_dim_v > 256 (d = dv = 512): a 64 x dv fp32 O no longer fits one WG's
-        # registers (256 regs/thread at dv = 512), so the two MMA WGs split N of both
-        # GEMMs instead of M. WG w computes S[:, w*N/2:(w+1)*N/2] and owns
-        # O[:, w*dv/2:(w+1)*dv/2]; thread t of both WGs owns the same rows. Per KV
-        # block the WGs exchange the row max through sRowStats (barrier PEmpty) and
-        # both halves of P go through sP (barrier PFull) before P @ V.
+        # head_dim_v > 256 (512/512, 576/512): a 64 x dv fp32 O no longer fits one WG's
+        # registers, so the two MMA WGs split N of both GEMMs instead of M. WG w
+        # computes S[:, w*N/2:(w+1)*N/2] and owns O[:, w*dv/2:(w+1)*dv/2]; thread t of
+        # both WGs owns the same rows. Per KV block the WGs exchange the row max through
+        # sRowStats (barrier PEmpty) and both halves of P go through sP (barrier PFull)
+        # before P @ V.
         self.split_n = self.tile_hdimv > 256
         if self.split_n:
             assert self.tile_m == 64, "split_n: tile_m must be 64 (one WGMMA M atom)"
@@ -85,11 +85,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if self.kv_shared:
             assert self.split_n, "kv_shared is only wired up for the split_n (dv > 256) path"
             assert self.tile_hdimv <= self.tile_hdim
-        # kv_shared with d > dv (576/512): two K stages of 576 columns do not fit next to
-        # Q, so K is split into a main part (the first dv columns, which is also V; one
-        # buffer per stage, released after P @ V) and a "rope" part (the last d - dv
-        # columns; a single buffer, released after Q @ K^T). Q @ K^T runs as two GEMMs.
-        # The rope part uses the V pipeline slot (V itself is never loaded).
+        # kv_shared with d > dv (576/512): a whole K tile cannot be double buffered next
+        # to Q, so K is split into a main part (the first dv columns, which are also V;
+        # one buffer per stage, released after P @ V) and a "rope" part (the remaining
+        # columns; a single buffer, released after Q @ K^T). Q @ K^T runs as two GEMMs
+        # accumulating into the same S. The rope part uses the V pipeline slot (V itself
+        # is never loaded).
         self.k_rope = self.kv_shared and self.tile_hdim != self.tile_hdimv
         if self.k_rope:
             self.tile_hdim_rope = self.tile_hdim - self.tile_hdimv

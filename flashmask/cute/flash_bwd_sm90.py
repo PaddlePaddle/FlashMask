@@ -156,8 +156,9 @@ class FlashAttentionBackwardSm90:
         #     2-stage Q pipeline.
         # Deterministic mode requires an ordered accumulation (semaphore-gated
         # smem+TMA path); atomicAdd order is non-deterministic, so force TMA.
-        # head_dim > 256 has no room for the tile_m x d fp32 staging buffer; its dQ stays
-        # on register atomics and is ordered by a per-m_block semaphore (dQ_chunked).
+        # head_dim > 256 has no smem left for the tile_m x d fp32 staging buffer, so its
+        # dQ stays on register atomics, ordered by a per-m_block semaphore when
+        # deterministic (dQ_chunked).
         self.dQacc_use_TMA = const_expr(
             (self.tile_hdim < 256 or deterministic) and not self.tile_hdim > 256
         )
@@ -176,24 +177,23 @@ class FlashAttentionBackwardSm90:
             and self.num_wg_mma == 2
             and not self.mma_dkv_is_rs
         )
-        # head_dim > 256 (d = dv = 512): a full tile_m x d fp32 dQ (128 regs/thread)
-        # does not fit next to the resident dK + dV accumulators (128 regs/thread at
-        # tile_n = 32). dQ^T = K^T dS^T is therefore issued one MMA_M slice (128 rows of
-        # head_dim, 64 per WG) at a time and each slice is atomicAdd'ed to gmem before
-        # the next one, so only one 32-register slice is live. The slices are the same
-        # flat ranges of the dQ partition the d256 sliced path uses, so dQaccum keeps
-        # its layout and the postprocess is unchanged.
+        # head_dim > 256: a full tile_m x d fp32 dQ accumulator does not
+        # fit in registers next to the resident dK + dV accumulators. dQ^T = K^T dS^T is
+        # therefore issued one MMA_M slice (64 rows of head_dim per WG) at a time and each
+        # slice is written back to gmem before the next one, so only one slice is live.
+        # The slices are the same flat ranges of the dQ partition the d256 sliced path
+        # uses, so dQaccum keeps its layout and the postprocess is unchanged.
         self.dQ_chunked = const_expr(self.tile_hdim > 256)
         if self.dQ_chunked:
             assert not self.dQacc_use_TMA
             assert not self.is_local, "dQ_chunked: local (window) attention not supported yet"
             assert self.dQ_swapAB and self.AtomLayoutMdQ in (1, 2) and self.num_wg_mma == 2
             assert not self.mma_dkv_is_rs and self.num_wg_dQ == 2
-            # 24 columns per WG (576, n=48) gives a wrong dK; keep per-WG N at 16k.
+            # A per-WG dK^T/dV^T width that is not a multiple of 16 (e.g. n=48 with two
+            # WGs) gives a wrong dK.
             assert (self.tile_n // self.AtomLayoutNdKV) % 16 == 0
             # One slice per MMA_M step of dQ^T: AtomLayoutMdQ == 1 stacks both WGs along
-            # head_dim (128 rows per slice), == 2 puts them side by side along tile_m
-            # (64 rows per slice, e.g. head_dim 576 = 9 slices).
+            # head_dim, == 2 puts them side by side along tile_m.
             dQ_atoms_m = self.num_wg_dQ // self.AtomLayoutMdQ
             assert self.tile_hdim % (64 * dQ_atoms_m) == 0
             self.num_dQ_chunks = self.tile_hdim // (64 * dQ_atoms_m)
@@ -352,7 +352,7 @@ class FlashAttentionBackwardSm90:
                 cute.struct.MemRange[self.dtype, 0], self.buffer_align_bytes
             ]
         # dQaccum smem staging is only used by the TMA bulk-reduce path. In the
-        # atomicAdd path (head_dim=256) it's dropped entirely to free the ~64KB
+        # atomicAdd path (head_dim=256) it's dropped entirely to free the space
         # for the 2-stage Q pipeline.
         sdqaccum_cosize = cute.cosize(self.sdQaccum_layout) if const_expr(self.dQacc_use_TMA) else 0
         sdQaccum_struct = cute.struct.Align[
@@ -1273,8 +1273,8 @@ class FlashAttentionBackwardSm90:
                 swap_AB=self.dQ_swapAB,
             )
             if const_expr(self.dQ_chunked):
-                # One dQ slice (MMA_M = 1) per call: the accumulator only holds that
-                # slice, so all slices reuse the same 32 registers.
+                # One dQ slice (MMA_M = 1) per call, so the accumulator only has to
+                # hold that slice and all slices reuse the same registers.
                 mma_dsk_slice_fn = partial(
                     self._mma_dQ_chunk, tiled_mma_dQ, tdQrdS=tdQrdS, tdQrKt=tdQrKt
                 )
@@ -1940,8 +1940,9 @@ class FlashAttentionBackwardSm90:
 
         if const_expr(self.dQ_chunked):
             # head_dim > 256: dV, then dQ slice 0 + dK, then the remaining dQ slices.
-            # Each dQ slice is atomicAdd'ed as soon as its MMA completes, so only one
-            # slice of acc_dQ is live at a time.
+            # The dQ slices ping-pong between two slice accumulators: slice j+1's MMA is
+            # issued before slice j is atomicAdd'ed, so the atomics overlap the MMA instead
+            # of the next MMA waiting for the atomics to read the accumulator registers.
             mma_pdo_fn(
                 A_idx=smem_idx_PdS, B_idx=smem_idx_dO,
                 zero_init=not dKV_accumulate
@@ -1978,24 +1979,33 @@ class FlashAttentionBackwardSm90:
                 )
                 barrier.wait_eq(dQ_lock, tidx, 0, lock_value)
                 dQ_sem_barrier.arrive_and_wait()
+            assert self.num_dQ_chunks >= 2
+            acc_dQ_bufs = (acc_dQ, cute.make_rmem_tensor(dQ_acc_shape, Float32))
             for j in cutlass.range_constexpr(self.num_dQ_chunks):
-                if const_expr(j > 0):
+                acc_dQ_cur = acc_dQ_bufs[j % 2]
+                if const_expr(j + 1 < self.num_dQ_chunks):
                     mma_dsk_slice_fn(
-                        acc_dQ, zero_init=True, A_idx=smem_idx_PdS, wg_wait=0, m_slice=j
+                        acc_dQ_bufs[(j + 1) % 2], zero_init=True, A_idx=smem_idx_PdS,
+                        wg_wait=-1, m_slice=j + 1,
                     )
+                if const_expr(j == 0):
+                    # Only slice 1 is in flight, so dK (the last reader of sQ) is done:
+                    # release Q now and let the next Q load overlap the remaining slices.
+                    warpgroup.wait_group(1)
+                    pipeline_Q.consumer_release(consumer_state_Q)
                 # Slice j is the flat range [j*chunk, (j+1)*chunk) of the full dQ partition.
                 for i in cutlass.range_constexpr(0, chunk, 4):
                     copy_utils.atomic_add_fp32x4(
-                        acc_dQ[i], acc_dQ[i + 1], acc_dQ[i + 2], acc_dQ[i + 3],
+                        acc_dQ_cur[i], acc_dQ_cur[i + 1], acc_dQ_cur[i + 2], acc_dQ_cur[i + 3],
                         utils.elem_pointer(tdQg_m, j * chunk + i),
                     )
+                if const_expr(j + 1 < self.num_dQ_chunks):
+                    warpgroup.wait_group(0)  # slice j+1 is complete before its atomics
             if const_expr(mdQ_sem_cur is not None):
                 # Every thread fences its own atomics before thread 0 releases the lock.
                 cute.arch.fence_acq_rel_gpu()
                 dQ_sem_barrier.arrive_and_wait()
                 barrier.arrive_inc(dQ_lock, tidx, 0, 1)
-            warpgroup.wait_group(0)
-            pipeline_Q.consumer_release(consumer_state_Q)
             consumer_state_Q.advance()
             consumer_state_dO.advance()
             return consumer_state_Q, consumer_state_dO

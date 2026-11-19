@@ -143,10 +143,10 @@ def _flash_attn_fwd(
             "head_dim_v > 256 does not support block sparsity (folded accumulator)"
         )
 
-    # SM90 big-d (d = dv = 512): FlashAttentionForwardSm90 with split_n splits N of
-    # both GEMMs over two MMA warpgroups (O = 64 x 512 fp32 does not fit one WG's registers).
-    # tile_m = 64 (one WGMMA M atom); tile_n = 64 with a single K/V stage:
-    # Q 64K + K 64K + V 64K + P 8K + row stats 4K ~= 205 KB of the 227 KB smem.
+    # SM90 big-d (head_dim > 256): FlashAttentionForwardSm90 with split_n splits N of
+    # both GEMMs over the two MMA warpgroups, because a 64 x head_dim_v fp32 O does not
+    # fit one WG's registers. tile_m = 64 (one WGMMA M atom); tile_n and the number of
+    # K/V stages are set below from the remaining smem.
     is_bigd_fwd_sm90 = compute_capability == 9 and head_dim > 256
     sm90_num_stages = 2
     # kv shared (v is k[..., :dv] over one storage): only K is loaded and V is a view of
@@ -160,8 +160,8 @@ def _flash_attn_fwd(
         and _same_storage(k, v)
     )
     if is_bigd_fwd_sm90:
-        # 576/512 (MLA) takes the same split-N config: Q 72K + K 72K + V 64K + P 8K +
-        # row stats 4K ~= 221 KB; with kv shared V is just the k[..., :512] view.
+        # 576/512 (MLA) takes the same split-N config; Q, K and the P buffer grow with
+        # head_dim, so it gets fewer stages than 512.
         assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
             f"SM90 head_dim > 256 supports only 512/512 and 576/512 (got {head_dim}/{head_dim_v})"
         )
@@ -176,9 +176,9 @@ def _flash_attn_fwd(
         assert group is None, "SM90 hd512 fwd: overlap not supported"
         m_block_size = 64
         n_block_size = 64
-        # kv shared: 2 K stages. 512: Q 64K + 2 x K 64K + P 8K + row stats 4K ~= 205 KB.
-        # 576: K is split into a 512-column main part (2 stages, also V) and a 64-column
-        # rope part (1 stage): Q 72K + 2 x 64K + 8K + P 8K + 4K ~= 220 KB.
+        # kv shared drops the V buffers, which leaves room for two K stages. 576/512
+        # splits K into a main part (the first head_dim_v columns, which is also V, two
+        # stages) and a rope part (the remaining columns, one stage).
         sm90_num_stages = 2 if kv_shared_fwd else 1
         pack_gqa = False
 

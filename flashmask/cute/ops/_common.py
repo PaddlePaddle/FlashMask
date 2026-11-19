@@ -196,24 +196,22 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     elif head_dim > 256:
-        # hdim 512 (FlashAttentionBackwardSm90.dQ_chunked): the d256 flag set with
-        # tile_n = 32. Resident dK + dV are 2 * 32 * 512 fp32 = 128 regs/thread over the
-        # two MMA WGs, and smem is Q 64K + dO 64K + K 32K + V 32K + P/dS 8K ~= 201 KB, so
-        # every pipeline is single-stage. dQ is chunked and atomicAdd'ed (non-deterministic).
+        # hdim > 256 (FlashAttentionBackwardSm90.dQ_chunked): the d256 flag set. Q, K, dO
+        # and the dK/dV accumulators together take most of the smem, so every pipeline is
+        # single-stage, and the dQ accumulator is chunked and atomicAdd'ed to gmem
+        # (non-deterministic backward).
         assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
             f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
             f"(got {head_dim}/{head_dim_v})"
         )
-        # 576 = 9 x 64 cannot be halved across the two WGs along head_dim (the 512
-        # layout puts head_dim on the M atoms of dK^T / dQ^T), so 576/512 splits the
-        # WGs along tile_n for dK/dV (576x16 / 512x16 per WG, 136 regs/thread) and
-        # along tile_m for dQ (9 slices of 64 rows). smem ~= 212 KB.
+        # The 512 layout puts head_dim on the M atoms of dK^T / dQ^T and splits them
+        # over the two WGs, which needs head_dim to be a multiple of 128. 576 is not, so
+        # it splits the WGs along tile_n for dK/dV and along tile_m for dQ instead.
         split_hdim_atoms = head_dim % 128 == 0
-        # kv_shared merges dV into dK's accumulator and drops sV, which buys a larger
-        # KV tile: n=64 (512: dKV 128 regs/thread, Q 64K + dO 64K + K 64K + P/dS 16K ~= 208
-        # KB; 576: dKV 144 regs/thread, Q 72K + dO 64K + K 72K + P/dS 16K ~= 225 KB, dO
-        # stays 512 wide). n=48 is out: 24 columns of dK^T/dV^T per WG (AtomLayoutNdKV=2)
-        # computes a wrong dK on the H card and breaks the GQA dK accum postprocess.
+        # kv_shared merges dV into dK's accumulator and drops sV, and keeping dv at
+        # head_dim_v leaves dO at its unpadded width, which buys a 64-row KV tile.
+        # n=48 is out: it gives each WG a dK^T/dV^T width that is not a multiple of 16,
+        # which computes a wrong dK and breaks the GQA dK accum postprocess.
         n_block_size = 64 if kv_shared else 32
         return BwdConfig(
             m_block_size=64, n_block_size=n_block_size,

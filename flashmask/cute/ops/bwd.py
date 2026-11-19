@@ -102,9 +102,9 @@ def _flash_attn_bwd(
     # 512-col TMEM budget, so that kernel chunks the head_dim axes and drains every
     # output through the fp32 gmem accumulators. See flash_bwd_sm100_bigd.py.
     is_bigd_bwd = compute_capability == 10 and (head_dim > 256 or head_dim_v > 256)
-    # SM90 512/512 and 576/512 run on FlashAttentionBackwardSm90 with dQ_chunked (tile 64 x 32,
-    # resident dK/dV, dQ atomicAdd'ed in head_dim slices). kv_shared (detected below)
-    # merges dV into dK's accumulator, like the SM100 big-d kernel.
+    # SM90 512/512 and 576/512 run on FlashAttentionBackwardSm90 with dQ_chunked
+    # (KV-stationary, resident dK/dV, dQ atomicAdd'ed in head_dim slices). kv_shared
+    # (detected below) merges dV into dK's accumulator, like the SM100 big-d kernel.
     is_bigd_bwd_sm90 = compute_capability == 9 and (head_dim > 256 or head_dim_v > 256)
     if is_bigd_bwd_sm90:
         assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
@@ -121,16 +121,16 @@ def _flash_attn_bwd(
     # KV shared: the caller handed the SAME buffer as k and v (the MLA / sparse-attn
     # convention, v = kv[..., :head_dim_v]). Then dV and dK are two halves of ONE
     # gradient -- autograd adds the grad of the aliased input twice -- so the kernel can
-    # accumulate them into a single TMEM slot and flush them once. Detected instead of
-    # asked for: the signature stays (q, k, v).
+    # accumulate them into a single dK/dV accumulator and flush them once. Detected
+    # instead of asked for: the signature stays (q, k, v).
     #
     # dv then comes back all-zero and dk carries dK + dV: the kernel never writes
     # dv_accum, so dv is allocated zeroed and its postprocess is skipped.
     #
-    # Only the shapes the merge is implemented for. 576/512 has no chunk width that
-    # divides both axes, so the kernel pads the dv axis to 576 and lets the dO TMA
-    # zero-fill columns 512..575; that keeps d_chunk at the measured 192 instead
-    # of narrowing it.
+    # Only the shapes the merge is implemented for (512/512 and 576/512). The SM100
+    # big-d kernel pads the dv axis to head_dim and lets the dO TMA zero-fill the extra
+    # columns; the SM90 kernel keeps dv at head_dim_v and accumulates dV into the first
+    # head_dim_v rows of dK's accumulator.
     kv_shared = (
         (is_bigd_bwd or is_bigd_bwd_sm90)
         and (head_dim, head_dim_v) in ((512, 512), (576, 512))
