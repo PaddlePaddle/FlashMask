@@ -44,7 +44,12 @@ def maybe_contiguous(x, be):
     return x.contiguous() if x is not None and not be.is_last_dim_contiguous(x) else x
 
 
-def _same_storage(a, b):
+# The head_dim / head_dim_v pairs above 256 that have kernels (SM90 and SM100), and the
+# only shapes the kv_shared merge is implemented for.
+_LARGE_HDIMS = ((512, 512), (576, 512))
+
+
+def _same_storage(a, b, what="kv_shared"):
     """Whether two tensors start at the same device address.
 
     Used to detect the kv-shared call convention (the same buffer passed as both k and
@@ -52,7 +57,8 @@ def _same_storage(a, b):
     because the kv_shared path returns a different gradient layout (dv all-zero, dk
     carrying dK + dV) and silently taking the other path would change the caller's
     gradients with no signal. The kv_shared condition evaluates this last, so a raise
-    only reaches calls that match every other kv-shared criterion.
+    only reaches calls that match every other kv-shared criterion. ``what`` names the
+    caller's path in the error message.
     """
     try:
         return a.data_ptr() == b.data_ptr()
@@ -60,11 +66,26 @@ def _same_storage(a, b):
         raise RuntimeError(
             "cannot tell whether k and v alias: Tensor.data_ptr() is unavailable on "
             f"this build ({type(exc).__name__}: {exc}). This call matches the "
-            "bigd bwd kv_shared convention in every other respect, and kv_shared "
+            f"{what} convention in every other respect, and kv_shared "
             "changes the gradient layout (dv comes back all-zero, dk carries "
             "dK + dV), so it will not be guessed. Pass distinct k / v buffers to use "
             "the plain path."
         ) from exc
+
+
+def _kv_alias_candidate(k, v, be, what):
+    """Whether v is k[..., :dv] over the same storage (the kv-shared call convention).
+
+    The arch / head_dim gates stay with the caller. _same_storage is evaluated last
+    because it raises rather than guess.
+    """
+    return (
+        k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(be.strides(k)) == tuple(be.strides(v))
+        and _same_storage(k, v, what)
+    )
 
 
 def _get_compute_capability(be):
@@ -72,30 +93,18 @@ def _get_compute_capability(be):
 
 
 def _is_valid_flash_dims(query, key, value, compute_capability):
+    # SM90 and SM100 (the only archs with kernels) support the same head-dim combos,
+    # so compute_capability does not narrow the set.
     q_headdim, k_headdim, v_headdim = query.shape[-1], key.shape[-1], value.shape[-1]
-    if (
+    return (
         (q_headdim <= 128 and k_headdim <= 128 and v_headdim <= 128)
-        or (q_headdim == 192 and k_headdim == 192 and v_headdim == 128)
-        or (q_headdim == 256 and k_headdim == 256 and v_headdim == 256)
-    ):
-        return True
-    # SM100 large head_dim, forward + backward.
-    # has been run end to end.
-    #   512/512 : forward + backward verified
-    if compute_capability == 10:
-        if (
-            (q_headdim == 512 and k_headdim == 512 and v_headdim == 512) or
-            (q_headdim == 576 and k_headdim == 576 and v_headdim == 512)
-        ):
-            return True
-    return False
+        or (q_headdim, k_headdim, v_headdim)
+        in ((192, 192, 128), (256, 256, 256), (512, 512, 512), (576, 576, 512))
+    )
 
 
 _SUPPORTED_HEAD_DIMS_DESC = (
-    "q/k/v all <= 128, or 192/192/128, or 256/256/256"
-)
-_SUPPORTED_HEAD_DIMS_DESC_SM100 = (
-    _SUPPORTED_HEAD_DIMS_DESC + ", or 512/512/512, or 576/576/512"
+    "q/k/v all <= 128, or 192/192/128, or 256/256/256, or 512/512/512, or 576/576/512"
 )
 
 
@@ -119,11 +128,7 @@ def _check_cutedsl_supported(query, key, value, be):
         "unsupported head_dim combination "
         f"(q={query.shape[-1]}, k={key.shape[-1]}, v={value.shape[-1]}) "
         f"on SM{compute_capability}0. Supported: "
-        + (
-            _SUPPORTED_HEAD_DIMS_DESC_SM100
-            if compute_capability == 10
-            else _SUPPORTED_HEAD_DIMS_DESC
-        )
+        + _SUPPORTED_HEAD_DIMS_DESC
     )
 
 
@@ -152,7 +157,10 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False):
+def _tile_size_bwd_sm90(
+    head_dim, head_dim_v, causal, local, sparse_block_size_q=None,
+    flashmask=False, deterministic=False, kv_shared=False,
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -211,6 +219,32 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
             )
+    elif head_dim > 256:
+        # hdim > 256 (FlashAttentionBackwardSm90.dQ_chunked): the d256 flag set. Q, K, dO
+        # and the dK/dV accumulators together take most of the smem, so every pipeline is
+        # single-stage, and the dQ accumulator is chunked and atomicAdd'ed to gmem
+        # (non-deterministic backward).
+        assert (head_dim, head_dim_v) in _LARGE_HDIMS, (
+            f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
+            f"(got {head_dim}/{head_dim_v})"
+        )
+        # The 512 layout puts head_dim on the M atoms of dK^T / dQ^T and splits them
+        # over the two WGs, which needs head_dim to be a multiple of 128. 576 is not, so
+        # it splits the WGs along tile_n for dK/dV and along tile_m for dQ instead.
+        split_hdim_atoms = head_dim % 128 == 0
+        # kv_shared merges dV into dK's accumulator and drops sV, and keeping dv at
+        # head_dim_v leaves dO at its unpadded width, which buys a 64-row KV tile.
+        # n=48 is out: it gives each WG a dK^T/dV^T width that is not a multiple of 16,
+        # which computes a wrong dK and breaks the GQA dK accum postprocess.
+        n_block_size = 64 if kv_shared else 32
+        return BwdConfig(
+            m_block_size=64, n_block_size=n_block_size,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
+            AtomLayoutMSdP=1,
+            AtomLayoutNdKV=1 if split_hdim_atoms else 2,
+            AtomLayoutMdQ=1 if split_hdim_atoms else 2,
+        )
     else:
         # hdim 256: mirror C++ FA3 run_mha_bwd_hdim256 (Arch>=90); dKV/dQ MMAs
         # use swapAB. The dQ-accumulation path drives the smem budget and must

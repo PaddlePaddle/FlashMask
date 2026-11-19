@@ -25,6 +25,7 @@ class NamedBarrierBwd(enum.IntEnum):
     dQEmptyWG0 = enum.auto()
     dQEmptyWG1 = enum.auto()
     FlashMask = enum.auto()
+    dQSem = enum.auto()
 
 
 class NamedBarrierBwdSm100(enum.IntEnum):
