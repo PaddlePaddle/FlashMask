@@ -251,37 +251,65 @@ __device__ __forceinline__ void remote_or(int64_t* ptr, int64_t value, int world
     atom.fetch_or(value, cuda::memory_order_release);
 }
 
-// Spin watchdog: traps a device spin that exceeds FLASHMASK_SPIN_TIMEOUT_S (lost signal or
-// dead peer). The budget must exceed normal rank skew. NIC error completions are not caught.
+// Spin watchdog: traps a device spin that exceeds FLASHMASK_SPIN_TIMEOUT_S. Almost every spin
+// waits for another rank, so the report names it and points at its log; NIC error completions
+// are not caught.
 
 constexpr unsigned kSpinCheckInterval = 1024;   // polls between timer reads
+// `peer` of a spin: a world rank, or one of these.
+constexpr int kAnyPeer = -1;      // a counter or flag raised by several ranks
+constexpr int kLocalWait = -2;    // waits for this rank's own comm kernel
+// Local waits get this much longer, so that the wait on another rank behind them reports first.
+constexpr unsigned long long kLocalWaitSlackNs = 60ull * 1000 * 1000 * 1000;
 
-static __device__ __noinline__ void spin_trap(const char* site, const char* reason,
+// First report wins; the other spinning threads trap silently.
+extern __device__ int g_spin_reported;
+
+static __device__ __noinline__ void spin_trap(const char* site, bool overshoot,
         const void* addr, unsigned long long expected, unsigned long long actual,
-        unsigned long long waited_ns) {
-    printf("[FlashMask spin] %s: %s, rank %d/%d block %d thread %d addr %p "
-           "expected %llu actual %llu waited %llu ms\n",
-           site, reason, g_device_state.world_rank, g_device_state.world_size,
-           static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), addr,
-           expected, actual, waited_ns / 1000000ull);
+        unsigned long long waited_ns, int peer) {
+    if (atomicExch(&g_spin_reported, 1) == 0) {
+        const int rank = g_device_state.world_rank;
+        if (overshoot) {
+            printf("[FlashMask overlap] rank %d/%d: internal error at %s: signal overshoot "
+                   "(expected %llu, got %llu, addr %p): a duplicated or misrouted signal.\n",
+                   rank, g_device_state.world_size, site, expected, actual, addr);
+        } else {
+            printf("[FlashMask overlap] rank %d/%d: wait at %s timed out after %llu s "
+                   "(FLASHMASK_SPIN_TIMEOUT_S; block %d thread %d, expected %llu, got %llu).\n",
+                   rank, g_device_state.world_size, site, waited_ns / 1000000000ull,
+                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), expected, actual);
+            if (peer >= 0) {
+                printf("[FlashMask overlap] rank %d waits only for rank %d here: check rank %d's "
+                       "log first, this timeout is a consequence.\n", rank, peer, peer);
+            } else if (peer == kAnyPeer) {
+                printf("[FlashMask overlap] rank %d waits for several ranks of its CP group here: "
+                       "find the first failing rank in the job logs.\n", rank);
+            } else {
+                printf("[FlashMask overlap] rank %d waits for its own comm kernel, which is blocked "
+                       "on another rank (reported first, naming it).\n", rank);
+            }
+        }
+    }
     __trap();
 }
 
 // Returns the spin's start time, read lazily so short waits never read the timer.
 static __device__ __noinline__ unsigned long long spin_watchdog_check(
         unsigned long long start_ns, const char* site, const void* addr,
-        unsigned long long expected, unsigned long long actual) {
-    const unsigned long long budget_ns = g_device_state.spin_timeout_ns;
+        unsigned long long expected, unsigned long long actual, int peer) {
+    unsigned long long budget_ns = g_device_state.spin_timeout_ns;
     if (budget_ns == 0) {
         return start_ns;
     }
+    if (peer == kLocalWait) budget_ns += min(kLocalWaitSlackNs, ~0ull - budget_ns);
     unsigned long long now;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
     if (start_ns == 0) {
         return now;
     }
     if (now - start_ns > budget_ns) {
-        spin_trap(site, "timeout", addr, expected, actual, now - start_ns);
+        spin_trap(site, false, addr, expected, actual, now - start_ns, peer);
     }
     return start_ns;
 }
@@ -291,18 +319,19 @@ struct SpinWatchdog {
     unsigned steps = 0;
 
     __device__ __forceinline__ void tick(const char* site, const void* addr,
-                                         unsigned long long expected, unsigned long long actual) {
+                                         unsigned long long expected, unsigned long long actual,
+                                         int peer) {
         if (++steps % kSpinCheckInterval == 0) {
-            start_ns = spin_watchdog_check(start_ns, site, addr, expected, actual);
+            start_ns = spin_watchdog_check(start_ns, site, addr, expected, actual, peer);
         }
     }
 };
 
 // Spins until done(*ptr) with relaxed loads, then re-reads with acquire to order later
-// accesses. Returns the acquired value.
+// accesses. Returns the acquired value. `peer`: the rank that raises *ptr (see kAnyPeer).
 template <typename T, typename Done>
 __device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* site,
-                                        unsigned long long expected) {
+                                        unsigned long long expected, int peer) {
     SpinWatchdog watchdog;
     for (;;) {
         const T seen = cuda::atomic_ref<const T, cuda::thread_scope_system>(*ptr)
@@ -315,28 +344,28 @@ __device__ __forceinline__ T spin_until(const T* ptr, Done done, const char* sit
             }
             continue;
         }
-        watchdog.tick(site, ptr, expected, static_cast<unsigned long long>(seen));
+        watchdog.tick(site, ptr, expected, static_cast<unsigned long long>(seen), peer);
     }
 }
 
 // Out of line to keep watchdog state out of the register-capped comm kernels.
 static __device__ __noinline__ void wait_until(
-        const int64_t* ptr, Compare compare, int64_t value, const char* site) {
+        const int64_t* ptr, Compare compare, int64_t value, const char* site, int peer) {
     spin_until(ptr, [=](int64_t current) {
         return (compare == Compare::NotEqual && current != value) ||
                (compare == Compare::GreaterThan && current > value);
-    }, site, value);
+    }, site, value, peer);
 }
 
 // Waits until a monotonic signal counter reaches exactly `want`; traps on overshoot
 // (duplicated or misrouted signal).
 static __device__ __noinline__ void signal_wait_exact(
-        const uint64_t* sig, uint64_t want, const char* site) {
+        const uint64_t* sig, uint64_t want, const char* site, int peer) {
     const uint64_t got = spin_until(sig, [=](uint64_t current) {
         return static_cast<int64_t>(current - want) >= 0;
-    }, site, want);
+    }, site, want, peer);
     if (got != want) {
-        spin_trap(site, "overshoot", sig, want, got, 0);
+        spin_trap(site, true, sig, want, got, 0, peer);
     }
 }
 

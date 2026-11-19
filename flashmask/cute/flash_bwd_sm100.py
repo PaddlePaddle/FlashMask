@@ -825,7 +825,7 @@ class FlashAttentionBackwardSm100:
         # per communication work item in the load warp below.
         self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
         assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
-            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
+            "the work_done gate needs its spin budget (barrier.gate_timeout_ns)"
         )
         if const_expr(overlap_k_addr is not None):
             if const_expr(overlap_bhsd_layout):

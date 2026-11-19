@@ -86,7 +86,8 @@ size_t fm4_overlap_unique_id_size() noexcept {
 // check_inputs can reject unsupported shapes early.
 int fm4_overlap_num_chunks_per_segment(int b_kv, int s_kv, int h_kv, int d_kv,
                                        int nranks) noexcept {
-    return flashmask::get_num_chunk_per_segment(b_kv, s_kv, h_kv, d_kv, nranks);
+    return flashmask::get_num_chunk_per_segment(b_kv, flashmask::seqlen_bucket(s_kv), h_kv, d_kv,
+                                                nranks);
 }
 
 // Creates, rebuilds (new UID) or reconfigures (new shape) the singleton. Returns

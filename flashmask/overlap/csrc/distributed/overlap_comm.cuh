@@ -53,8 +53,9 @@ struct OverlapConfig {
  *
  * Dynamic reconfiguration: when B/H/D/S_local change between calls,
  * `reconfigure_if_needed()` will detect the change and reallocate buffers as needed.
- * S_local is a runtime value (check_s_local); capacities and the chunks per segment follow its
- * power-of-two bucket (seqlen_bucket), so lengths inside a seen bucket only re-point the kernels.
+ * S_local is a runtime value (check_s_local); capacities follow its power-of-two bucket
+ * (seqlen_bucket) and the chunks per segment its largest value seen, so lengths inside a seen
+ * bucket only re-point the kernels.
  * Backward always runs the split AG plus the dK/dV RS overlap (nranks > 1).
 */
 template <typename KVType>
@@ -231,12 +232,14 @@ public:
     //  wptr_init      comp_stream → comm_stream        write_ptr is initialized, AG kernel may start
     //  sr_usable      comp_stream → comm_stream        Attention consumed local KV chunk, SR buffer reusable
     //  ag_done        comm_stream → comp_stream        AG kernel done with copy_chunk_mask and the AG counters
+    //  mask_ready     comp_stream → comm_stream        copy_chunk_mask written; published before HierSetFull
     //  reduce_done    aux_c_stream → comp_stream       dK/dV recv buffers released and ready
     //  local_moved    put_streams[0] → aux_c_stream    Segment-0 local dKV memcpy d2d completed
     //
     cudaEvent_t wptr_init;
     cudaEvent_t sr_usable;
     cudaEvent_t ag_done;
+    cudaEvent_t mask_ready;
     cudaEvent_t reduce_done;
     cudaEvent_t local_moved;
     /**
@@ -290,6 +293,10 @@ private:
     // Opt this shape's split AG / RS put kernels into their dynamic smem; throws if the
     // device can't. Call before the shape is committed.
     void reserve_comm_kernel_smem(int s_local, int nc, int effective_batch, int b) const;
+    // Largest nc <= `nc` whose split AG / RS put dynamic smem fits the device at S_local `s_local`.
+    int fit_num_chunks(int nc, int s_local, int effective_batch, int b) const;
+    // Hierarchical: ints of the published chunk mask (capacity of the whole S bucket); else 0.
+    int published_mask_ints() const;
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
     // Zero recv(segment_idx) and tell its producers it is empty, on aux_c_stream.
@@ -308,8 +315,11 @@ private:
     int S_local;
     int H;
     int D;
-    int num_chunks;         // chunks per bwd segment, picked for _s_bucket
+    int num_chunks;         // chunks per bwd segment (get_num_chunk_per_segment, fit_num_chunks)
     int _s_bucket;          // largest seqlen_bucket(S_local) seen; sizes every buffer
+    int _s_max = 0;         // largest S_local, effective batch and B seen: num_chunks' smem fit
+    int _beff_max = 0;
+    int _b_max = 0;
     size_t sr_bucket_numel() const { return static_cast<size_t>(_s_bucket) * H * D * B * _total_n_pes; }
 
     int _my_pe;
@@ -335,6 +345,7 @@ private:
     size_t _sr_buffer_capacity;             // allocated SRBuffer numel capacity
     size_t _dkv_single_k_numel_capacity = 0;    // allocated SepSRBuffer single_k_numel capacity
     int _dkv_num_chunks = 0;                    // SepSRBuffer's chunks_per_seg (layout-defining)
+    int _published_mask_capacity = 0;           // ints of SRBuffer's published chunk-mask region
 
     int _bitmap_region_size;                // bitmap entries the current shape uses (work_done + frontier)
     int _bwi_head_capacity = 0;             // allocated head region (>= num_blocks and the bitmap)

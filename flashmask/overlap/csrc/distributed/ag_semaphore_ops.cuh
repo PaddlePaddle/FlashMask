@@ -36,32 +36,36 @@ __host__ __forceinline__ int semaphore_count(
 }
 
 /**
- * @brief (Device Function) Wait until semaphores[target_pe] > 0 (data ready).
+ * @brief (Device Function) Wait until semaphores[idx] > 0 (data ready). `peer` raises it.
  */
 __device__ __forceinline__ void wait_full(
     const int64_t* const __restrict__ semaphores,
-    const int target_pe
+    const int idx,
+    const int peer,
+    const char* const site = "ag_full"
 ) {
-    gin::wait_until(semaphores + target_pe, gin::Compare::GreaterThan, 0, "ag_full");
+    gin::wait_until(semaphores + idx, gin::Compare::GreaterThan, 0, site, peer);
 }
 
 
 /**
  * @brief (Device Function) Wait until semaphores' batch_idx readiness bit is set for target_pe.
- *   Hierarchical Phase 2 relay wait. Acquire pairs with the relay holder's release fetch_or;
- *   the caller's bar.sync extends it to the CTA's NVLink loads. Out of line: see gin::wait_until.
+ *   Hierarchical Phase 2 relay wait; `peer` is the relay holder that raises it. Acquire pairs
+ *   with its release fetch_or; the caller's bar.sync extends it to the CTA's NVLink loads.
+ *   Out of line: see gin::wait_until.
  */
 static __device__ __noinline__ void wait_full_one_batch(
     const int64_t* const __restrict__ semaphores,
     const int batch_idx,
     const int target_pe,
-    const int num_batch
+    const int num_batch,
+    const int peer
 ) {
     const int64_t batch_bit = static_cast<int64_t>(1ULL << (batch_idx & 63));
     const int64_t* const word =
         semaphores + target_pe * batch_ready_words(num_batch) + (batch_idx >> 6);
     gin::spin_until(word, [=](int64_t current) { return (current & batch_bit) != 0; },
-                    "ag_batch_ready", batch_bit);
+                    "ag_batch_ready", batch_bit, peer);
 }
 
 /**
@@ -88,21 +92,23 @@ __device__ __forceinline__ void notify_batch_ready_to_same_node(
 }
 
 /**
- * @brief (Device Function) Wait until all batch bits are set for target_pe.
- *   Used in HierNotifyEmpty to drain per-batch relay signals before clearing.
+ * @brief (Device Function) Wait until all batch bits are set for target_pe; `peer` raises them
+ *   (target_pe itself on this node, else its relay holder here).
  *   Out of line: see gin::wait_until.
  */
 static __device__ __noinline__ void wait_full_all_batch(
     const int64_t* const __restrict__ semaphores,
     const int num_batch,
-    const int target_pe
+    const int target_pe,
+    const int peer,
+    const char* const site = "ag_all_batch_ready"
 ) {
     const int words = batch_ready_words(num_batch);
     const int64_t* const base = semaphores + target_pe * words;
     for (int w = 0; w < words; w++) {
         const int64_t expected = batch_ready_bits(num_batch, w);
         gin::spin_until(base + w, [=](int64_t current) { return current == expected; },
-                        "ag_all_batch_ready", expected);
+                        site, expected, peer);
     }
 }
 
@@ -119,7 +125,7 @@ __global__ void NotifySemaphoreEmptyKernel(
 ) {
     if (threadIdx.x != my_pe) {
         // the other PE will not notify us before we reset
-        wait_full(semaphores, threadIdx.x);
+        wait_full(semaphores, threadIdx.x, threadIdx.x);
         semaphores[threadIdx.x] = 0;
         // one consumer of threadIdx.x's chunk is done
         gin::remote_add(ag_refcnt + threadIdx.x, 1, threadIdx.x);
@@ -138,7 +144,7 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
     const int target_rank = (start_rank + threadIdx.x) % total_pes;
     if (target_rank != my_pe) {
         // the other PE will not notify us before we reset
-        wait_full(semaphores, target_rank);
+        wait_full(semaphores, target_rank, target_rank);
         semaphores[target_rank] = 0;
         gin::remote_add(ag_refcnt + target_rank, 1, target_rank);
     }
@@ -164,7 +170,7 @@ __global__ void AgWaitConsumedKernel(
     const uint64_t* const __restrict__ ag_issued,
     int my_pe
 ) {
-    gin::signal_wait_exact(ag_refcnt + my_pe, ag_issued[my_pe], "ag_refcnt");
+    gin::signal_wait_exact(ag_refcnt + my_pe, ag_issued[my_pe], "ag_refcnt", gin::kAnyPeer);
 }
 
 /**
@@ -346,16 +352,19 @@ __global__ void HierNotifyEmptyKernel(
     const int ready_words = batch_ready_words(num_batch);
 
     if (target_slot == my_slot) {
-        // Case 1: Congruent (Phase 1 target, cross-node).
+        // Cross-node (Phase-1 target): the get kernel only waits this flag for works it fetches,
+        // so a pass that skipped everything would clear a flag the peer has not consumed yet, and
+        // the next pass would read a stale chunk. Wait for it before clearing.
+        wait_full(sema_inter, target_node, target, "ag_full_before_clear");
         sema_inter[target_node] = 0;
         gin::remote_add(ag_refcnt + target, 1, target);
     } else {
-        wait_full_all_batch(sema_intra, num_batch, target);
+        // Same node: no relay, the target is read over LSA.
+        const int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
+        wait_full_all_batch(sema_intra, num_batch, target, remote_rank);
         for (int w = 0; w < ready_words; w++) {
             sema_intra[target * ready_words + w] = 0;
         }
-        // same node: no remote_pe relay. Othewise we should calculate the relay rank
-        int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
         gin::remote_add(ag_refcnt + target, 1, remote_rank);
     }
 }
@@ -394,16 +403,17 @@ __global__ void HierNotifySegmentEmptyKernel(
     const int ready_words = batch_ready_words(num_batch);
 
     if (target_slot == my_slot) {
-        // Case 1: Congruent (Phase 1 target, cross-node).
+        // Cross-node (Phase-1 target): wait before clearing, as in HierNotifyEmptyKernel.
+        wait_full(sema_inter, target_node, target, "ag_full_before_clear");
         sema_inter[target_node] = 0;
         gin::remote_add(ag_refcnt + target, 1, target);
     } else {
-        wait_full_all_batch(sema_intra, num_batch, target);
+        // Same node: no relay, the target is read over LSA.
+        const int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
+        wait_full_all_batch(sema_intra, num_batch, target, remote_rank);
         for (int w = 0; w < ready_words; w++) {
             sema_intra[target * ready_words + w] = 0;
         }
-        // same node: no remote_pe relay. Othewise we should calculate the relay rank
-        int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
         gin::remote_add(ag_refcnt + target, 1, remote_rank);
     }
 }
@@ -449,7 +459,7 @@ __global__ void WaitSelfEmptyHierarchicalKernel(
     int gpus_per_node
 ) {
     int partner = my_pe_node + ((my_node_id + threadIdx.x) % blockDim.x) * gpus_per_node;
-    gin::signal_wait_exact(ag_refcnt + partner, ag_issued[partner], "ag_refcnt_hier");
+    gin::signal_wait_exact(ag_refcnt + partner, ag_issued[partner], "ag_refcnt_hier", gin::kAnyPeer);
 }
 
 /**

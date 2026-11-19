@@ -1396,7 +1396,7 @@ class FlashAttentionBackwardSm100BigD:
             "overlap send buffers are filled by the postprocess, not here"
         )
         assert (overlap_work_done_addr is None) == (overlap_spin_timeout_ns is None), (
-            "the work_done gate needs its spin budget (barrier.spin_timeout_ns_from_env)"
+            "the work_done gate needs its spin budget (barrier.gate_timeout_ns)"
         )
         # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
         # capsule, so rebuild the views from the raw segment addresses. The dims must
