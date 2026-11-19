@@ -35,8 +35,10 @@ from ..flashmask_utils import (
 )
 
 from ._common import (
+    _LARGE_HDIMS,
     _dist_world_size,
     _get_overlap_runtime,
+    _kv_alias_candidate,
     _same_storage,
     maybe_contiguous,
     num_splits_heuristic,
@@ -143,26 +145,17 @@ def _flash_attn_fwd(
             "head_dim_v > 256 does not support block sparsity (folded accumulator)"
         )
 
-    # SM90 big-d (head_dim > 256): FlashAttentionForwardSm90 with split_n splits N of
+    # SM90 head_dim > 256: FlashAttentionForwardSm90 with split_n splits N of
     # both GEMMs over the two MMA warpgroups, because a 64 x head_dim_v fp32 O does not
     # fit one WG's registers. tile_m = 64 (one WGMMA M atom); tile_n and the number of
     # K/V stages are set below from the remaining smem.
-    is_bigd_fwd_sm90 = compute_capability == 9 and head_dim > 256
+    sm90_split_n = compute_capability == 9 and head_dim > 256
     sm90_num_stages = 2
-    # kv shared (v is k[..., :dv] over one storage): only K is loaded and V is a view of
-    # the K stage, so the V buffer is gone. _same_storage stays last: it raises rather than guess.
-    kv_shared_fwd = (
-        is_bigd_fwd_sm90
-        and k.dtype == v.dtype
-        and list(k.shape[:-1]) == list(v.shape[:-1])
-        and v.shape[-1] <= k.shape[-1]
-        and tuple(be.strides(k)) == tuple(be.strides(v))
-        and _same_storage(k, v)
-    )
-    if is_bigd_fwd_sm90:
+    kv_shared_fwd = False
+    if sm90_split_n:
         # 576/512 (MLA) takes the same split-N config; Q, K and the P buffer grow with
         # head_dim, so it gets fewer stages than 512.
-        assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
+        assert (head_dim, head_dim_v) in _LARGE_HDIMS, (
             f"SM90 head_dim > 256 supports only 512/512 and 576/512 (got {head_dim}/{head_dim_v})"
         )
         # causal and flashmask (startend_row_indices) run on the shared mainloop; a
@@ -174,6 +167,10 @@ def _flash_attn_fwd(
         assert block_logit is None, "SM90 hd512 fwd: block_logit not supported"
         assert num_splits == 1, "SM90 hd512 fwd: split-KV not supported"
         assert group is None, "SM90 hd512 fwd: overlap not supported"
+        # kv shared (v is k[..., :dv] over one storage): only K is loaded and V is a view
+        # of the K stage, so the V buffer is gone. Checked after the shape asserts so an
+        # unsupported shape reports itself before _same_storage can raise.
+        kv_shared_fwd = _kv_alias_candidate(k, v, be, "SM90 split-N fwd kv_shared")
         m_block_size = 64
         n_block_size = 64
         # kv shared drops the V buffers, which leaves room for two K stages. 576/512
@@ -188,7 +185,7 @@ def _flash_attn_fwd(
     # generation below so prepare_block_maxmin / reduce_block_count /
     # compute_flashmask_block_lists and the kernel all agree on n_block_size
     # (otherwise the per-n_block arrays disagree in length -> reshape error).
-    if compute_capability == 9 and head_dim > 128 and not is_bigd_fwd_sm90:
+    if compute_capability == 9 and head_dim > 128 and not sm90_split_n:
         n_block_size = 64
         # d256/dv256 dense fwd is tensor-core bound; a larger KV tile (80 vs 64,
         # matching mainline FA3) cuts KV-loop iterations/overhead and feeds the
@@ -382,11 +379,11 @@ def _flash_attn_fwd(
     # head_dim <= 256 for the symmetric / single_q_stage paths. Larger head_dim is the SM100
     # big-d path (single_q_stage with q_stage=1); head_dim_v > 256 stays whole on the folded
     # (m_block_size == 64) accumulator, which supports up to head_dim_v = 512.
-    # SM90 runs d = dv = 512 on the split-N path (is_bigd_fwd_sm90 above).
+    # SM90 runs d = dv = 512 on the split-N path (sm90_split_n above).
     assert (
         head_dim <= 256
         or (compute_capability == 10 and head_dim_v <= 512)
-        or is_bigd_fwd_sm90
+        or sm90_split_n
     ), (
         "head_dim must be <= 256, or head_dim>256 with head_dim_v<=512 on SM100, "
         f"or 512/512, 576/512 on SM90 (got {head_dim}/{head_dim_v})"
@@ -767,8 +764,8 @@ def _flash_attn_fwd(
                 Q_in_regs=False,
                 # The split-N (dv > 256) path exchanges the row max between WGs every
                 # KV block and reads P from smem; it has no intra-WG overlap yet.
-                intra_wg_overlap=not is_bigd_fwd_sm90,
-                mma_pv_is_rs=not is_bigd_fwd_sm90,
+                intra_wg_overlap=not sm90_split_n,
+                mma_pv_is_rs=not sm90_split_n,
                 kv_shared=kv_shared_fwd,
             )
         elif compute_capability == 10:

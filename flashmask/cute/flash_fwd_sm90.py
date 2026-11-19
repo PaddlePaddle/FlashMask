@@ -211,6 +211,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             @cute.struct
             class SharedStorageQKRope:
+                """k_rope smem layout (576/512 kv shared).
+
+                sK holds the first dv columns of K and doubles as V; sKr holds the
+                remaining (rope) columns in one stage. There is no sV, and mbar_ptr_V
+                drives the rope pipeline.
+                """
+
                 mbar_ptr_Q: mbar_ptr_Q_struct
                 mbar_ptr_K: mbar_ptr_K_struct
                 mbar_ptr_V: mbar_ptr_V_struct  # the rope pipeline (1 stage)
@@ -2109,6 +2116,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         The row sum stays a per-WG partial; combine_row_sum_split_n adds the halves
         once before finalize.
+
+        Args:
+            softmax: this WG's Softmax; row_max / row_sum are updated in place.
+            acc_S: this WG's N half of the S tile.
+            row_stats: sRowStats (the cross-WG row max exchange buffer), tidx_in_wg
+                and wg_idx.
+            is_first: first KV block, so there is no previous row max to rescale from.
+            check_inf: guard rows whose max is -inf.
+
+        Returns:
+            row_scale: the per-row factor to rescale the O accumulator by.
         """
         sRowStats, t, wg = row_stats.sRowStats, row_stats.tidx_in_wg, row_stats.wg_idx
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)

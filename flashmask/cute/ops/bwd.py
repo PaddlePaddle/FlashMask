@@ -35,10 +35,11 @@ from ..flashmask_utils import (
 )
 
 from ._common import (
+    _LARGE_HDIMS,
     _dist_world_size,
     _get_overlap_runtime,
+    _kv_alias_candidate,
     _make_fake_bwd_tensors,
-    _same_storage,
     _tile_size_bwd_sm90,
     maybe_contiguous,
 )
@@ -97,23 +98,24 @@ def _flash_attn_bwd(
     seqlen_q = q.shape[1]
     seqlen_k = k.shape[1]
 
+    large_hdim = head_dim > 256 or head_dim_v > 256
     # Large head dims (MLA-shaped 576/512 and friends) go through a separate SM100
     # backward kernel: dV (512 cols) + dK/dQ (576 cols each) + S/dP do not fit the
     # 512-col TMEM budget, so that kernel chunks the head_dim axes and drains every
     # output through the fp32 gmem accumulators. See flash_bwd_sm100_bigd.py.
-    is_bigd_bwd = compute_capability == 10 and (head_dim > 256 or head_dim_v > 256)
-    # SM90 512/512 and 576/512 run on FlashAttentionBackwardSm90 with dQ_chunked
-    # (KV-stationary, resident dK/dV, dQ atomicAdd'ed in head_dim slices). kv_shared
-    # (detected below) merges dV into dK's accumulator, like the SM100 big-d kernel.
-    is_bigd_bwd_sm90 = compute_capability == 9 and (head_dim > 256 or head_dim_v > 256)
-    if is_bigd_bwd_sm90:
-        assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
+    is_bigd_bwd = compute_capability == 10 and large_hdim
+    if compute_capability == 9 and large_hdim:
+        # SM90 512/512 and 576/512 stay on the regular FlashAttentionBackwardSm90, which
+        # switches itself to dQ_chunked (KV-stationary, resident dK/dV, dQ atomicAdd'ed
+        # in head_dim slices) from head_dim. kv_shared (detected below) merges dV into
+        # dK's accumulator, like the SM100 big-d kernel.
+        assert (head_dim, head_dim_v) in _LARGE_HDIMS, (
             f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
             f"(got {head_dim}/{head_dim_v})"
         )
         # causal and flashmask run on the shared mainloop (mask_fn / flashmask segments).
         assert group is None, "SM90 hd512 bwd: overlap not supported"
-    assert is_bigd_bwd or is_bigd_bwd_sm90 or (head_dim <= 256 and head_dim_v <= 256), (
+    assert not large_hdim or compute_capability in (9, 10), (
         f"backward does not support head_dim={head_dim}, head_dim_v={head_dim_v} "
         f"on sm_{compute_capability}0"
     )
@@ -132,13 +134,9 @@ def _flash_attn_bwd(
     # columns; the SM90 kernel keeps dv at head_dim_v and accumulates dV into the first
     # head_dim_v rows of dK's accumulator.
     kv_shared = (
-        (is_bigd_bwd or is_bigd_bwd_sm90)
-        and (head_dim, head_dim_v) in ((512, 512), (576, 512))
-        and k.dtype == v.dtype
-        and list(k.shape[:-1]) == list(v.shape[:-1])
-        and v.shape[-1] <= k.shape[-1]
-        and tuple(be.strides(k)) == tuple(be.strides(v))
-        and _same_storage(k, v)
+        large_hdim
+        and (head_dim, head_dim_v) in _LARGE_HDIMS
+        and _kv_alias_candidate(k, v, be, "large head_dim bwd kv_shared")
     )
 
     m_block_size = 128
@@ -178,7 +176,6 @@ def _flash_attn_bwd(
             flashmask=flashmask_info is not None,
             deterministic=deterministic,
             kv_shared=kv_shared,
-            gqa=num_head != num_head_kv,
         ).n_block_size
 
     # FM-4 backward consumes one split-AG segment at a time and gates each KV tile
@@ -261,7 +258,6 @@ def _flash_attn_bwd(
             flashmask=cute_flashmask_info is not None,
             deterministic=deterministic,
             kv_shared=kv_shared,
-            gqa=num_head != num_head_kv,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -331,9 +327,6 @@ def _flash_attn_bwd(
         for t in (q, k, v, out, dout, lse)
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256 or is_bigd_bwd or is_bigd_bwd_sm90, (
-        "head_dim must be less than or equal to 256"
-    )
     alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
@@ -417,11 +410,14 @@ def _flash_attn_bwd(
             n *= d
         return n
 
+    # kv_shared takes the full-zero path below: it allocates dk_accum only and aliases
+    # dv_accum to it, while the range path needs a separate dv_accum buffer.
     zero_kv_accum_range = (
         kv_postprocess_enabled
         and need_kv_accum
         and accum_zero_axis1_kv is not None
         and not is_bigd_bwd
+        and not kv_shared
     )
 
     zero_specs = []  # list of (key, shape, numel)

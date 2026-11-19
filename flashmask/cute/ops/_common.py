@@ -44,7 +44,12 @@ def maybe_contiguous(x, be):
     return x.contiguous() if x is not None and not be.is_last_dim_contiguous(x) else x
 
 
-def _same_storage(a, b):
+# The head_dim / head_dim_v pairs above 256 that have kernels (SM90 and SM100), and the
+# only shapes the kv_shared merge is implemented for.
+_LARGE_HDIMS = ((512, 512), (576, 512))
+
+
+def _same_storage(a, b, what="kv_shared"):
     """Whether two tensors start at the same device address.
 
     Used to detect the kv-shared call convention (the same buffer passed as both k and
@@ -52,7 +57,8 @@ def _same_storage(a, b):
     because the kv_shared path returns a different gradient layout (dv all-zero, dk
     carrying dK + dV) and silently taking the other path would change the caller's
     gradients with no signal. The kv_shared condition evaluates this last, so a raise
-    only reaches calls that match every other kv-shared criterion.
+    only reaches calls that match every other kv-shared criterion. ``what`` names the
+    caller's path in the error message.
     """
     try:
         return a.data_ptr() == b.data_ptr()
@@ -60,11 +66,26 @@ def _same_storage(a, b):
         raise RuntimeError(
             "cannot tell whether k and v alias: Tensor.data_ptr() is unavailable on "
             f"this build ({type(exc).__name__}: {exc}). This call matches the "
-            "bigd bwd kv_shared convention in every other respect, and kv_shared "
+            f"{what} convention in every other respect, and kv_shared "
             "changes the gradient layout (dv comes back all-zero, dk carries "
             "dK + dV), so it will not be guessed. Pass distinct k / v buffers to use "
             "the plain path."
         ) from exc
+
+
+def _kv_alias_candidate(k, v, be, what):
+    """Whether v is k[..., :dv] over the same storage (the kv-shared call convention).
+
+    The arch / head_dim gates stay with the caller. _same_storage is evaluated last
+    because it raises rather than guess.
+    """
+    return (
+        k.dtype == v.dtype
+        and list(k.shape[:-1]) == list(v.shape[:-1])
+        and v.shape[-1] <= k.shape[-1]
+        and tuple(be.strides(k)) == tuple(be.strides(v))
+        and _same_storage(k, v, what)
+    )
 
 
 def _get_compute_capability(be):
@@ -136,7 +157,10 @@ class BwdConfig:
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None, flashmask=False, deterministic=False, kv_shared=False, gqa=False):
+def _tile_size_bwd_sm90(
+    head_dim, head_dim_v, causal, local, sparse_block_size_q=None,
+    flashmask=False, deterministic=False, kv_shared=False,
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -200,7 +224,7 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
         # and the dK/dV accumulators together take most of the smem, so every pipeline is
         # single-stage, and the dQ accumulator is chunked and atomicAdd'ed to gmem
         # (non-deterministic backward).
-        assert (head_dim, head_dim_v) in ((512, 512), (576, 512)), (
+        assert (head_dim, head_dim_v) in _LARGE_HDIMS, (
             f"SM90 bwd head_dim > 256 supports only 512/512 and 576/512 "
             f"(got {head_dim}/{head_dim_v})"
         )
