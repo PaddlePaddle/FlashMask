@@ -27,6 +27,7 @@ from ...backend import _torch as _backend_adapter  # noqa: F401
 from ...backend import get_backend
 from ...distributed import _torch as _dist_adapter  # noqa: F401
 from ...cute.ops._common import _check_cutedsl_supported, _dist_world_size
+from ...cute.ops.decode import _flash_attn_decode_swapab, swapab_decode_supported
 from .autograd import FlashMaskFunc
 
 __all__ = [
@@ -63,6 +64,9 @@ def flashmask_attention(
 
     Returns:
         ``out``, or ``(out, lse)`` when ``return_lse``.
+
+    A forward-only call with seqlen_q = 1 on SM100 / SM103 runs the SwapAB decode kernel
+    when it supports the shapes (see ``swapab_decode_supported``); the result is the same.
     """
     be = get_backend(q, k, v)
     _check_cutedsl_supported(q, k, v, be)
@@ -96,7 +100,34 @@ def flashmask_attention(
         )
 
     # apply() passes positionally: torch.autograd.Function does not take keywords.
+    if _use_decode_kernel(q, k, v, startend_row_indices, causal, learnable_sink, group, be):
+        out, lse = _flash_attn_decode_swapab(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            startend_row_indices=startend_row_indices,
+            causal=causal,
+            mask_row=0,
+        )
+        return (out, lse) if return_lse else out
     out, lse = FlashMaskFunc.apply(
         q, k, v, causal, softmax_scale, learnable_sink, startend_row_indices, group
     )
     return (out, lse) if return_lse else out
+
+
+def _use_decode_kernel(q, k, v, startend_row_indices, causal, learnable_sink, group, be):
+    """Single-token forward-only calls go to the SM100 SwapAB decode kernel.
+
+    It computes the same attention as the main kernel: mask row 0 is the query, and
+    bottom-right causal hides nothing from the only row.
+    """
+    if q.shape[1] != 1 or learnable_sink is not None:
+        return False
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        return False
+    if group is not None and _dist_world_size(be, group) != 1:
+        return False
+    return swapab_decode_supported(q, k, v, startend_row_indices, causal, be)
