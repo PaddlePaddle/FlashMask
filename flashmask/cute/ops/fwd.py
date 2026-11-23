@@ -24,6 +24,12 @@ from ..block_sparsity import (
     normalize_block_sparse_tensors,
     to_cute_block_sparse_tensors,
 )
+from ..flash_fwd_decode_sm100 import (
+    SWAPAB_OCCUPANCIES,
+    SWAPAB_TILE_N,
+    FlashMaskDecodeSm100SwapAB,
+    swapab_occupancy_fits,
+)
 from ..flash_fwd_sm90 import FlashAttentionForwardSm90
 from ..flash_fwd_sm100 import FlashAttentionForwardSm100
 from ..flashmask_utils import (
@@ -42,6 +48,13 @@ from ._common import (
     num_splits_heuristic,
 )
 from .combine import _flash_attn_fwd_combine
+from .decode import (
+    CUDA_MAX_GRID_DIM_YZ,
+    _decode_block_list,
+    swapab_decode_supported,
+    swapab_num_splits,
+    swapab_occupancy,
+)
 
 __all__ = ["_flash_attn_fwd"]
 
@@ -62,7 +75,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
-    num_splits: int = 1,
+    num_splits: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsPaddle] = None,
@@ -79,6 +92,8 @@ def _flash_attn_fwd(
 
     Args:
         ...
+        num_splits: KV splits. None means 1 for the main kernel and the heuristic for the
+            SwapAB decode kernel; < 1 picks the heuristic of the kernel that runs.
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
@@ -117,6 +132,24 @@ def _flash_attn_fwd(
     )
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
+    # SM100 single-token forward without autograd runs the SwapAB decode kernel (the branch
+    # before the main kernel's compile below). It applies the main kernel's mask semantics:
+    # the query is mask row 0, and bottom-right causal hides no key from the only row.
+    use_swapab_decode = (
+        compute_capability == 10
+        and seqlen_q == 1
+        and learnable_sink is None
+        and window_size_left is None
+        and window_size_right is None
+        and block_sparse_tensors is None
+        and block_logit is None
+        and not any(be.requires_grad(t) for t in (q, k, v))
+        and (group is None or _dist_world_size(be, group) == 1)
+        and swapab_decode_supported(q, k, v, startend_row_indices, causal, be)
+    )
+    if num_splits is None:
+        num_splits = 0 if use_swapab_decode else 1
+
     # --- SM100 large head_dim: the folded-accumulator single pass ---
     # head_dim > 256 keeps head_dim_v whole and runs the folded (m_block_size == 64)
     # accumulator config below. There used to be a fallback that split head_dim_v into
@@ -127,7 +160,12 @@ def _flash_attn_fwd(
     # The features the folded accumulator cannot express are therefore not supported at
     # head_dim_v > 256 -- assert instead of silently taking a measurably slower route. See
     # also the folded_acc asserts in FlashAttentionForwardSm100.__init__.
-    if compute_capability == 10 and head_dim > 256 and head_dim_v > 256:
+    if (
+        compute_capability == 10
+        and head_dim > 256
+        and head_dim_v > 256
+        and not use_swapab_decode
+    ):
         assert head_dim_v <= 512, (
             f"head_dim={head_dim}/{head_dim_v}: the folded accumulator supports "
             "head_dim_v <= 512 (O takes head_dim_v / 2 TMEM columns)"
@@ -277,7 +315,8 @@ def _flash_attn_fwd(
         overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
-    if startend_row_indices is not None:
+    # The SwapAB decode kernel reads the mask itself (block list below).
+    if startend_row_indices is not None and not use_swapab_decode:
         fm_batch_size = startend_row_indices.shape[0]
         fm_heads = startend_row_indices.shape[1]
         num_m_blocks = (seqlen_q + fwd_m_tile_rows - 1) // fwd_m_tile_rows
@@ -375,7 +414,8 @@ def _flash_attn_fwd(
         # window_size_* is only normalized into causal/local further below, so derive both here.
         fwd_causal = causal or (window_size_left is None and window_size_right == 0)
         fwd_local = not fwd_causal and (window_size_left is not None or window_size_right is not None)
-        o_fully_written = compute_capability == 9 or (
+        # The SwapAB decode kernel writes every O and LSE entry.
+        o_fully_written = use_swapab_decode or compute_capability == 9 or (
             head_dim == 256
             and head_dim_v == 256
             and (
@@ -399,11 +439,12 @@ def _flash_attn_fwd(
         )
 
     if lse is None:
-        lse = (
-            be.full(shape=lse_shape, fill_value=float('-inf'), dtype=be.float32)
-            if requires_grad or return_lse
-            else None
-        )
+        if not (requires_grad or return_lse):
+            lse = None
+        elif use_swapab_decode:
+            lse = be.empty(shape=lse_shape, dtype=be.float32)
+        else:
+            lse = be.full(shape=lse_shape, fill_value=float('-inf'), dtype=be.float32)
     elif lse is not None:
         assert list(lse.shape) == lse_shape, (
             f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
@@ -513,7 +554,20 @@ def _flash_attn_fwd(
         # 512-col TMEM.
         single_q_stage = (head_dim > 192 and head_dim == head_dim_v) or is_bigd_fwd
 
-    if num_splits < 1:
+    if use_swapab_decode:
+        if num_splits < 1:
+            num_splits = swapab_num_splits(
+                batch_size,
+                num_head_kv,
+                seqlen_k,
+                be.device_capability()[1] == 3,
+                q.dtype == be.bfloat16,
+                head_dim_v,
+            )
+        # More splits than KV blocks would only add empty CTAs.
+        num_splits = max(1, min(num_splits, -(-seqlen_k // SWAPAB_TILE_N), 256))
+        assert num_head_kv * num_splits <= CUDA_MAX_GRID_DIM_YZ
+    elif num_splits < 1:
         max_seqlen_k = seqlen_k
         max_seqlen_q = seqlen_q
         seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
@@ -563,6 +617,95 @@ def _flash_attn_fwd(
         )
     else:
         lse_tensor = None
+
+    if use_swapab_decode:
+        mask_num_vecs, mask_per_head, mask_tensor = 0, False, None
+        if startend_row_indices is not None:
+            mask_num_vecs = startend_row_indices.shape[3]
+            # The query heads of one KV head share a mask head iff H_m divides num_heads_kv.
+            mask_per_head = num_head_kv % startend_row_indices.shape[1] != 0
+            mask_tensor = from_dlpack(
+                startend_row_indices.detach(), assumed_align=4
+            ).mark_layout_dynamic(leading_dim=3)
+        # causal only changes the code for num_vecs 2.
+        mask_is_causal = causal and mask_num_vecs == 2
+        # Block skipping: per (sequence, KV head), the KV units in which the query sees at least
+        # one key; splits are dealt out over those only. The list kernel addresses mask head
+        # kv_head // (num_heads_kv / H_m), so the KV heads must share mask heads. Otherwise
+        # every block is loaded and masked in place.
+        use_block_list = mask_tensor is not None and not mask_per_head
+        blk_cnt_tensor = blk_idx_tensor = None
+        if use_block_list:
+            blk_cnt, blk_idx = _decode_block_list(
+                startend_row_indices, mask_tensor, num_head_kv, mask_is_causal, current_stream,
+                be, mask_row=0,
+            )
+            blk_cnt_tensor = from_dlpack(blk_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=2
+            )
+            blk_idx_tensor = from_dlpack(blk_idx.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=3
+            )
+        occupancy = swapab_occupancy(
+            batch_size * num_head_kv * num_splits,
+            be.multi_processor_count(),
+            -(-seqlen_k // num_splits),
+            use_block_list,
+            qhead_per_kvhead,
+            head_dim_v,
+        )
+        assert occupancy in SWAPAB_OCCUPANCIES, f"occupancy must be in {SWAPAB_OCCUPANCIES}"
+        assert swapab_occupancy_fits(qhead_per_kvhead, head_dim_v, occupancy), (
+            f"{occupancy} CTAs per SM do not fit TMEM with {qhead_per_kvhead} q heads per KV head"
+        )
+        compile_key = (
+            "swapab_decode",
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            is_split_kv,
+            lse is None,
+            mask_num_vecs,
+            mask_is_causal,
+            mask_per_head,
+            use_block_list,
+            occupancy,
+        )
+        decode_args = (
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            mask_tensor,
+            blk_cnt_tensor,
+            blk_idx_tensor,
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(0),  # the query's mask row
+            current_stream,
+        )
+        if compile_key not in _flash_attn_fwd.compile_cache:
+            fa_fwd = FlashMaskDecodeSm100SwapAB(
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_split_kv,
+                mask_num_vecs=mask_num_vecs,
+                mask_is_causal=mask_is_causal,
+                mask_per_head=mask_per_head,
+                occupancy=occupancy,
+            )
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(fa_fwd, *decode_args)
+        _flash_attn_fwd.compile_cache[compile_key](*decode_args)
+        if is_split_kv:
+            _flash_attn_fwd_combine(
+                out_partial,
+                lse_partial.transpose(-1, -2),
+                out,
+                lse.transpose(-1, -2) if lse is not None else None,
+            )
+        return out, lse
 
     if block_logit is not None:
         assert compute_capability == 10, (

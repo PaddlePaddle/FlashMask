@@ -19,7 +19,6 @@ from ...backend import _paddle as _backend_adapter  # noqa: F401
 from ...backend import get_backend
 from ...distributed import _paddle as _dist_adapter  # noqa: F401
 from ...cute.ops._common import _check_cutedsl_supported, _dist_world_size
-from ...cute.ops.decode import _flashmask_decode_swapab, swapab_decode_supported
 from .autograd import FlashMaskFunc
 
 __all__ = [
@@ -126,20 +125,6 @@ def flashmask_attention(
                 )
 
     # when softmax_scale is None, it is set to 1.0 / math.sqrt(head_dim) inside _flash_attn_fwd
-    if _use_decode_kernel(
-        query, key, value, startend_row_indices, causal, learnable_sink, group, be
-    ):
-        out, lse = _flashmask_decode_swapab(
-            query,
-            key,
-            value,
-            softmax_scale=softmax_scale,
-            return_lse=return_softmax_lse,
-            startend_row_indices=startend_row_indices,
-            causal=causal,
-            mask_row=0,
-        )
-        return [out, lse] if return_softmax_lse else out
     out, lse = FlashMaskFunc.apply(
         query,
         key,
@@ -154,18 +139,3 @@ def flashmask_attention(
         return [out, lse]
     else:
         return out
-
-
-def _use_decode_kernel(query, key, value, startend_row_indices, causal, learnable_sink, group, be):
-    """Single-token forward-only calls go to the SM100 SwapAB decode kernel.
-
-    It computes the same attention as the main kernel: mask row 0 is the query, and
-    bottom-right causal hides nothing from the only row.
-    """
-    if query.shape[1] != 1 or learnable_sink is not None:
-        return False
-    if paddle.is_grad_enabled() and any(not t.stop_gradient for t in (query, key, value)):
-        return False
-    if group is not None and _dist_world_size(be, group) != 1:
-        return False
-    return swapab_decode_supported(query, key, value, startend_row_indices, causal, be)
