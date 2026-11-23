@@ -40,6 +40,7 @@
 ---
 
 ## 📢 最新动态
+- **2026-11-23 FlashMask-4**：Hopper 新增 `512/512` 与 `576/512` 大 headdim 支持，均提供 K/V 分离与 KV 共享两个版本。
 - **2026-09-25 FlashMask-4**：支持 Hopper / Blackwell 架构；基于 CuTe DSL 运行时 JIT 编译，编译速度快；在全部支持的 headdim 下提供灵活掩码；完整支持 sink bias 与确定性计算；支持大 headdim；同时提供 PaddlePaddle 与 PyTorch 接口。
 - **2026-09-25 FlashMask-3**：支持 Hopper 架构，提出掩码感知的计算通信 overlap 及负载均衡的分布式计算。
 - **2026-09-25 FlashMask**：支持 Ampere 架构，提出列式稀疏掩码表示，将掩码存储复杂度从 $O(N^2)$ 降至 $O(N)$，并利用掩码稀疏性跳过无效计算。
@@ -50,7 +51,7 @@
 
 FlashMask 是一个面向灵活稀疏掩码的**高效注意力内核库**。它采用列式稀疏表示，将二维稠密掩码矩阵编码为一维的列索引区间，并利用掩码稀疏性跳过无效计算。
 
-本仓库从 [PaddlePaddle/flash-attention](https://github.com/PaddlePaddle/flash-attention) 演进而来，现作为 FlashMask 独立仓库维护。本仓库基于 **CuTe DSL** 实现了面向 **Hopper（SM90）与 Blackwell（SM100）** 的前向和反向 Kernel，同时提供 **PaddlePaddle 与 PyTorch** 接口。核心代码基于 CuTe DSL 运行时 JIT 编译，编译速度快。除灵活掩码外，还支持掩码感知的计算通信 overlap 及负载均衡的分布式计算，并在 SM100 上新增大 headdim 支持。
+本仓库从 [PaddlePaddle/flash-attention](https://github.com/PaddlePaddle/flash-attention) 演进而来，现作为 FlashMask 独立仓库维护。本仓库基于 **CuTe DSL** 实现了面向 **Hopper（SM90）与 Blackwell（SM100）** 的前向和反向 Kernel，同时提供 **PaddlePaddle 与 PyTorch** 接口。核心代码基于 CuTe DSL 运行时 JIT 编译，编译速度快。除灵活掩码外，还支持掩码感知的计算通信 overlap 及负载均衡的分布式计算，并在 SM90 与 SM100 上新增大 headdim 支持。
 
 ### 核心公式
 
@@ -87,19 +88,19 @@ FlashMask-4 提供三项能力：
 | 80 | 80 | ✅ | ✅ | ✅ | ✅ |
 | 128 | 128 | ✅ | ✅ | ✅ | ✅ |
 | **192** | **128** | ✅ | ✅ | ⚠️ | ✅ |
-| **256** | **256** | ✅ | ✅ | ✅ | ❌ |
-| **512** | **512** | ❌ | ✅ | ❌ | ❌ |
-| **576** | **512** | ❌ | ✅ | ❌ | ❌ |
+| **256** | **256** | ✅ | ✅ | ✅ | ✅ |
+| **512** | **512** | ✅ | ✅ | ❌ | ❌ |
+| **576** | **512** | ✅ | ✅ | ❌ | ❌ |
 
 > ✅ 支持，⚠️ 部分支持，❌ 不支持。FlashAttention SM90 在 `d != dv` 时反向不支持 GQA/MQA（`qhead_per_kvhead > 1`），因此 `192/128` 仅支持 MHA；FlashMask SM90 在该配置下支持 GQA/MQA。
 >
-> 表中 FlashAttention 两列基于 commit `edb5c7` 于 2026-09-23 测试得到，与下文性能测试的 baseline 一致。
+> 表中 FlashAttention 两列基于 flash-attention commit `b038b49` 于 2026-11-23 测试得到，与下文性能测试的 baseline 一致。
 
 **FlashMask-4 的优势不只是支持更大的 headdim，而是在这些维度下仍保留灵活掩码、sink bias 与确定性计算的完整能力：**
 
 - **线性掩码存储**：用少量边界向量描述掩码，存储复杂度从 $O(N^2)$ 降至 $O(N)$。
 - **稀疏计算**：将计算块分为全掩码、部分掩码与无掩码三类，跳过全掩码块，仅对部分掩码块执行逐元素掩码。
-- **灵活掩码广泛支持**：SM90 上 `192/128` 支持 GQA/MQA；SM100 上 `256/256`、`512/512`、`576/512` 均可使用自定义掩码。FlashAttention-4 `mask_mod` 在这些场景下不可用。
+- **灵活掩码广泛支持**：SM90 上 `192/128` 支持 GQA/MQA；SM90 与 SM100 上 `512/512`、`576/512` 均可使用自定义掩码。FlashAttention-4 `mask_mod` 在这些场景下不可用。
 - **配套能力完整**：上表所有配置均支持 sink bias 与确定性计算（deterministic）。
 
 内核位于 [`flashmask/cute`](flashmask/cute/)，用 CuTe DSL 分别实现 SM90 与 SM100 的前向、反向，并按 GPU 与输入配置在运行时 JIT 编译。
@@ -160,13 +161,11 @@ Overlap 还假定以下使用契约，但不会检查：
 
 ### 大 headdim
 
-FlashMask-4 在 SM100 上将**灵活掩码、sink bias 与确定性计算扩展到大 headdim**，并针对 KV 共享存储做了专门优化。
+FlashMask-4 在 SM90 与 SM100 上将**灵活掩码、sink bias 与确定性计算扩展到大 headdim**，并针对 KV 共享存储做了专门优化。
 
 - **大维度前向与反向**：支持 `d/dv` 为 **`512/512`** 与 **`576/512`** 两组配置。
 - **K/V 分离与 KV 共享**：两组配置均提供 K/V 分离与 KV 共享两个版本。
 - **完整掩码能力**：大维度下使用相同的列式掩码接口，同样支持 sink bias 与确定性计算。
-
-以上大维度配置目前仅由 SM100 CuTe DSL 路径提供，SM90 暂不支持。
 
 ---
 
@@ -176,27 +175,27 @@ FlashMask、FlashMask-3 以及计算通信 overlap 及负载均衡的分布式�
 
 ### FlashMask-4 vs FlashAttention-4 `mask_mod`
 
-Baseline 为 FlashAttention-4 `mask_mod`（commit `edb5c7`）。性能指标为 TFLOPs/s，越高越好；正文中的提升范围取自总计（前向 + 反向）。
+Baseline 为 FlashAttention-4 `mask_mod`（flash-attention commit `b038b49`）。性能指标为 TFLOPs/s，越高越好；正文中的提升范围取自总计（前向 + 反向）。
 
 雷达图的读法：三行分别为前向（FWD）、反向（BWD）、总计（TOTAL），每列为一个序列长度。
 
 #### Hopper
 
-headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -13.1% ～ +49.0%。
+headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -7.2% ～ +39.6%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_128_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 128/128）"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod（d=128, dv=128）</sub>
 </div>
 
-headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -7.3% ～ +23.8%。
+headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -4.5% ～ +16.7%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_192_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 192/128）"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod（d=192, dv=128）</sub>
 </div>
 
-headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 +3.1% ～ +155.8%。
+headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 +7.2% ～ +165.3%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_256_256_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Hopper，headdim 256/256）"/>
@@ -205,44 +204,67 @@ headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的
 
 #### Blackwell
 
-headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -6.2% ～ +101.3%。
+headdim 128/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -6.1% ～ +137.2%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_128_128_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Blackwell，headdim 128/128）"/>
   <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod（d=128, dv=128）</sub>
 </div>
 
-headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -9.4% ～ +76.8%。
+headdim 192/128、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 +2.0% ～ +67.7%。
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_192_128_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Blackwell，headdim 192/128）"/>
   <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod（d=192, dv=128）</sub>
 </div>
 
-### 不同 headdim 的耗时（Blackwell SM100）
+headdim 256/256、序列长度 4K ～ 128K 下，FlashMask-4 相对 baseline 的总计性能变化为 -1.5% ～ +63.6%。
 
-FlashAttention-4 `mask_mod` 在 SM100 上不支持 `d=256, dv=256`，因此这里只比较 FlashMask-4 自身在 Blackwell (SM100) 上不同 headdim 的前向 + 反向总耗时，以 `d=128, dv=128` 为基准（`1.00x`）。
+<div align="center">
+  <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_256_256_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 与 FlashAttention-4 mask_mod 性能对比（Blackwell，headdim 256/256）"/>
+  <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod（d=256, dv=256）</sub>
+</div>
 
-| 序列长度 | `d=128, dv=128` | `d=192, dv=128` | `d=256, dv=256` |
-|---:|---:|---:|---:|
-| 理论计算量 | 1.00x | 1.29x | 2.00x |
-| 4K | 1.00x | 1.36x | 2.75x |
-| 8K | 1.00x | 1.36x | 2.80x |
-| 32K | 1.00x | 1.35x | 2.85x |
-| 64K | 1.00x | 1.34x | 2.88x |
-| 128K | 1.00x | 1.34x | 2.90x |
+### 大 headdim 吞吐
 
-- 理论计算量只统计核心 MMA 运算，不含 softmax 等其他计算。
-- 每个序列长度的实测倍率，为该长度下所有掩码类型总耗时倍率的几何平均。
-- 三种 headdim 均在相同 head 数（H=16）下测得，可直接与理论计算量对比。
+序列长度 32K、Full 掩码下，FlashMask-4 大 headdim 的前向、反向与总计吞吐（TFLOPs/s）：
+
+| d/dv | 版本 | Hopper FWD | Hopper BWD | Hopper TOTAL | Blackwell FWD | Blackwell BWD | Blackwell TOTAL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 512/512 | K/V 分离 | 484 | 230 | 271 | 882 | 354 | 427 |
+| 512/512 | KV 共享 | 540 | 399 | 431 | 924 | 621 | 685 |
+| 576/512 | K/V 分离 | 467 | 217 | 256 | 861 | 340 | 410 |
+| 576/512 | KV 共享 | 511 | 363 | 395 | 881 | 612 | 670 |
+
+> 大 headdim 内核仍在持续优化中。
 
 ### 大 headdim：KV 共享 vs K/V 分离
 
-`d/dv` 为 576/512、序列长度 4K ～ 128K 下，FlashMask-4 KV 共享版本相对 K/V 分离版本的总计性能提升 +35.3% ～ +81.7%。
+序列长度 4K ～ 128K 下，FlashMask-4 KV 共享版本相对 K/V 分离版本的总计性能提升如下：
+
+| d | dv | Hopper（SM90） | Blackwell（SM100） |
+|---:|---:|---:|---:|
+| 512 | 512 | +15.9% ～ +65.4% | +43.3% ～ +73.8% |
+| 576 | 512 | +10.1% ～ +59.9% | +36.9% ～ +67.6% |
 
 <div align="center">
-  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 KV 共享与 K/V 分离性能对比"/>
-  <br/><sub>SM100 FlashMask-4 KV 共享 vs K/V 分离</sub>
+  <img src="docs/assets/flashmaskv4_sm90_vs_flashmaskv4kvshared_sm90_bf16_512_512_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 KV 共享与 K/V 分离性能对比（Hopper，headdim 512/512）"/>
+  <br/><sub>SM90 FlashMask-4 KV 共享 vs K/V 分离（d=512, dv=512）</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm90_vs_flashmaskv4kvshared_sm90_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 KV 共享与 K/V 分离性能对比（Hopper，headdim 576/512）"/>
+  <br/><sub>SM90 FlashMask-4 KV 共享 vs K/V 分离（d=576, dv=512）</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_bf16_512_512_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 KV 共享与 K/V 分离性能对比（Blackwell，headdim 512/512）"/>
+  <br/><sub>SM100 FlashMask-4 KV 共享 vs K/V 分离（d=512, dv=512）</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 KV 共享与 K/V 分离性能对比（Blackwell，headdim 576/512）"/>
+  <br/><sub>SM100 FlashMask-4 KV 共享 vs K/V 分离（d=576, dv=512）</sub>
 </div>
 
 ---
