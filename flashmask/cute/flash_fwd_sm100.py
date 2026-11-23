@@ -21,7 +21,9 @@ from .barrier import wait_write_ptr_ge
 from . import pipeline
 from .mask import AttentionMask
 from .softmax import SoftmaxSm100
-from .seqlen_info import SeqlenInfoQK
+from .seqlen_info import SeqlenInfoQK, SeqlenMeta, seqlen_info_kwargs
+from .paged_kv import PagedKVManager
+from .tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
 from .block_info import BlockInfo
 from .block_sparsity import BlockSparseTensors
 from .block_sparse_utils import (
@@ -107,6 +109,7 @@ class FlashAttentionForwardSm100:
         has_block_bos: cutlass.Constexpr = False,
         use_2cta_instrs: bool = False,
         has_flashmask: bool = False,
+        paged_kv_non_tma: bool = False,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -308,6 +311,19 @@ class FlashAttentionForwardSm100:
         # split axis, while generate_block / load / softmax only walk this split's range:
         # the pipelines would disagree and hang. The host rejects the combination too.
         assert not (has_flashmask and is_split_kv), "flashmask does not support split-KV"
+        # Paged KV with page_size != n_block_size: K / V are gathered row by row with
+        # cp.async (PagedKVManager) by two load warps instead of one TMA per tile. The
+        # second load warp takes the spare slot, which a column mask needs for
+        # generate_block, so column masks need page_size == n_block_size.
+        assert not (paged_kv_non_tma and has_flashmask), (
+            "column masks do not support cp.async paged KV (page_size != n_block_size)"
+        )
+        self.paged_kv_non_tma = paged_kv_non_tma
+        self.use_tma_KV = not paged_kv_non_tma
+        assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
+            "cp.async paged KV needs head dims that are multiples of 16"
+        )
+        assert self.use_tma_KV or not use_2cta_instrs, "cp.async paged KV does not support 2-CTA"
         if self.num_s_stages == 1:
             # single_q_stage / 2-CTA big-d: there is a single S/P stage, so the second softmax
             # warpgroup has no work at all -- keep it OUT of the CTA instead of letting it
@@ -339,6 +355,10 @@ class FlashAttentionForwardSm100:
             spare_warp_ids = (15,)
         if has_flashmask:
             self.generate_block_warp_ids = spare_warp_ids
+            self.empty_warp_ids = ()
+        elif paged_kv_non_tma:
+            self.generate_block_warp_ids = ()
+            self.load_warp_ids = self.load_warp_ids + spare_warp_ids
             self.empty_warp_ids = ()
         else:
             self.generate_block_warp_ids = ()
@@ -757,6 +777,11 @@ class FlashAttentionForwardSm100:
         overlap_spin_timeout_ns: Optional[cutlass.Int64] = None,
         overlap_local_kv_size: Optional[cutlass.Int32] = None,
         overlap_bhsd_layout: cutlass.Constexpr = False,
+        # Optional per-batch KV lengths and paged-KV metadata.
+        seqlen_meta: Optional[SeqlenMeta] = None,
+        # (num_ctas, 16) Int64: one TMA descriptor slot per CTA when seqused_k
+        # bounds dense V loads.
+        tensormap_workspace: Optional[cute.Tensor] = None,
         # int32[2] ticket / finished-CTA counter of DynamicPersistentTileScheduler (zeroed once,
         # self-resetting); only used when fm_persistent.
         mSchedCounter: Optional[cute.Tensor] = None,
@@ -859,6 +884,16 @@ class FlashAttentionForwardSm100:
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             for t in (mQ, mK, mV, mO)
         ]
+        if const_expr(seqlen_meta is not None):
+            assert seqlen_meta.num_splits_dynamic is None, "per-batch num_splits is not wired yet"
+        # Paged KV: K / V are (num_pages, page_size, h_k, d) pools and page_table
+        # (b, max_pages) maps a sequence's logical page to a pool page.
+        mPageTable = seqlen_meta.page_table if const_expr(seqlen_meta is not None) else None
+        self.paged_kv = const_expr(mPageTable is not None)
+        assert self.paged_kv or self.use_tma_KV, "paged_kv_non_tma needs a page_table"
+        if const_expr(self.paged_kv):
+            assert not self.enable_overlap, "page_table is not supported with FM-4 overlap"
+            assert not self.use_2cta_instrs, "page_table is not supported with the 2-CTA config"
         Q_layout_transpose = [1, 3, 2, 0]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k)
@@ -1103,24 +1138,42 @@ class FlashAttentionForwardSm100:
             self.cluster_layout_vmnk.shape,
         )
 
-        # TMA load for K
-        tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mK,
-            cute.select(sK_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            self.cluster_layout_vmnk.shape,
+        tma_atom_K, tma_atom_V = None, None
+        # Bound V loads by the sequence end: the load warp rewrites its
+        # CTA's copy of the V TMA descriptor whenever the batch changes, so rows at or past
+        # seqlen_k are out of bounds for TMA and arrive zero-filled. Masking P alone does
+        # not keep a NaN in an unused V row out of the PV MMA (0 * NaN = NaN). K needs
+        # nothing: the mask overwrites those scores. Paged TMA cannot bound rows inside a
+        # page, so there the caller keeps rows past seqused_k in the last page finite.
+        self.bounded_tma_V = const_expr(
+            self.use_tma_KV
+            and mPageTable is None
+            and seqlen_meta is not None
+            and seqlen_meta.seqused_k is not None
         )
-        # TMA load for V
-        tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mV,
-            cute.select(sV_layout, mode=[0, 1, 2]),
-            self.mma_tiler_pv,
-            tiled_mma_pv,
-            self.cluster_layout_vmnk.shape,
-        )
+        if const_expr(self.bounded_tma_V):
+            assert tensormap_workspace is not None, "bounded V TMA loads need a tensormap workspace"
+        mV_gmem = mV if const_expr(self.bounded_tma_V) else None
+        if const_expr(self.use_tma_KV):
+            # TMA load for K. With a page_table, mK is (page_size, d, h_k, num_pages) and a
+            # tile is one page (page_size == n_block_size).
+            tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mK,
+                cute.select(sK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                self.cluster_layout_vmnk.shape,
+            )
+            # TMA load for V
+            tma_atom_V, mV = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mV,
+                cute.select(sV_layout, mode=[0, 1, 2]),
+                self.mma_tiler_pv,
+                tiled_mma_pv,
+                self.cluster_layout_vmnk.shape,
+            )
 
         o_cta_v_layout = cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile)
 
@@ -1237,7 +1290,9 @@ class FlashAttentionForwardSm100:
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]),
             num_splits,
-            cute.size(mK.shape[0]),
+            cute.size(mK.shape[0])
+            if const_expr(not self.paged_kv)
+            else cute.size(mK.shape[0]) * cute.size(mPageTable.shape[1]),
             mQ.shape[1],
             mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
             tile_shape_mn=(self.work_tile_m, self.cta_tiler[1]),
@@ -1503,6 +1558,9 @@ class FlashAttentionForwardSm100:
             mBlockLogit if const_expr(self.has_block_logit) else None,
             mBlockBos if const_expr(self.has_block_bos) else None,
             overlap_info,
+            seqlen_meta,
+            mV_gmem,
+            tensormap_workspace if const_expr(self.bounded_tma_V) else None,
             mSchedCounter,
             mO_gmem if const_expr(self.fm_persistent) else None,
             tma_atom_Oc,
@@ -1550,6 +1608,9 @@ class FlashAttentionForwardSm100:
         mBlockLogit: Optional[cute.Tensor] = None,
         mBlockBos: Optional[cute.Tensor] = None,
         overlap_info: Optional[OverlapInfo] = None,
+        seqlen_meta: Optional[SeqlenMeta] = None,
+        mV_gmem: Optional[cute.Tensor] = None,  # gmem V behind tma_atom_V (bounded V only)
+        tensormap_workspace: Optional[cute.Tensor] = None,  # (num_ctas, 16) Int64 (bounded V only)
         mSchedCounter: Optional[cute.Tensor] = None,
         mO_gmem: Optional[cute.Tensor] = None,
         tma_atom_Oc: Optional[cute.CopyAtom] = None,
@@ -1833,10 +1894,15 @@ class FlashAttentionForwardSm100:
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
+        mPageTable = seqlen_meta.page_table if const_expr(seqlen_meta is not None) else None
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
+            # Paged: a sequence spans its page_table row, not one page.
+            seqlen_k_static=mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
+            **seqlen_info_kwargs(seqlen_meta),
         )
         AttentionMaskCls = partial(
             AttentionMask,
@@ -1941,6 +2007,9 @@ class FlashAttentionForwardSm100:
                 s_startend_row_indices,
                 flashmask_info,
                 overlap_info,
+                mPageTable,
+                mV_gmem,
+                tensormap_workspace,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -2627,13 +2696,31 @@ class FlashAttentionForwardSm100:
         s_startend_row_indices: Optional[cute.Tensor],
         flashmask_info: Optional[FlashMaskInfo],
         overlap_info: Optional[OverlapInfo],
+        mPageTable: Optional[cute.Tensor] = None,
+        mV_gmem: Optional[cute.Tensor] = None,
+        tensormap_workspace: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        # With two load warps (cp.async paged KV) both gather K / V, but Q is one TMA and
+        # its barrier expects a single arrive: only the first load warp issues it.
+        issue_q_for_this_warp = (
+            const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]
+        )
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
         )
+        tensormap_manager, tensormap_V_gmem, v_desc_ptr = None, None, None
+        if const_expr(self.bounded_tma_V):
+            tensormap_manager, tensormap_V_gmem, v_desc_ptr = cta_tensormap_slot(tensormap_workspace)
+            tensormap_manager.init_tensormap_from_atom(tma_atom_V, tensormap_V_gmem, self.load_warp_ids[0])
+            tensormap_manager.fence_tensormap_initialization()
+        # The V extent depends on the batch only: rewrite the descriptor when it changes and
+        # acquire it right before the first V load so the Q / K issue overlaps the fence.
+        v_desc_batch_idx = Int32(-1)
+        v_desc_acquire = Int32(0)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         if const_expr(self.enable_flashmask):
@@ -2649,34 +2736,75 @@ class FlashAttentionForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+            if const_expr(self.bounded_tma_V):
+                if batch_idx != v_desc_batch_idx:
+                    # Cut V's rows extent at this sequence's end. Extents must stay >= 1
+                    # (bound_rows clamps).
+                    v_desc_batch_idx = batch_idx
+                    v_desc_acquire = Int32(1)
+                    v_rows_end = seqlen.seqlen_k
+                    tensormap_manager.update_tensormap(
+                        (bound_rows(mV_gmem, v_rows_end),), (tma_atom_V,), (tensormap_V_gmem,),
+                        self.load_warp_ids[0], (None,),
+                    )
 
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
-            mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
-            gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-            gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             tSgQ = thr_mma_qk.partition_A(gQ)
-            tSgK = thr_mma_qk.partition_B(gK)
-            tOgV = thr_mma_pv.partition_B(gV)
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
             )
 
-            tKsK, tKgK = cpasync.tma_partition(
-                tma_atom_K,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sK, 0, 3),
-                cute.group_modes(tSgK, 0, 3),
-            )
-            tVsV, tVgV = cpasync.tma_partition(
-                tma_atom_V,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sV, 0, 3),
-                cute.group_modes(tOgV, 0, 3),
-            )
+            tKsK, tKgK, tVsV, tVgV = None, None, None, None
+            paged_kv_manager = None
+            if const_expr(self.use_tma_KV):
+                if const_expr(mPageTable is not None):
+                    # Keep the page coord free: a block is tile 0 of page page_table[b, n_block].
+                    mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
+                    gK = cute.local_tile(
+                        mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
+                    )
+                    gV = cute.local_tile(
+                        mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
+                    )
+                else:
+                    mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                    gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                    gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                tSgK = thr_mma_qk.partition_B(gK)
+                tOgV = thr_mma_pv.partition_B(gV)
+                tKsK, tKgK = cpasync.tma_partition(
+                    tma_atom_K,
+                    0,  # no multicast
+                    cute.make_layout(1),
+                    cute.group_modes(sK, 0, 3),
+                    cute.group_modes(tSgK, 0, 3),
+                )
+                tVsV, tVgV = cpasync.tma_partition(
+                    tma_atom_V,
+                    0,  # no multicast
+                    cute.make_layout(1),
+                    cute.group_modes(sV, 0, 3),
+                    cute.group_modes(tOgV, 0, 3),
+                )
+            else:
+                paged_kv_manager = PagedKVManager.create(
+                    mPageTable,
+                    mK,
+                    mV,
+                    FastDivmodDivisor(mK.shape[0]),  # page_size
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,  # leftpad_k
+                    self.n_block_size,
+                    self.head_dim_padded,
+                    self.head_dim_v_padded,
+                    num_load_threads,
+                    mK.element_type,
+                )
 
             load_Q = partial(
                 self.load_Q,
@@ -2696,6 +2824,7 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="K",
+                paged_kv_manager=paged_kv_manager,
             )
             load_V = partial(
                 self.load_KV,
@@ -2706,6 +2835,8 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
+                paged_kv_manager=paged_kv_manager,
+                tma_desc_ptr=v_desc_ptr,
             )
 
             # FM-4 overlap gate: bound via partial (NOT a nested closure) so it has no
@@ -2765,10 +2896,17 @@ class FlashAttentionForwardSm100:
                                 while n_block >= n_block_min:
                                     if const_expr(self.enable_overlap):
                                         _gate(n_block)
-                                    load_K(block=n_block, producer_state=kv_producer_state)  # Kj
+                                    page_idx_i = self.paged_block_page(mPageTable, batch_idx, n_block)
+                                    if const_expr(not self.use_tma_KV):
+                                        paged_kv_manager.load_page_table(n_block)
+                                    load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # Kj
                                     kv_producer_state.advance()
                                     if not is_first_block:
-                                        load_V(block=n_block_prev, producer_state=kv_producer_state)  # V(j-1)
+                                        # The cp.async paged path keeps one page in per-thread
+                                        # registers, so refill them for the block V loads.
+                                        if const_expr(not self.use_tma_KV):
+                                            paged_kv_manager.load_page_table(n_block_prev)
+                                        load_V(block=n_block_prev, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_prev))  # V(j-1)
                                         kv_producer_state.advance()
                                     is_first_block = cutlass.Boolean(False)
                                     n_block_prev = n_block
@@ -2823,7 +2961,9 @@ class FlashAttentionForwardSm100:
                         else:
                             if const_expr(self.enable_overlap):
                                 _gate(n_block_first)
-                            load_K(block=n_block_first, producer_state=kv_producer_state)  # K0
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block_first)
+                            load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_first))  # K0
                             kv_producer_state.advance()
                             if const_expr(self.q_stage == 2):
                                 load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
@@ -2833,7 +2973,7 @@ class FlashAttentionForwardSm100:
                             # so the block whose V is still pending is carried in n_block_prev.
                             n_block_prev = n_block_first
                             if const_expr(not self.use_s_ping_pong):
-                                load_V(block=n_block_first, producer_state=kv_producer_state)  # V0
+                                load_V(block=n_block_first, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_first))  # V0
                                 kv_producer_state.advance()
                             # TODO: two possible optimization: 1.reuse kv_producer_state
                             # 2.skip load when not partially masked
@@ -2856,14 +2996,21 @@ class FlashAttentionForwardSm100:
 
                                     if const_expr(self.enable_overlap):
                                         _gate(n_block)
-                                    load_K(block=n_block, producer_state=kv_producer_state)  # Ki
+                                    page_idx_i = self.paged_block_page(mPageTable, batch_idx, n_block)
+                                    if const_expr(not self.use_tma_KV):
+                                        paged_kv_manager.load_page_table(n_block)
+                                    load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # Ki
                                     kv_producer_state.advance()
                                     if const_expr(self.use_s_ping_pong):
-                                        load_V(block=n_block_prev, producer_state=kv_producer_state)  # V(i-1)
+                                        # The cp.async paged path keeps one page in per-thread
+                                        # registers, so refill them for the block V loads.
+                                        if const_expr(not self.use_tma_KV):
+                                            paged_kv_manager.load_page_table(n_block_prev)
+                                        load_V(block=n_block_prev, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_prev))  # V(i-1)
                                         kv_producer_state.advance()
                                         n_block_prev = n_block
                                     else:
-                                        load_V(block=n_block, producer_state=kv_producer_state)  # Vi
+                                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # Vi
                                         kv_producer_state.advance()
 
                                     load_startend_row_indices_producer_state = self.load_startend_row_indices(
@@ -2917,7 +3064,9 @@ class FlashAttentionForwardSm100:
                                     n_block_idx += 1
 
                         if const_expr(self.use_s_ping_pong):
-                            load_V(block=n_block_prev, producer_state=kv_producer_state)  # V(n-1)
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block_prev)
+                            load_V(block=n_block_prev, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_prev))  # V(n-1)
                             kv_producer_state.advance()
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_generate_block_empty_offset + generate_block_consumer_state.index)
                         generate_block_consumer_state.advance()
@@ -2930,37 +3079,61 @@ class FlashAttentionForwardSm100:
                 # though it's unclear why it's not supported to remove n_block_first
                 n_block_first = 0
                 if block_info.has_kv_work(n_block_min, n_block_max, split_idx):
-                    load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
+                    if issue_q_for_this_warp:
+                        load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     if const_expr(self.enable_overlap):
                         _gate(n_block_max - 1)
-                    load_K(block=n_block_max - 1, producer_state=kv_producer_state)  # K0
+                    # A tile with no KV block (n_block_max == 0) still runs one fully masked
+                    # iteration at block -1 (page -1 on the TMA paged path).
+                    page_idx = self.paged_block_page(mPageTable, batch_idx, n_block_max - 1)
+                    if const_expr(not self.use_tma_KV):
+                        paged_kv_manager.load_page_table(n_block_first)
+                    load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2):
-                        load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
+                        if issue_q_for_this_warp:
+                            load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
                     q_producer_phase ^= 1
+                    if const_expr(self.bounded_tma_V):
+                        if v_desc_acquire == 1:
+                            acquire_tensormap(tensormap_manager, tensormap_V_gmem)
+                            v_desc_acquire = Int32(0)
                     if const_expr(self.use_s_ping_pong):
                         # Same order as the MMA warp consumes them: K0, [K(j+1), V(j)], V(n-1).
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                             n_block = n_block_max - 2 - i
                             if const_expr(self.enable_overlap):
                                 _gate(n_block)
-                            load_K(block=n_block, producer_state=kv_producer_state)  # K(j+1)
+                            page_idx_i = self.paged_block_page(mPageTable, batch_idx, n_block)
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block)
+                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # K(j+1)
                             kv_producer_state.advance()
-                            load_V(block=n_block + 1, producer_state=kv_producer_state)  # V(j)
+                            # The cp.async paged path keeps one page in per-thread registers,
+                            # so refill them for the block V loads.
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block + 1)
+                            load_V(block=n_block + 1, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block + 1))  # V(j)
                             kv_producer_state.advance()
-                        load_V(block=n_block_min, producer_state=kv_producer_state)  # V(n-1)
+                        if const_expr(not self.use_tma_KV):
+                            paged_kv_manager.load_page_table(n_block_min)
+                        load_V(block=n_block_min, producer_state=kv_producer_state, page_idx=self.paged_block_page(mPageTable, batch_idx, n_block_min))  # V(n-1)
                         kv_producer_state.advance()
                     else:
-                        load_V(block=n_block_max - 1, producer_state=kv_producer_state)  # V0
+                        v_block_first = n_block_max - 1
+                        load_V(block=v_block_first, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                         kv_producer_state.advance()
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                             n_block = n_block_max - 2 - i
                             if const_expr(self.enable_overlap):
                                 _gate(n_block)
-                            load_K(block=n_block, producer_state=kv_producer_state)  # Ki
+                            page_idx_i = self.paged_block_page(mPageTable, batch_idx, n_block)
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block)
+                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # Ki
                             kv_producer_state.advance()
-                            load_V(block=n_block, producer_state=kv_producer_state)  # Vi
+                            load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx_i)  # Vi
                             kv_producer_state.advance()
 
             else:
@@ -5471,6 +5644,24 @@ class FlashAttentionForwardSm100:
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
 
     @cute.jit
+    def paged_block_page(
+        self, mPageTable: Optional[cute.Tensor], batch_idx: Int32, n_block: Int32
+    ) -> Optional[Int32]:
+        """Pool page of KV block n_block on the TMA paged path, else None.
+
+        page_size == n_block_size there, so block n_block is page_table[b, n_block]. A tile
+        with no KV block runs one fully masked iteration at block -1; that maps to page -1,
+        out of the pool's bounds, so TMA zero-fills it instead of reading a page the
+        sequence does not own (which may hold NaN).
+        """
+        page_idx = None
+        if const_expr(mPageTable is not None and self.use_tma_KV):
+            page_idx = Int32(-1)
+            if n_block >= 0:
+                page_idx = mPageTable[batch_idx, n_block]
+        return page_idx
+
+    @cute.jit
     def load_KV(
         self,
         tma_atom: Optional[cute.CopyAtom],
@@ -5482,12 +5673,14 @@ class FlashAttentionForwardSm100:
         block: Int32,
         producer_state: cutlass.pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
-        # Retained (always None) so the block-sparse SM100 load path, which calls this
-        # with page_idx=None, keeps working.
+        # TMA paged KV (page_size == n_block_size): the pool page holding this block.
         page_idx: Optional[Int32] = None,
+        # cp.async paged KV: gathers the block row by row (its page table is loaded).
+        paged_kv_manager: Optional[PagedKVManager] = None,
+        # This CTA's rewritten TMA descriptor (bounded V), else the atom's own.
+        tma_desc_ptr: Optional[cute.Pointer] = None,
     ):
         assert K_or_V in ("K", "V")
-        assert page_idx is None
         stage, phase = producer_state.index, producer_state.phase
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
@@ -5496,19 +5689,30 @@ class FlashAttentionForwardSm100:
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
 
-        assert (
-            tXgX is not None and
-            tXsX is not None and
-            tma_atom is not None
-        )
-        self.tma_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes[K_or_V])
-        tXsX_cur = tXsX[None, stage]
-        if const_expr(self.uneven_kv_smem):
-            # Since this is the producer_state, the phase starts at 1, so we have to invert it
-            tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
-        # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
-        tXgX_cur = tXgX[None, block]
-        cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
+        if const_expr(self.use_tma_KV):
+            assert (
+                tXgX is not None and
+                tXsX is not None and
+                tma_atom is not None
+            )
+            self.tma_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes[K_or_V])
+            tXsX_cur = tXsX[None, stage]
+            if const_expr(self.uneven_kv_smem):
+                # Since this is the producer_state, the phase starts at 1, so we have to invert it
+                tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
+            # Paged: page_size == n_block_size, so the block is tile 0 of its page.
+            tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
+            desc_kwargs = {"tma_desc_ptr": tma_desc_ptr} if const_expr(tma_desc_ptr is not None) else {}
+            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage, **desc_kwargs)
+        else:
+            assert paged_kv_manager is not None
+            sX_cur = sX[None, None, None, stage]
+            if const_expr(self.uneven_kv_smem):
+                sX_cur = self.offset_kv_smem(sX_cur, stage, phase ^ 1)
+            paged_kv_manager.load_KV(block, sX_cur, K_or_V)
+            cute.arch.cp_async_commit_group()
+            # Arrives once this thread's copies have landed; the barrier counts threads.
+            cute.arch.cp_async_mbarrier_arrive_noinc(mbar_full_ptr + stage)
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):
@@ -5517,6 +5721,9 @@ class FlashAttentionForwardSm100:
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
+            # Hint that the offset is 128-bit aligned so that ptr + offset keeps the
+            # alignment cp.async needs (cp.async paged KV), as upstream c055bdc does.
+            offset = cute.assume(offset, divby=128 // self.k_dtype.width)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX
@@ -5525,6 +5732,17 @@ class FlashAttentionForwardSm100:
         load_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
         )
+        if const_expr(not self.use_tma_KV):
+            # cp.async paged KV: every load thread arrives on the full barrier once its
+            # copies land (cp.async.mbarrier.arrive.noinc), so the count is the threads.
+            return cutlass.pipeline.PipelineAsyncUmma.create(
+                barrier_storage=load_kv_mbar_ptr,
+                num_stages=self.kv_stage,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE * len(self.load_warp_ids)
+                ),
+                consumer_group=load_kv_consumer_group,
+            )
         load_kv_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len(self.load_warp_ids)
         )

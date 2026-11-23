@@ -340,6 +340,7 @@ def reduce_block_count_kernel(
     seqlen_q: cutlass.Int32,
     seqlen_k: cutlass.Int32,
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
+    seqused_k: Optional[cute.Tensor] = None, # [b] int32, KV length per batch (<= seqlen_k)
 ):
     # one warp per block row
     tidx = cute.arch.thread_idx()[0]
@@ -373,9 +374,16 @@ def reduce_block_count_kernel(
                 seqlen_q,
             )
         n_block_max = num_blocks_col
+        seqlen_k_batch = seqlen_k
+        if cutlass.const_expr(seqused_k is not None):
+            # The main kernel walks only the blocks below seqused_k[b] (block_info), and its
+            # causal diagonal is seqused_k[b] - seqlen_q. Count the same blocks, otherwise the
+            # correction warp waits for blocks generate_block never produces.
+            seqlen_k_batch = seqused_k[batch_idx]
+            n_block_max = min(n_block_max, (seqlen_k_batch + kBlockN - 1) // kBlockN)
         if is_causal:
             # make sure window_size_right is 0
-            n_idx_right = row_idx_end + seqlen_k - seqlen_q
+            n_idx_right = row_idx_end + seqlen_k_batch - seqlen_q
             n_block_max = min(n_block_max, (n_idx_right + kBlockN - 1) // kBlockN)
         loop_num = (n_block_max + 31) >> 5
         local_sum = 0
@@ -420,6 +428,7 @@ def reduce_block_count_cute(
     seqlen_k: cutlass.Int32,
     stream: cuda.CUstream,
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
+    seqused_k: Optional[cute.Tensor] = None,
 ):
     reduce_block_count_kernel(
         LTS_nblock_max if LTS_nblock_max is not None else None,
@@ -440,6 +449,7 @@ def reduce_block_count_cute(
         seqlen_q,
         seqlen_k,
         qhead_per_kvhead_packgqa,
+        seqused_k,
     ).launch(
         grid=[(num_blocks_row * batch_size * h_flashmask + 3) >> 2, 1, 1],
         block=[32 * 4, 1, 1],
@@ -455,6 +465,7 @@ def reduce_block_count(
     seqlen_q: int,
     be,
     qhead_per_kvhead_packgqa: int = 1,
+    seqused_k: Optional[cute.Tensor] = None,
 ):
     # Unlike the other entry points here, `flashmask_info` is the *cute*
     # FlashMaskInfo -- its fields are cute.Tensor, so the backend cannot be
@@ -463,6 +474,11 @@ def reduce_block_count(
     # valid_block_count is indexed by the kernel's m_block, so its M axis has the
     # kernel's granularity: kBlockM rows of the packed (qhead_per_kvhead, seqlen_q) axis
     # under pack_gqa (qhead_per_kvhead_packgqa > 1), plain query rows otherwise.
+    #
+    # seqused_k (int32 [batch] cute tensor, optional): per-batch KV length. Each batch
+    # then counts only the column blocks below ceil(seqused_k[b] / kBlockN), and the
+    # causal diagonal uses seqused_k[b], as the main kernel's block range does. The
+    # nblock max/min still cover the whole mask.
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
     num_blocks_row = (seqlen_q * qhead_per_kvhead_packgqa + kBlockM - 1) // kBlockM
     num_blocks_col = (seqlen_k + kBlockN - 1) // kBlockN
@@ -487,7 +503,10 @@ def reduce_block_count(
     current_stream = cuda.CUstream(be.cuda_stream())
 
     # TODO: are all of these compile keys necessary?
-    compile_key = (is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute, qhead_per_kvhead_packgqa)
+    compile_key = (
+        is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute, qhead_per_kvhead_packgqa,
+        seqused_k is not None,
+    )
     if compile_key not in reduce_block_count.compile_cache:
         reduce_block_count.compile_cache[compile_key] = cute.compile(
             reduce_block_count_cute,
@@ -510,6 +529,7 @@ def reduce_block_count(
             seqlen_k,
             current_stream,
             qhead_per_kvhead_packgqa,
+            seqused_k,
         )
     reduce_block_count.compile_cache[compile_key](
         flashmask_info.LTS_nblock_max,
@@ -528,7 +548,8 @@ def reduce_block_count(
         kBlockN,
         seqlen_q,
         seqlen_k,
-        current_stream
+        current_stream,
+        seqused_k=seqused_k,
     )
 
 reduce_block_count.compile_cache = {}
