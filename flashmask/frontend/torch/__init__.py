@@ -63,6 +63,10 @@ def flashmask_attention(
 
     Returns:
         ``out``, or ``(out, lse)`` when ``return_lse``.
+
+    A call with seqlen_q = 1 whose inputs do not require grad runs the SwapAB decode kernel
+    on SM100 / SM103 when it supports the shapes (see ``_flash_attn_fwd``); the result is
+    the same.
     """
     be = get_backend(q, k, v)
     _check_cutedsl_supported(q, k, v, be)
