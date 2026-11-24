@@ -40,6 +40,7 @@ English | [简体中文](README.zh-CN.md)
 ---
 
 ## 📢 News
+- **2026-11-23 FlashMask-4**: Hopper adds large head dim support for `512/512` and `576/512`, each in both a separate K/V version and a shared KV version.
 - **2026-09-25 FlashMask-4**: Supports Hopper and Blackwell. Kernels are JIT-compiled at runtime with CuTe DSL, so compilation is fast. Flexible masks are available at every supported head dim, with full support for sink bias and deterministic computation, plus large head dims. Both PaddlePaddle and PyTorch interfaces are provided.
 - **2026-09-25 FlashMask-3**: Supports Hopper and introduces mask-aware distributed attention with communication/computation overlap and load balancing.
 - **2026-09-25 FlashMask**: Supports Ampere and introduces the column-wise sparse mask representation, which reduces memory complexity from $O(N^2)$ to $O(N)$ and uses mask sparsity to skip unnecessary computation.
@@ -50,7 +51,7 @@ English | [简体中文](README.zh-CN.md)
 
 FlashMask is an **efficient attention kernel library** for flexible sparse masks. It uses a column-wise sparse mask representation that encodes a 2D dense mask as 1D per-column row-index ranges, and it exploits mask sparsity to skip unnecessary computation.
 
-This repository evolved from [PaddlePaddle/flash-attention](https://github.com/PaddlePaddle/flash-attention) and is now maintained as the standalone FlashMask repository. It implements forward and backward kernels for **Hopper (SM90) and Blackwell (SM100)** with **CuTe DSL**, and provides both **PaddlePaddle and PyTorch** interfaces. The core code is JIT-compiled at runtime with CuTe DSL, so compilation is fast. Beyond flexible masks, it supports mask-aware distributed attention with communication/computation overlap and load balancing, and adds large head dim support on SM100.
+This repository evolved from [PaddlePaddle/flash-attention](https://github.com/PaddlePaddle/flash-attention) and is now maintained as the standalone FlashMask repository. It implements forward and backward kernels for **Hopper (SM90) and Blackwell (SM100)** with **CuTe DSL**, and provides both **PaddlePaddle and PyTorch** interfaces. The core code is JIT-compiled at runtime with CuTe DSL, so compilation is fast. Beyond flexible masks, it supports mask-aware distributed attention with communication/computation overlap and load balancing, and adds large head dim support on SM90 and SM100.
 
 ### Formulation
 
@@ -87,19 +88,19 @@ The table below compares **FlashMask-4** with the **`mask_mod` path of FlashAtte
 | 80 | 80 | ✅ | ✅ | ✅ | ✅ |
 | 128 | 128 | ✅ | ✅ | ✅ | ✅ |
 | **192** | **128** | ✅ | ✅ | ⚠️ | ✅ |
-| **256** | **256** | ✅ | ✅ | ✅ | ❌ |
-| **512** | **512** | ❌ | ✅ | ❌ | ❌ |
-| **576** | **512** | ❌ | ✅ | ❌ | ❌ |
+| **256** | **256** | ✅ | ✅ | ✅ | ✅ |
+| **512** | **512** | ✅ | ✅ | ❌ | ❌ |
+| **576** | **512** | ✅ | ✅ | ❌ | ❌ |
 
 > ✅ supported, ⚠️ partially supported, ❌ not supported. On SM90, FlashAttention backward does not support GQA/MQA (`qhead_per_kvhead > 1`) when `d != dv`, so `192/128` is MHA-only; FlashMask SM90 supports GQA/MQA in this configuration.
 >
-> The two FlashAttention columns were tested on 2026-09-23 at commit `edb5c7`, the same baseline used in the performance section below.
+> The two FlashAttention columns were tested on 2026-11-23 at flash-attention commit `b038b49`, the same baseline used in the performance section below.
 
 **FlashMask-4 does more than support larger head dims: it keeps flexible masks, sink bias, and deterministic computation fully available at those sizes.**
 
 - **Linear memory complexity**: masks are described by a few boundary vectors, reducing memory complexity from $O(N^2)$ to $O(N)$.
 - **Sparse computation**: blocks are classified as fully masked, partially masked, or unmasked. Fully masked blocks are skipped, and element-wise masking is applied only to partially masked blocks.
-- **Broad flexible-mask support**: `192/128` supports GQA/MQA on SM90, and custom masks are available at `256/256`, `512/512`, and `576/512` on SM100. FlashAttention-4 `mask_mod` is unavailable in these scenarios.
+- **Broad flexible-mask support**: `192/128` supports GQA/MQA on SM90, and custom masks are available at `512/512` and `576/512` on both SM90 and SM100. FlashAttention-4 `mask_mod` is unavailable in these scenarios.
 - **Complete feature set**: every configuration in the table supports sink bias and deterministic computation.
 
 The kernels live in [`flashmask/cute`](flashmask/cute/). They implement the SM90 and SM100 forward and backward passes in CuTe DSL and are JIT-compiled at runtime for the GPU and input configuration.
@@ -160,13 +161,11 @@ The CuTe DSL Overlap in this repository targets SM100 only. To use Overlap on SM
 
 ### Large head dim
 
-On SM100, FlashMask-4 **extends flexible masks, sink bias, and deterministic computation to large head dims**, with dedicated optimizations for shared KV storage.
+On SM90 and SM100, FlashMask-4 **extends flexible masks, sink bias, and deterministic computation to large head dims**, with dedicated optimizations for shared KV storage.
 
 - **Large-dim forward and backward**: supports `d/dv` configurations of **`512/512`** and **`576/512`**.
 - **Separate K/V and shared KV**: both configurations come in a separate K/V version and a shared KV version.
 - **Full mask capability**: large dims use the same column-wise mask interface and also support sink bias and deterministic computation.
-
-These large-dim configurations are currently provided only by the SM100 CuTe DSL path; SM90 does not support them yet.
 
 ---
 
@@ -176,27 +175,27 @@ Performance results for FlashMask, FlashMask-3, and the distributed attention wi
 
 ### FlashMask-4 vs FlashAttention-4 `mask_mod`
 
-The baseline is FlashAttention-4 `mask_mod` (commit `edb5c7`). The metric is TFLOPs/s (higher is better); the improvement ranges quoted in the text refer to the total (forward + backward).
+The baseline is FlashAttention-4 `mask_mod` (flash-attention commit `b038b49`). The metric is TFLOPs/s (higher is better); the improvement ranges quoted in the text refer to the total (forward + backward).
 
 How to read the radar charts: the three rows are forward (FWD), backward (BWD), and total (TOTAL), and each column is one sequence length.
 
 #### Hopper
 
-At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -13.1% to +49.0% relative to the baseline.
+At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -7.2% to +39.6% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_128_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 128/128)"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod (d=128, dv=128)</sub>
 </div>
 
-At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -7.3% to +23.8% relative to the baseline.
+At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -4.5% to +16.7% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_192_128_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 192/128)"/>
   <br/><sub>SM90 FlashMask-4 vs FlashAttention-4 mask_mod (d=192, dv=128)</sub>
 </div>
 
-At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from +3.1% to +155.8% relative to the baseline.
+At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from +7.2% to +165.3% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm90_bf16_256_256_fwd_bwd_total_radar.png" width="80%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Hopper, head dim 256/256)"/>
@@ -205,44 +204,67 @@ At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total pe
 
 #### Blackwell
 
-At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -6.2% to +101.3% relative to the baseline.
+At head dim 128/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -6.1% to +137.2% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_128_128_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Blackwell, head dim 128/128)"/>
   <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod (d=128, dv=128)</sub>
 </div>
 
-At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -9.4% to +76.8% relative to the baseline.
+At head dim 192/128 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from +2.0% to +67.7% relative to the baseline.
 
 <div align="center">
   <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_192_128_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Blackwell, head dim 192/128)"/>
   <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod (d=192, dv=128)</sub>
 </div>
 
-### Runtime across head dims (Blackwell SM100)
+At head dim 256/256 and sequence lengths from 4K to 128K, FlashMask-4's total performance ranges from -1.5% to +63.6% relative to the baseline.
 
-FlashAttention-4 `mask_mod` does not support `d=256, dv=256` on SM100, so this table compares only FlashMask-4 against itself: total forward + backward time on Blackwell (SM100) at different head dims, normalized to `d=128, dv=128` (`1.00x`).
+<div align="center">
+  <img src="docs/assets/fa4_mask_mod_vs_flashmaskv4_sm100_bf16_256_256_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 vs FlashAttention-4 mask_mod performance (Blackwell, head dim 256/256)"/>
+  <br/><sub>SM100 FlashMask-4 vs FlashAttention-4 mask_mod (d=256, dv=256)</sub>
+</div>
 
-| Sequence length | `d=128, dv=128` | `d=192, dv=128` | `d=256, dv=256` |
-|---:|---:|---:|---:|
-| Theoretical FLOPs | 1.00x | 1.29x | 2.00x |
-| 4K | 1.00x | 1.36x | 2.75x |
-| 8K | 1.00x | 1.36x | 2.80x |
-| 32K | 1.00x | 1.35x | 2.85x |
-| 64K | 1.00x | 1.34x | 2.88x |
-| 128K | 1.00x | 1.34x | 2.90x |
+### Large head dim throughput
 
-- Theoretical FLOPs count only the core MMA operations, excluding softmax and other computation.
-- The measured ratio at each sequence length is the geometric mean of the total-time ratios over all mask types at that length.
-- All three head dims were measured with the same number of heads (H=16), so the ratios are directly comparable with theoretical FLOPs.
+Forward, backward, and total throughput (TFLOPs/s) of FlashMask-4 at large head dims, with the Full mask and sequence length 32K:
+
+| d/dv | Version | Hopper FWD | Hopper BWD | Hopper TOTAL | Blackwell FWD | Blackwell BWD | Blackwell TOTAL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 512/512 | separate K/V | 484 | 230 | 271 | 882 | 354 | 427 |
+| 512/512 | shared KV | 540 | 399 | 431 | 924 | 621 | 685 |
+| 576/512 | separate K/V | 467 | 217 | 256 | 861 | 340 | 410 |
+| 576/512 | shared KV | 511 | 363 | 395 | 881 | 612 | 670 |
+
+> The large head dim kernels are still being optimized.
 
 ### Large head dim: shared KV vs separate K/V
 
-At `d/dv` of 576/512 and sequence lengths from 4K to 128K, the shared KV version of FlashMask-4 improves total performance by +35.3% to +81.7% over the separate K/V version.
+At sequence lengths from 4K to 128K, the shared KV version of FlashMask-4 improves total performance over the separate K/V version as follows:
+
+| d | dv | Hopper (SM90) | Blackwell (SM100) |
+|---:|---:|---:|---:|
+| 512 | 512 | +15.9% to +65.4% | +43.3% to +73.8% |
+| 576 | 512 | +10.1% to +59.9% | +36.9% to +67.6% |
 
 <div align="center">
-  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 shared KV vs separate K/V performance"/>
-  <br/><sub>SM100 FlashMask-4 shared KV vs separate K/V</sub>
+  <img src="docs/assets/flashmaskv4_sm90_vs_flashmaskv4kvshared_sm90_bf16_512_512_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 shared KV vs separate K/V performance (Hopper, head dim 512/512)"/>
+  <br/><sub>SM90 FlashMask-4 shared KV vs separate K/V (d=512, dv=512)</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm90_vs_flashmaskv4kvshared_sm90_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 shared KV vs separate K/V performance (Hopper, head dim 576/512)"/>
+  <br/><sub>SM90 FlashMask-4 shared KV vs separate K/V (d=576, dv=512)</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_bf16_512_512_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 shared KV vs separate K/V performance (Blackwell, head dim 512/512)"/>
+  <br/><sub>SM100 FlashMask-4 shared KV vs separate K/V (d=512, dv=512)</sub>
+</div>
+
+<div align="center">
+  <img src="docs/assets/flashmaskv4_sm100_vs_flashmaskv4kvshared_sm100_fwd_bwd_total_radar.png" width="100%" alt="FlashMask-4 shared KV vs separate K/V performance (Blackwell, head dim 576/512)"/>
+  <br/><sub>SM100 FlashMask-4 shared KV vs separate K/V (d=576, dv=512)</sub>
 </div>
 
 ---
