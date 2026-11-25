@@ -48,6 +48,7 @@ from ._common import (
     _same_storage,
     maybe_contiguous,
     num_splits_heuristic,
+    sm100_split_kv_supported,
 )
 from .combine import _flash_attn_fwd_combine
 from .decode import (
@@ -125,7 +126,6 @@ def _flash_attn_fwd(
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
     batch_size, seqlen_q = q.shape[:2]
-    total_q = batch_size * seqlen_q
 
     compute_capability = (
         be.device_capability()[0]
@@ -172,7 +172,7 @@ def _flash_attn_fwd(
             f"head_dim={head_dim}/{head_dim_v}: the folded accumulator supports "
             "head_dim_v <= 512 (O takes head_dim_v / 2 TMEM columns)"
         )
-        assert num_splits == 1, (
+        assert num_splits <= 1, (
             "head_dim_v > 256 does not support split-KV: the folded accumulator shares "
             "each query row between two threads, which the split-KV row map cannot express"
         )
@@ -353,27 +353,20 @@ def _flash_attn_fwd(
     cute_flashmask_info = None
     # The SwapAB decode kernel reads the mask itself (block list below).
     if startend_row_indices is not None and not use_swapab_decode:
-        fm_batch_size = startend_row_indices.shape[0]
-        fm_heads = startend_row_indices.shape[1]
-        num_m_blocks = (seqlen_q + fwd_m_tile_rows - 1) // fwd_m_tile_rows
         flashmask_info = FlashMaskInfoPaddle(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
         )
-        # valid_block_count (produced by reduce_block_count) feeds only the SM100
-        # path and the bwd 2CTA density heuristic. The SM90 fwd kernel iterates the
-        # block-sparse lists built below (build_flashmask_block_lists) and never
-        # reads valid_block_count, so skip both the extra [b,h,num_m_blocks] alloc
-        # and the reduce_block_count kernel launch there. Per-call fixed overhead
-        # dominates the high-sparsity / short-seq configs, so this is pure win.
-        if compute_capability != 9:
-            flashmask_info.valid_block_count = be.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=be.int32)
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
-        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        if compute_capability != 9:
-            reduce_block_count(
-                cute_flashmask_info, causal, fwd_m_tile_rows, n_block_size, seqlen_q, be
-            )
+        # valid_block_count (produced by reduce_block_count) feeds only the SM100
+        # path. The SM90 fwd kernel iterates the block-sparse lists built below
+        # (build_flashmask_block_lists) and never reads valid_block_count, so skip
+        # both the extra [b,h,num_m_blocks] alloc and the reduce_block_count kernel
+        # launch there. Per-call fixed overhead dominates the high-sparsity /
+        # short-seq configs, so this is pure win. On SM100 its M granularity depends
+        # on the final pack_gqa, so it is built after pack_gqa is settled (below).
+        if compute_capability == 9:
+            cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
 
     if enable_overlap:
         # K/V are still the LOCAL framework tensors here (used only for update_kv +
@@ -442,23 +435,26 @@ def _flash_attn_fwd(
     requires_grad = any(be.requires_grad(t) for t in (q, k, v))
 
     if out is None:
-        # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
-        # out as 0. So on SM90 use an uninitialized buffer to skip the O
-        # zero-fill that dominates short-seq / high-sparsity calls (measured fwd speedup).
-        # On SM100 a query block without any KV block skips its O store, so O keeps the
-        # zero-fill, except at d == dv == 256: with flashmask the kernel writes those tiles'
-        # zeros itself (zero_empty_o_tiles), and without flashmask every query block has a
-        # KV block unless causal leaves rows past seqlen_k empty or a local window is set.
-        # window_size_* is only normalized into causal/local further below, so derive both here.
+        # Both forward kernels write every O element themselves for the fork's own paths:
+        # a flashmask tile with valid_block_count == 0 is zero-filled by the SM100
+        # correction warps (by the epilogue warp under fm_persistent) and stored after
+        # SM90's (empty) block-list walk. On SM100
+        # without flashmask a query block with no KV block skips its O store, so those
+        # keep the host fill except where every block has KV work: d == dv == 256 (the
+        # kernel writes those tiles' zeros itself, zero_empty_o_tiles), dense non-causal,
+        # or causal with seqlen_q <= seqlen_k, and no local window.
         fwd_causal = causal or (window_size_left is None and window_size_right == 0)
         fwd_local = not fwd_causal and (window_size_left is not None or window_size_right is not None)
         # The SwapAB decode kernel writes every O and LSE entry.
-        o_fully_written = use_swapab_decode or compute_capability == 9 or (
-            head_dim == 256
-            and head_dim_v == 256
-            and (
-                startend_row_indices is not None
-                or (not fwd_local and (not fwd_causal or seqlen_q <= seqlen_k))
+        o_fully_written = (
+            use_swapab_decode
+            or compute_capability == 9
+            or startend_row_indices is not None
+            or (
+                head_dim == 256
+                and head_dim_v == 256
+                and not fwd_local
+                and (not fwd_causal or seqlen_q <= seqlen_k)
             )
         )
         out = (be.empty if o_fully_written else be.zeros)(
@@ -480,6 +476,10 @@ def _flash_attn_fwd(
         if not (requires_grad or return_lse):
             lse = None
         elif use_swapab_decode:
+            lse = be.empty(shape=lse_shape, dtype=be.float32)
+        elif compute_capability == 10:
+            # The SM100 kernel writes LSE for every row of every tile it is launched on,
+            # -inf for rows with no visible key (also on skipped flashmask tiles).
             lse = be.empty(shape=lse_shape, dtype=be.float32)
         else:
             lse = be.full(shape=lse_shape, fill_value=float('-inf'), dtype=be.float32)
@@ -575,9 +575,6 @@ def _flash_attn_fwd(
     if compute_capability == 10:
         if pack_gqa and (128 % qhead_per_kvhead != 0):
             pack_gqa = False
-        # TODO: fix GQA + SplitKV
-        if pack_gqa and num_splits != 1:
-            pack_gqa = False
         # The big-d fwd configs cannot pack q heads into the M dim. PackGQA derives each
         # row's q_head (and its O destination) straight from tidx, which neither single_q_stage's
         # q_stage=1 row map nor the folded (m_block_size=64) accumulator provides -- in the
@@ -605,7 +602,24 @@ def _flash_attn_fwd(
         # More splits than KV blocks would only add empty CTAs.
         num_splits = max(1, min(num_splits, -(-seqlen_k // SWAPAB_TILE_N), 256))
         assert num_head_kv * num_splits <= CUDA_MAX_GRID_DIM_YZ
-    elif num_splits < 1:
+    elif compute_capability == 10:
+        # Head dims whose split build fails to launch (SMEM) or asserts: the heuristic must
+        # not pick split there, and an explicit split gets a clear error.
+        if not sm100_split_kv_supported(head_dim, head_dim_v, q.element_size()):
+            if num_splits > 1:
+                raise NotImplementedError(
+                    f"SplitKV is not supported for head_dim={head_dim}, head_dim_v={head_dim_v} "
+                    "on SM100 (needs head_dim_v < 192, head_dim <= 256, and the fp32 O "
+                    "partials must fit in shared memory)"
+                )
+            num_splits = 1
+
+    # Split-KV with a column mask is rejected below on the main-kernel path, so the
+    # heuristic must not pick it there. SwapAB decode supports mask + split and has
+    # already fixed num_splits >= 1 above.
+    if num_splits < 1 and startend_row_indices is not None:
+        num_splits = 1
+    if num_splits < 1:
         max_seqlen_k = seqlen_k
         max_seqlen_q = seqlen_q
         seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
@@ -625,11 +639,29 @@ def _flash_attn_fwd(
         )
 
     is_split_kv = num_splits > 1
+    if is_split_kv and startend_row_indices is not None and not use_swapab_decode:
+        # The main kernel would hang: the correction warp counts a tile's blocks from
+        # valid_block_count, which has no split axis, while the other warps only walk
+        # this split's KV range. SwapAB decode deals its splits over the mask's
+        # surviving blocks and is handled in its own branch below.
+        raise NotImplementedError("FlashMask (startend_row_indices) is not supported with SplitKV.")
     if is_split_kv:
-        out_partial = be.empty(
-            shape=[num_splits, *q_batch_seqlen_shape, num_head, head_dim_v], dtype=be.float32
-        )
-        lse_partial = be.empty(shape=[num_splits, *lse_shape], dtype=be.float32)
+        if use_swapab_decode:
+            # The SwapAB kernel keeps the split axis separate: O is (ns, b, 1, h, dv)
+            # and LSE is (ns, b, h, 1).
+            out_partial = be.empty(
+                shape=[num_splits, *q_batch_seqlen_shape, num_head, head_dim_v], dtype=be.float32
+            )
+            lse_partial = be.empty(shape=[num_splits, *lse_shape], dtype=be.float32)
+        else:
+            # The split axis is folded into batch (split outermost), so O / LSE partials keep
+            # the rank of O / LSE; see FlashAttentionForwardSm100.__call__.
+            out_partial = be.empty(
+                shape=[num_splits * batch_size, seqlen_q, num_head, head_dim_v], dtype=be.float32
+            )
+            lse_partial = be.empty(
+                shape=[num_splits * batch_size, num_head, seqlen_q], dtype=be.float32
+            )
 
     q_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -810,6 +842,23 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    if startend_row_indices is not None and compute_capability != 9:
+        fm_batch_size, fm_heads = startend_row_indices.shape[:2]
+        # A pack_gqa tile holds the qhead_per_kvhead query heads of one KV head and stages
+        # one mask head per tile, so those query heads must share a mask head.
+        if pack_gqa and num_head_kv % fm_heads != 0:
+            pack_gqa = False
+        # The kernel indexes valid_block_count with its m_block, which under pack_gqa
+        # counts tiles of the packed (qhead_per_kvhead, seqlen_q) axis.
+        fm_qhpk = qhead_per_kvhead if pack_gqa else 1
+        num_m_blocks = (seqlen_q * fm_qhpk + fwd_m_tile_rows - 1) // fwd_m_tile_rows
+        flashmask_info.valid_block_count = be.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=be.int32)
+        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
+        reduce_block_count(
+            cute_flashmask_info, flashmask_info.is_causal, fwd_m_tile_rows, n_block_size, seqlen_q, be,
+            qhead_per_kvhead_packgqa=fm_qhpk,
+        )
+
 
     # Build SRBuffer views inside the MLIR context. Dimensions stay runtime Int32;
     # making this layout static changes the TMA descriptor and reads wrong bytes.
@@ -930,6 +979,7 @@ def _flash_attn_fwd(
                 block_size=block_size,
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
+                has_flashmask=cute_flashmask_info is not None,
             )
         else:
             raise ValueError(
@@ -1016,9 +1066,11 @@ def _flash_attn_fwd(
         stream=current_stream,
     )
     if is_split_kv:
+        # Unfold the split axis back out of batch for combine. Split is outermost, so this
+        # is a free view of the same memory.
         _flash_attn_fwd_combine(
-            out_partial,
-            lse_partial.transpose(-1, -2),
+            out_partial.view([num_splits, batch_size, seqlen_q, num_head, head_dim_v]),
+            lse_partial.view([num_splits, batch_size, num_head, seqlen_q]).transpose(-1, -2),
             out,
             lse.transpose(-1, -2) if lse is not None else None,
         )

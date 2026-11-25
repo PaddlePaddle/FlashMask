@@ -155,7 +155,6 @@ class FlashAttentionBackwardPreprocess:
             seqlen_k=0,
             headdim=0,
             headdim_v=mO.shape[2],
-            total_q=mO.shape[0],
             tile_shape_mn=(self.tile_m, 1),
         )
 

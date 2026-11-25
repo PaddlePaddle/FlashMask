@@ -40,9 +40,17 @@ def _flash_attn_fwd_combine(
         lse_partial: Partial LSE tensor (num_splits, batch, seqlen, nheads)
         out: Output tensor (batch, seqlen, nheads, headdim)
         lse: Output LSE tensor (batch, seqlen, nheads).
-        num_splits_dynamic_ptr: Dynamic number of splits per batch
+        num_splits_dynamic_ptr: Optional int32 tensor of length >= batch: the number of
+            splits batch b actually produced. For batch b only splits
+            [0, num_splits_dynamic_ptr[b]) of out_partial / lse_partial are read, so the
+            rest may hold garbage. Values must lie in [1, out_partial.shape[0]]; this is
+            not checked (it would need a device-to-host copy) and a larger value reads
+            out of bounds. A value of 1 makes the combine skip batch b entirely and leave
+            out / lse untouched, so the producer must have written that batch's final
+            out / lse itself. The SM100 forward does neither: it always cuts every batch
+            into out_partial.shape[0] ranges and writes only out_partial, which is why
+            _flash_attn_fwd does not pass this argument.
         semaphore_to_reset: Semaphore for synchronization
-        k_block_size: Block size for head dimension
 
     Returns:
         None
@@ -76,6 +84,11 @@ def _flash_attn_fwd_combine(
             assert t.dtype == be.int32, f"{name} must be int32"
             assert be.is_gpu(t), f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
+    if num_splits_dynamic_ptr is not None:
+        # The kernel reads num_splits_dynamic_ptr[batch_idx] for every batch in the grid.
+        assert num_splits_dynamic_ptr.ndim == 1 and (
+            num_splits_dynamic_ptr.shape[0] >= out_partial.shape[1]
+        ), "num_splits_dynamic_ptr must be 1-D with one entry per batch"
 
     head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
@@ -130,6 +143,10 @@ def _flash_attn_fwd_combine(
         k_block_size,
         log_max_splits,
         lse is not None,
+        # Both are const_expr branches in the kernel, so presence picks a different
+        # kernel; without these a cached build would ignore (or reject) the tensor.
+        num_splits_dynamic_ptr is not None,
+        semaphore_to_reset is not None,
     )
 
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
