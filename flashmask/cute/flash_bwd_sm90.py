@@ -604,7 +604,6 @@ class FlashAttentionBackwardSm90:
             cute.size(mQ.shape[0]),  # pass seqlen_q or total_q for seqlen_k
             mQ.shape[1],  # headdim
             mV.shape[1],  # headdim_v
-            total_q=cute.size(mK.shape[0]) * cute.size(mK.shape[3]),
             tile_shape_mn=(self.tile_n, self.tile_m),  # Swapping the role of Q & K
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
