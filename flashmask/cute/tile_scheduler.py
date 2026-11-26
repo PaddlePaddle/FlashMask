@@ -64,7 +64,6 @@ class TileSchedulerArguments(ParamsBase):
     seqlen_k: Int32
     headdim: Int32
     headdim_v: Int32
-    total_q: Int32
     tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     # How `num_block` relates to the CTAs of a cluster. Two conventions exist and they

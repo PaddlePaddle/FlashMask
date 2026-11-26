@@ -295,7 +295,6 @@ def _flash_attn_bwd(
     ]
 
     batch_size, seqlen_q = q.shape[:2]
-    total_q = batch_size * seqlen_q
 
     batch_size, seqlen_k = k.shape[:2]
     total_k = batch_size * seqlen_k

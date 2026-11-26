@@ -9,11 +9,14 @@ module holds its split / occupancy heuristics and the block-list builder. Framew
 allocation goes through a `flashmask.backend` adapter (``be``).
 """
 
+from typing import Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
+import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
-from ...backend import Tensor
+from ...backend import Tensor, get_backend
 from ..flash_fwd_decode_sm100 import (
     SWAPAB_HEAD_DIMS,
     SWAPAB_MAX_QHEAD_PER_KVHEAD,
@@ -24,6 +27,7 @@ from ..flash_fwd_decode_sm100 import (
 )
 
 __all__ = [
+    "swapab_decode_block_list",
     "swapab_decode_supported",
     "swapab_num_splits",
     "swapab_occupancy",
@@ -111,19 +115,38 @@ def _is_contiguous(t: Tensor, be) -> bool:
     return True
 
 
-def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
+def swapab_decode_supported(
+    q, k, v, startend_row_indices, causal, be, seqused_k=None, page_table=None
+) -> bool:
     """Whether the SwapAB kernel supports this forward call (no autograd checks).
 
     ``_flash_attn_fwd`` sends single-token calls that pass to the SwapAB kernel. Besides the
     kernel's own asserts this requires the TMA alignment (16-byte base addresses and strides)
     that would otherwise only fail at launch.
+
+    ``seqused_k`` (int32 (B,), device) optionally gives each sequence's KV length; ``page_table``
+    (int32 (B, max_pages), device) switches K / V to paged pools with page_size ==
+    SWAPAB_SKIP_UNIT.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         return False
     batch_size, seqlen_q, num_heads, head_dim = q.shape
-    _, seqlen_k, num_heads_kv, _ = k.shape
+    _, page_size, num_heads_kv, _ = k.shape
     head_dim_v = v.shape[-1]
-    if seqlen_q != 1 or seqlen_k < 1 or (head_dim, head_dim_v) not in SWAPAB_HEAD_DIMS:
+    if page_table is not None:
+        # One page per 128-token block: a page is exactly one TMA tile.
+        if page_size != SWAPAB_SKIP_UNIT:
+            return False
+        max_seqlen_k = page_table.shape[1] * page_size
+        if page_table.dtype != be.int32 or page_table.ndim != 2:
+            return False
+        if page_table.shape[0] != batch_size or page_table.shape[1] < 1:
+            return False
+        if not _is_contiguous(page_table, be) or be.data_ptr(page_table) % 4 != 0:
+            return False
+    else:
+        max_seqlen_k = k.shape[1]
+    if seqlen_q != 1 or max_seqlen_k < 1 or (head_dim, head_dim_v) not in SWAPAB_HEAD_DIMS:
         return False
     if q.dtype not in (be.float16, be.bfloat16) or not (q.dtype == k.dtype == v.dtype):
         return False
@@ -145,12 +168,19 @@ def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
             return False
         if any(st % 8 != 0 for st, n in zip(strides[:-1], t.shape[:-1]) if n > 1):
             return False
+    if seqused_k is not None:
+        if seqused_k.dtype != be.int32 or seqused_k.ndim != 1:
+            return False
+        if seqused_k.shape[0] != batch_size or not _is_contiguous(seqused_k, be):
+            return False
+        if be.data_ptr(seqused_k) % 4 != 0:
+            return False
     if startend_row_indices is not None:
         mask = startend_row_indices
         if mask.ndim != 4 or mask.dtype != be.int32 or not _is_contiguous(mask, be):
             return False
         mask_batch, mask_heads, mask_seqlen, num_vecs = mask.shape
-        if mask_batch != batch_size or mask_seqlen != seqlen_k or num_vecs not in (1, 2, 4):
+        if mask_batch != batch_size or mask_seqlen != max_seqlen_k or num_vecs not in (1, 2, 4):
             return False
         if (causal and num_vecs == 4) or mask_heads < 1 or num_heads % mask_heads != 0:
             return False
@@ -158,28 +188,90 @@ def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
 
 
 def _decode_block_list(
-    startend_row_indices, mask_tensor, num_heads_kv, is_causal, stream, be, mask_row
+    startend_row_indices, mask_tensor, num_heads_kv, is_causal, stream, be, mask_row,
+    seqused_k=None, buffers=None,
 ):
     """(cnt (B, H_kv, 1), idx (B, H_kv, 1, nk)) int32 for the block-skipping SwapAB kernel.
 
     The list holds the KV units (SWAPAB_SKIP_UNIT tokens each) visible from query row
     ``mask_row``. Entries past cnt are left uninitialized; the kernel never reads them.
+    ``seqused_k`` (int32 (B,), optional) truncates each sequence: units past its length are
+    never listed.
+    ``buffers`` optionally supplies (flags (B, H_m, nk), cnt, idx) int32 tensors, e.g. from a
+    FwdWorkspace, so the call allocates nothing.
     """
     batch_size, mask_heads, seqlen_k, num_vecs = startend_row_indices.shape
     nk = -(-seqlen_k // SWAPAB_SKIP_UNIT)
-    flags = be.empty([batch_size, mask_heads, nk], dtype=be.int32)
-    cnt = be.empty([batch_size, num_heads_kv, 1], dtype=be.int32)
-    idx = be.empty([batch_size, num_heads_kv, 1, nk], dtype=be.int32)
+    if buffers is None:
+        flags = be.empty([batch_size, mask_heads, nk], dtype=be.int32)
+        cnt = be.empty([batch_size, num_heads_kv, 1], dtype=be.int32)
+        idx = be.empty([batch_size, num_heads_kv, 1, nk], dtype=be.int32)
+    else:
+        flags, cnt, idx = buffers
+        assert list(flags.shape) == [batch_size, mask_heads, nk], (
+            f"flags shape {list(flags.shape)} != [{batch_size}, {mask_heads}, {nk}]"
+        )
+        assert list(cnt.shape) == [batch_size, num_heads_kv, 1], (
+            f"cnt shape {list(cnt.shape)} != [{batch_size}, {num_heads_kv}, 1]"
+        )
+        assert list(idx.shape) == [batch_size, num_heads_kv, 1, nk], (
+            f"idx shape {list(idx.shape)} != [{batch_size}, {num_heads_kv}, 1, {nk}]"
+        )
+    seqused_tensor = _to_cute(seqused_k, 4) if seqused_k is not None else None
     tensors = [_to_cute(t, 4) for t in (flags, cnt, idx)]
     cache = _decode_block_list.compile_cache
-    key = (num_vecs, is_causal)
+    key = (num_vecs, is_causal, seqused_k is not None)
     if key not in cache:
         cache[key] = cute.compile(
-            build_decode_block_list, mask_tensor, *tensors, cutlass.Int32(mask_row), num_vecs,
-            is_causal, stream,
+            build_decode_block_list, mask_tensor, seqused_tensor, *tensors,
+            cutlass.Int32(mask_row), num_vecs, is_causal, stream,
         )
-    cache[key](mask_tensor, *tensors, cutlass.Int32(mask_row), stream)
+    cache[key](mask_tensor, seqused_tensor, *tensors, cutlass.Int32(mask_row), stream)
     return cnt, idx
+
+
+def swapab_decode_block_list(
+    startend_row_indices: Tensor,
+    num_heads_kv: int,
+    *,
+    causal: bool = False,
+    mask_row: int = 0,
+    seqused_k: Optional[Tensor] = None,
+    workspace=None,
+) -> Tuple[Tensor, Tensor]:
+    """Build the SwapAB decode block list once per step.
+
+    Returns (cnt, idx) int32 tensors shaped (B, H_kv, 1) and (B, H_kv, 1, ceil(S/128)).
+    Pass ``block_list=(cnt, idx)`` to every forward call of the step so the list is built
+    once and shared by all layers.
+
+    With ``workspace`` (a FwdWorkspace built with the mask's num_vecs), the flags / cnt /
+    idx buffers come from the workspace and nothing is allocated. Otherwise they are
+    allocated here.
+    """
+    be = get_backend(startend_row_indices)
+    mask_tensor = from_dlpack(
+        startend_row_indices.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=3)
+    # causal only changes the code for num_vecs 2.
+    is_causal = causal and startend_row_indices.shape[3] == 2
+    buffers = None
+    if workspace is not None:
+        batch_size, mask_heads, seqlen_k, _ = startend_row_indices.shape
+        buffers = workspace.swapab_block_list_views(
+            batch_size, mask_heads, num_heads_kv, seqlen_k
+        )
+    return _decode_block_list(
+        startend_row_indices,
+        mask_tensor,
+        num_heads_kv,
+        is_causal,
+        cuda.CUstream(be.cuda_stream()),
+        be,
+        mask_row=mask_row,
+        seqused_k=seqused_k,
+        buffers=buffers,
+    )
 
 
 _decode_block_list.compile_cache = {}

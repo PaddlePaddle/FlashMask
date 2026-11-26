@@ -45,6 +45,7 @@ def flashmask_attention(
     learnable_sink: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     group=None,
+    block_list: Optional[tuple] = None,
 ):
     """FlashMask attention.
 
@@ -60,6 +61,10 @@ def flashmask_attention(
         group: context-parallel group; world size > 1 enables the overlap path.
             k/v are then local shards, and the mask key axis spans all ranks'
             chunks (S_local * group_size) in group-rank order, unshifted.
+        block_list: optional (cnt, idx) int32 tensors from
+            `flashmask.cute.ops.decode.swapab_decode_block_list`. Build it once per
+            step and pass it to every layer so the block list is not rebuilt per call
+            (single-token decode on SM100 / SM103 only).
 
     Returns:
         ``out``, or ``(out, lse)`` when ``return_lse``.
@@ -101,6 +106,6 @@ def flashmask_attention(
 
     # apply() passes positionally: torch.autograd.Function does not take keywords.
     out, lse = FlashMaskFunc.apply(
-        q, k, v, causal, softmax_scale, learnable_sink, startend_row_indices, group
+        q, k, v, causal, softmax_scale, learnable_sink, startend_row_indices, group, block_list
     )
     return (out, lse) if return_lse else out

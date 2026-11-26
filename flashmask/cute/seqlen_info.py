@@ -2,7 +2,7 @@
 # Copyright (c) 2025, Tri Dao.
 # Copyright (c) 2026 The FlashMask Authors. Modifications for FlashMask.
 
-from typing import Optional
+from typing import Optional, NamedTuple
 from dataclasses import dataclass
 
 import cutlass
@@ -10,6 +10,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
 from . import copy_utils
+from .cute_dsl_utils import new_namedtuple_from_mlir_values
 
 
 """
@@ -17,6 +18,33 @@ This consolidates all the info related to sequence length. This is so that we ca
 the gmem reads once at the beginning of each tile, rather than having to repeat these reads
 to compute various things like n_block_min, n_block_max, etc.
 """
+
+
+class SeqlenMeta(NamedTuple):
+    """Per-batch KV length / paged / split-KV metadata for the forward kernel.
+
+    Kept apart from FlashMaskInfo because the lifetimes differ: the mask comes
+    with each request, while this is built once per batch step and shared by
+    every layer. seqused_k gives each batch's KV length, page_table its KV pages.
+    """
+    seqused_k: Optional[cute.Tensor] = None
+    page_table: Optional[cute.Tensor] = None
+    num_splits_dynamic: Optional[cute.Tensor] = None
+    max_seqlen_q: Optional[Int32] = None
+    max_seqlen_k: Optional[Int32] = None
+
+    def __new_from_mlir_values__(self, values):
+        return new_namedtuple_from_mlir_values(self, values)
+
+
+def seqlen_info_kwargs(meta: Optional[SeqlenMeta]) -> dict:
+    """Return the optional per-batch arguments (KV length, split count) for SeqlenInfoQK."""
+    if meta is None:
+        return {}
+    return dict(
+        mSeqUsedK=meta.seqused_k,
+        mNumSplitsDynamic=meta.num_splits_dynamic,
+    )
 
 
 @dataclass(frozen=True)
@@ -58,26 +86,34 @@ class SeqlenInfoQK:
     m_block_offset: Int32
     block_idx_offset: Int32
     num_n_blocks: Int32
+    has_seqused_k: cutlass.Constexpr[bool]
+    has_cu_block_idx_offsets: cutlass.Constexpr[bool] = False
+    # Split-KV: the number of KV ranges this batch is cut into (#26), read from
+    # SeqlenMeta.num_splits_dynamic. None means every batch uses the grid's split count.
+    num_splits_dynamic: Optional[Int32] = None
 
     @staticmethod
     def create(
         batch_idx: Int32,
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
+        mSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        mNumSplitsDynamic: Optional[cute.Tensor] = None,
     ):
-        # Fixed-length only: q/k offsets are always 0 and seqlens are the static
-        # shapes. mCuTotalMBlocks / mCuBlockIdxOffsets belong to the block-sparse
-        # scheduling contract (None for the flashmask fixed-length reuse).
+        # Fixed-length only: q/k offsets are always 0 and seqlen_q is the static shape.
+        # mSeqUsedK (int32 [batch]) gives each batch's KV length, else the static shape.
+        # mCuTotalMBlocks / mCuBlockIdxOffsets belong to the block-sparse scheduling
+        # contract (None for the flashmask fixed-length reuse).
         offset_q = 0
         offset_k = 0
         padded_offset_q = 0
         padded_offset_k = 0
         seqlen_q = seqlen_q_static
-        seqlen_k = seqlen_k_static
+        seqlen_k = mSeqUsedK[batch_idx] if const_expr(mSeqUsedK is not None) else seqlen_k_static
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
         block_idx_offset = (
@@ -95,6 +131,11 @@ class SeqlenInfoQK:
             m_block_offset,
             block_idx_offset,
             num_n_blocks,
+            has_seqused_k=mSeqUsedK is not None,
+            has_cu_block_idx_offsets=mCuBlockIdxOffsets is not None,
+            num_splits_dynamic=(
+                mNumSplitsDynamic[batch_idx] if const_expr(mNumSplitsDynamic is not None) else None
+            ),
         )
 
     def offset_batch_Q(
