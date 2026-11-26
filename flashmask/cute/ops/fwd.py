@@ -223,8 +223,10 @@ def _flash_attn_fwd(
         and block_logit is None
         and not any(be.requires_grad(t) for t in (q, k, v))
         and (group is None or _dist_world_size(be, group) == 1)
-        and seqlen_meta is None
-        and swapab_decode_supported(q, k, v, startend_row_indices, causal, be)
+        and (seqlen_meta is None or seqused_k is not None or page_table is not None)
+        and swapab_decode_supported(
+            q, k, v, startend_row_indices, causal, be, seqused_k=seqused_k, page_table=page_table
+        )
     )
     if num_splits is None:
         num_splits = 0 if use_swapab_decode else 1
@@ -833,7 +835,7 @@ def _flash_attn_fwd(
         if use_block_list:
             blk_cnt, blk_idx = _decode_block_list(
                 startend_row_indices, mask_tensor, num_head_kv, mask_is_causal, current_stream,
-                be, mask_row=0,
+                be, mask_row=0, seqused_k=seqused_k,
             )
             blk_cnt_tensor = from_dlpack(blk_cnt.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=2
@@ -841,6 +843,16 @@ def _flash_attn_fwd(
             blk_idx_tensor = from_dlpack(blk_idx.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=3
             )
+        seqused_tensor = (
+            from_dlpack(seqused_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if seqused_k is not None
+            else None
+        )
+        page_table_tensor = (
+            from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+            if page_table is not None
+            else None
+        )
         occupancy = swapab_occupancy(
             batch_size * num_head_kv * num_splits,
             be.multi_processor_count(),
@@ -866,6 +878,8 @@ def _flash_attn_fwd(
             mask_per_head,
             use_block_list,
             occupancy,
+            seqused_k is not None,
+            page_table is not None,
         )
         decode_args = (
             q_tensor,
@@ -876,6 +890,8 @@ def _flash_attn_fwd(
             mask_tensor,
             blk_cnt_tensor,
             blk_idx_tensor,
+            seqused_tensor,
+            page_table_tensor,
             cutlass.Float32(softmax_scale),
             cutlass.Int32(0),  # the query's mask row
             current_stream,
