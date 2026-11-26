@@ -9,11 +9,14 @@ module holds its split / occupancy heuristics and the block-list builder. Framew
 allocation goes through a `flashmask.backend` adapter (``be``).
 """
 
+from typing import Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
+import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 
-from ...backend import Tensor
+from ...backend import Tensor, get_backend
 from ..flash_fwd_decode_sm100 import (
     SWAPAB_HEAD_DIMS,
     SWAPAB_MAX_QHEAD_PER_KVHEAD,
@@ -24,6 +27,7 @@ from ..flash_fwd_decode_sm100 import (
 )
 
 __all__ = [
+    "swapab_decode_block_list",
     "swapab_decode_supported",
     "swapab_num_splits",
     "swapab_occupancy",
@@ -185,7 +189,7 @@ def swapab_decode_supported(
 
 def _decode_block_list(
     startend_row_indices, mask_tensor, num_heads_kv, is_causal, stream, be, mask_row,
-    seqused_k=None,
+    seqused_k=None, buffers=None,
 ):
     """(cnt (B, H_kv, 1), idx (B, H_kv, 1, nk)) int32 for the block-skipping SwapAB kernel.
 
@@ -193,12 +197,26 @@ def _decode_block_list(
     ``mask_row``. Entries past cnt are left uninitialized; the kernel never reads them.
     ``seqused_k`` (int32 (B,), optional) truncates each sequence: units past its length are
     never listed.
+    ``buffers`` optionally supplies (flags (B, H_m, nk), cnt, idx) int32 tensors, e.g. from a
+    FwdWorkspace, so the call allocates nothing.
     """
     batch_size, mask_heads, seqlen_k, num_vecs = startend_row_indices.shape
     nk = -(-seqlen_k // SWAPAB_SKIP_UNIT)
-    flags = be.empty([batch_size, mask_heads, nk], dtype=be.int32)
-    cnt = be.empty([batch_size, num_heads_kv, 1], dtype=be.int32)
-    idx = be.empty([batch_size, num_heads_kv, 1, nk], dtype=be.int32)
+    if buffers is None:
+        flags = be.empty([batch_size, mask_heads, nk], dtype=be.int32)
+        cnt = be.empty([batch_size, num_heads_kv, 1], dtype=be.int32)
+        idx = be.empty([batch_size, num_heads_kv, 1, nk], dtype=be.int32)
+    else:
+        flags, cnt, idx = buffers
+        assert list(flags.shape) == [batch_size, mask_heads, nk], (
+            f"flags shape {list(flags.shape)} != [{batch_size}, {mask_heads}, {nk}]"
+        )
+        assert list(cnt.shape) == [batch_size, num_heads_kv, 1], (
+            f"cnt shape {list(cnt.shape)} != [{batch_size}, {num_heads_kv}, 1]"
+        )
+        assert list(idx.shape) == [batch_size, num_heads_kv, 1, nk], (
+            f"idx shape {list(idx.shape)} != [{batch_size}, {num_heads_kv}, 1, {nk}]"
+        )
     seqused_tensor = _to_cute(seqused_k, 4) if seqused_k is not None else None
     tensors = [_to_cute(t, 4) for t in (flags, cnt, idx)]
     cache = _decode_block_list.compile_cache
@@ -210,6 +228,50 @@ def _decode_block_list(
         )
     cache[key](mask_tensor, seqused_tensor, *tensors, cutlass.Int32(mask_row), stream)
     return cnt, idx
+
+
+def swapab_decode_block_list(
+    startend_row_indices: Tensor,
+    num_heads_kv: int,
+    *,
+    causal: bool = False,
+    mask_row: int = 0,
+    seqused_k: Optional[Tensor] = None,
+    workspace=None,
+) -> Tuple[Tensor, Tensor]:
+    """Build the SwapAB decode block list once per step.
+
+    Returns (cnt, idx) int32 tensors shaped (B, H_kv, 1) and (B, H_kv, 1, ceil(S/128)).
+    Pass ``block_list=(cnt, idx)`` to every forward call of the step so the list is built
+    once and shared by all layers.
+
+    With ``workspace`` (a FwdWorkspace built with the mask's num_vecs), the flags / cnt /
+    idx buffers come from the workspace and nothing is allocated. Otherwise they are
+    allocated here.
+    """
+    be = get_backend(startend_row_indices)
+    mask_tensor = from_dlpack(
+        startend_row_indices.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=3)
+    # causal only changes the code for num_vecs 2.
+    is_causal = causal and startend_row_indices.shape[3] == 2
+    buffers = None
+    if workspace is not None:
+        batch_size, mask_heads, seqlen_k, _ = startend_row_indices.shape
+        buffers = workspace.swapab_block_list_views(
+            batch_size, mask_heads, num_heads_kv, seqlen_k
+        )
+    return _decode_block_list(
+        startend_row_indices,
+        mask_tensor,
+        num_heads_kv,
+        is_causal,
+        cuda.CUstream(be.cuda_stream()),
+        be,
+        mask_row=mask_row,
+        seqused_k=seqused_k,
+        buffers=buffers,
+    )
 
 
 _decode_block_list.compile_cache = {}

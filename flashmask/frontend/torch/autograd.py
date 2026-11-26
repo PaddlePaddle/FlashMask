@@ -41,6 +41,7 @@ class FlashMaskFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         startend_row_indices: Optional[torch.Tensor] = None,
         group=None,
+        block_list=None,
     ):
         out, lse = _flash_attn_fwd(
             query,
@@ -53,6 +54,7 @@ class FlashMaskFunc(torch.autograd.Function):
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
             group=group,
+            block_list=block_list,
         )
         ctx.save_for_backward(query, key, value, startend_row_indices, out, lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
@@ -100,4 +102,5 @@ class FlashMaskFunc(torch.autograd.Function):
             dsink if sink_needs else None,
             None,  # startend_row_indices
             None,  # group
+            None,  # block_list
         )

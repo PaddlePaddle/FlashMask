@@ -21,6 +21,7 @@ from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 from ...backend import Tensor, get_backend
+from ..flash_fwd_decode_sm100 import SWAPAB_SKIP_UNIT
 from ..flashmask_utils import _compute_nblock_seqlen
 from ._common import sm100_split_kv_supported
 
@@ -201,6 +202,22 @@ class FwdWorkspace:
         self.nblock_buffers = []
         self.column_scratch = None
         self.valid_block_count = None
+        # SwapAB decode block lists (#45): flags per mask head, cnt / idx per KV head.
+        # The same bounds as the nblock buffers above; views hand out per-call shapes.
+        if num_vecs is not None:
+            self.swapab_n_units = -(-max_seqlen_k // SWAPAB_SKIP_UNIT)
+            self.swapab_flags = be.empty(
+                [max_batch * self.mask_heads * self.swapab_n_units], dtype=i32
+            )
+            self.swapab_blk_cnt = be.empty([max_batch * num_heads_kv], dtype=i32)
+            self.swapab_blk_idx = be.empty(
+                [max_batch * num_heads_kv * self.swapab_n_units], dtype=i32
+            )
+        else:
+            self.swapab_n_units = 0
+            self.swapab_flags = None
+            self.swapab_blk_cnt = None
+            self.swapab_blk_idx = None
         if num_vecs is not None:
             mh = self.mask_heads
             nblock_numel = max_batch * mh * _compute_nblock_seqlen(max_seqlen_k, _MIN_TILE_N)
@@ -294,6 +311,40 @@ class FwdWorkspace:
         return (
             _view(self.out_partial, [s * batch_size, seqlen_q, self.num_heads, self.head_dim_v]),
             _view(self.lse_partial, [s * batch_size, self.num_heads, seqlen_q]),
+        )
+
+    def swapab_partials(self, batch_size, seqlen_q):
+        """SwapAB O / LSE partials, which keep the split axis separate.
+
+        O is (num_splits, batch, seqlen_q, num_heads, head_dim_v) and LSE is
+        (num_splits, batch, num_heads, seqlen_q); the SwapAB kernel is single-token so
+        seqlen_q is 1.
+        """
+        assert seqlen_q == 1, "SwapAB decode requires seqlen_q == 1"
+        s = self.max_splits
+        return (
+            _view(self.out_partial, [s, batch_size, seqlen_q, self.num_heads, self.head_dim_v]),
+            _view(self.lse_partial, [s, batch_size, self.num_heads, seqlen_q]),
+        )
+
+    def swapab_block_list_views(self, batch_size, mask_heads, num_heads_kv, seqlen_k):
+        """flags / cnt / idx views for one SwapAB decode call, allocating nothing."""
+        assert self.swapab_flags is not None, (
+            "workspace was built without num_vecs; it cannot hold SwapAB block lists"
+        )
+        assert batch_size <= self.max_batch and mask_heads <= self.mask_heads, (
+            f"mask {batch_size}x{mask_heads} exceeds workspace "
+            f"{self.max_batch}x{self.mask_heads}"
+        )
+        assert num_heads_kv <= self.num_heads_kv and seqlen_k <= self.max_seqlen_k, (
+            f"call needs {num_heads_kv} KV heads x {seqlen_k} keys, workspace bound is "
+            f"{self.num_heads_kv} x {self.max_seqlen_k}"
+        )
+        nk = -(-seqlen_k // SWAPAB_SKIP_UNIT)
+        return (
+            _view(self.swapab_flags, [batch_size, mask_heads, nk]),
+            _view(self.swapab_blk_cnt, [batch_size, num_heads_kv, 1]),
+            _view(self.swapab_blk_idx, [batch_size, num_heads_kv, 1, nk]),
         )
 
     def nblock_alloc(self):

@@ -446,6 +446,7 @@ class _SwapABCore:
         mBlockIdx: cute.Tensor | None,  # (batch, num_heads_kv, 1, n_units) int32 unit list
         mSeqUsedK: cute.Tensor | None,  # (batch,) int32: KV length of each sequence
         mPageTable: cute.Tensor | None,  # (batch, max_pages) int32 paged-KV table
+        mNumSplitsDynamic: cute.Tensor | None,  # (batch,) int32: per-batch split count
         softmax_scale: Float32,
         mask_row: Int32,  # the query's row in the column mask
         stream: cuda.CUstream,
@@ -605,6 +606,7 @@ class _SwapABCore:
             mBlockIdx,
             mSeqUsedK,
             mPageTable,
+            mNumSplitsDynamic,
             softmax_scale_log2,
             mask_row,
             tiled_mma_qk,
@@ -644,6 +646,7 @@ class _SwapABCore:
         mBlockIdx: cute.Tensor | None,
         mSeqUsedK: cute.Tensor | None,
         mPageTable: cute.Tensor | None,
+        mNumSplitsDynamic: cute.Tensor | None,
         softmax_scale_log2: Float32,
         mask_row: Int32,
         tiled_mma_qk: cute.TiledMma,
@@ -698,12 +701,17 @@ class _SwapABCore:
         # equal contiguous runs, as in upstream BlockInfo.get_n_block_min_max. With a block
         # list, block j holds the units at list positions j * units_per_block + i.
         # The block-list count is read only after the on-chip prologue (see the PDL wait below).
+        # Per-batch split count (#45): the grid keeps num_splits (the maximum) and batch b
+        # uses num_splits_dynamic[b] of them; splits at or past it get an empty range.
         units_per_block = tile_n // SWAPAB_SKIP_UNIT
         num_listed = Int32(0)
         oob_unit = num_units
+        num_splits_b = num_splits
         if const_expr(mBlockIdx is None):
+            if const_expr(mNumSplitsDynamic is not None):
+                num_splits_b = mNumSplitsDynamic[batch_idx]
             n_block_min, n_block_max, num_n_blocks = _split_block_range(
-                cute.ceil_div(seq_len_b, tile_n), split_id, num_splits
+                cute.ceil_div(seq_len_b, tile_n), split_id, num_splits_b
             )
             is_empty_split = num_n_blocks == 0
         # Q, O and LSE rows are the sequence index.
@@ -908,8 +916,10 @@ class _SwapABCore:
             # global read, the list count, and before loading Q.
             cute.arch.griddepcontrol_wait()
             num_listed = mBlockCnt[batch_idx, kv_head_idx, 0]
+            if const_expr(mNumSplitsDynamic is not None):
+                num_splits_b = mNumSplitsDynamic[batch_idx]
             n_block_min, n_block_max, num_n_blocks = _split_block_range(
-                (num_listed + units_per_block - 1) // units_per_block, split_id, num_splits
+                (num_listed + units_per_block - 1) // units_per_block, split_id, num_splits_b
             )
             is_empty_split = num_n_blocks == 0
             if warp_idx == load_q_store_o_warp_id:
@@ -1652,6 +1662,7 @@ class FlashMaskDecodeSm100SwapAB:
         mBlockIdx: cute.Tensor | None,  # (b, h_k, 1, n_units) int32 | None
         mSeqUsedK: cute.Tensor | None,  # (b,) int32 | None
         mPageTable: cute.Tensor | None,  # (b, max_pages) int32 | None
+        mNumSplitsDynamic: cute.Tensor | None,  # (b,) int32 | None
         softmax_scale: Float32,
         mask_row: Int32,  # the query's mask row: s_k - 1 bottom-right, 0 as the main kernel
         stream: cuda.CUstream,
@@ -1677,6 +1688,8 @@ class FlashMaskDecodeSm100SwapAB:
             assert len(mSeqUsedK.shape) == 1 and mSeqUsedK.element_type == Int32
         if const_expr(mPageTable is not None):
             assert len(mPageTable.shape) == 2 and mPageTable.element_type == Int32
+        if const_expr(mNumSplitsDynamic is not None):
+            assert len(mNumSplitsDynamic.shape) == 1 and mNumSplitsDynamic.element_type == Int32
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         batch, num_heads = mQ.shape[0], mQ.shape[2]
@@ -1722,6 +1735,7 @@ class FlashMaskDecodeSm100SwapAB:
             mBlockIdx,
             mSeqUsedK,
             mPageTable,
+            mNumSplitsDynamic,
             softmax_scale,
             mask_row,
             stream,

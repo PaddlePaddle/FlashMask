@@ -26,6 +26,7 @@ from ..block_sparsity import (
 )
 from ..flash_fwd_decode_sm100 import (
     SWAPAB_OCCUPANCIES,
+    SWAPAB_SKIP_UNIT,
     SWAPAB_TILE_N,
     FlashMaskDecodeSm100SwapAB,
     swapab_occupancy_fits,
@@ -94,6 +95,7 @@ def _flash_attn_fwd(
     group=None,
     seqlen_meta: Optional[SeqlenMeta] = None,
     workspace: Optional[FwdWorkspace] = None,
+    block_list: Optional[Tuple[Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Forward pass for FlashAttention.
 
@@ -146,6 +148,9 @@ def _flash_attn_fwd(
             host. The split count is workspace.max_splits (num_splits must be <= 1 or
             equal to it); with max_splits > 1 and no seqlen_meta.num_splits_dynamic, the
             per-batch counts come from workspace.num_splits_dynamic (see FwdWorkspace.plan).
+        block_list: optional (cnt, idx) int32 tensors from swapab_decode_block_list, built
+            once per step and shared by every layer (SM100 SwapAB decode only). The list
+            is rebuilt per call when None and a column mask is given.
     """
     be = get_backend(q, k, v)
 
@@ -153,7 +158,7 @@ def _flash_attn_fwd(
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
     if workspace is not None:
-        if num_splits > 1 and num_splits != workspace.max_splits:
+        if num_splits is not None and num_splits > 1 and num_splits != workspace.max_splits:
             raise ValueError(f"num_splits={num_splits} differs from workspace.max_splits={workspace.max_splits}")
         num_splits = workspace.max_splits
         if num_splits > 1 and (seqlen_meta is None or seqlen_meta.num_splits_dynamic is None):
@@ -223,7 +228,8 @@ def _flash_attn_fwd(
         and block_logit is None
         and not any(be.requires_grad(t) for t in (q, k, v))
         and (group is None or _dist_world_size(be, group) == 1)
-        and (seqlen_meta is None or seqused_k is not None or page_table is not None)
+        and (seqlen_meta is None or seqused_k is not None or page_table is not None
+             or num_splits_dynamic is not None)
         and swapab_decode_supported(
             q, k, v, startend_row_indices, causal, be, seqused_k=seqused_k, page_table=page_table
         )
@@ -703,8 +709,11 @@ def _flash_attn_fwd(
                 q.dtype == be.bfloat16,
                 head_dim_v,
             )
-        # More splits than KV blocks would only add empty CTAs.
-        num_splits = max(1, min(num_splits, -(-seqlen_k // SWAPAB_TILE_N), 256))
+        # More splits than KV blocks would only add empty CTAs. A workspace fixes the
+        # grid at max_splits (its partial views are shaped that way) and the per-batch
+        # counts on the device decide which splits do work.
+        if workspace is None:
+            num_splits = max(1, min(num_splits, -(-seqlen_k // SWAPAB_TILE_N), 256))
         assert num_head_kv * num_splits <= CUDA_MAX_GRID_DIM_YZ
     elif compute_capability == 10:
         # Head dims whose split build fails to launch (SMEM) or asserts: the heuristic must
@@ -772,7 +781,12 @@ def _flash_attn_fwd(
         raise ValueError("seqlen_meta.num_splits_dynamic needs num_splits > 1 (the grid's split count)")
     if is_split_kv:
         if workspace is not None:
-            out_partial, lse_partial = workspace.partials(batch_size, seqlen_q)
+            if use_swapab_decode:
+                # The SwapAB kernel keeps the split axis separate: O is (ns, b, 1, h, dv)
+                # and LSE is (ns, b, h, 1).
+                out_partial, lse_partial = workspace.swapab_partials(batch_size, seqlen_q)
+            else:
+                out_partial, lse_partial = workspace.partials(batch_size, seqlen_q)
         elif use_swapab_decode:
             # The SwapAB kernel keeps the split axis separate: O is (ns, b, 1, h, dv)
             # and LSE is (ns, b, h, 1).
@@ -816,6 +830,11 @@ def _flash_attn_fwd(
         lse_tensor = None
 
     if use_swapab_decode:
+        if block_list is not None and (startend_row_indices is None or num_head_kv % startend_row_indices.shape[1] != 0):
+            raise ValueError(
+                "block_list requires a column mask whose head count divides num_heads_kv "
+                "(the SwapAB block list is built for shared mask heads)"
+            )
         mask_num_vecs, mask_per_head, mask_tensor = 0, False, None
         if startend_row_indices is not None:
             mask_num_vecs = startend_row_indices.shape[3]
@@ -833,10 +852,35 @@ def _flash_attn_fwd(
         use_block_list = mask_tensor is not None and not mask_per_head
         blk_cnt_tensor = blk_idx_tensor = None
         if use_block_list:
-            blk_cnt, blk_idx = _decode_block_list(
-                startend_row_indices, mask_tensor, num_head_kv, mask_is_causal, current_stream,
-                be, mask_row=0, seqused_k=seqused_k,
-            )
+            if block_list is not None:
+                blk_cnt, blk_idx = block_list
+                nk = -(-seqlen_k // SWAPAB_SKIP_UNIT)
+                assert blk_cnt.dtype == be.int32 and blk_idx.dtype == be.int32, (
+                    "block_list tensors must be int32"
+                )
+                assert list(blk_cnt.shape) == [batch_size, num_head_kv, 1] and list(blk_idx.shape) == [
+                    batch_size,
+                    num_head_kv,
+                    1,
+                    nk,
+                ], (
+                    f"block_list shapes {list(blk_cnt.shape)} / {list(blk_idx.shape)} do not "
+                    f"match [{batch_size}, {num_head_kv}, 1] / [{batch_size}, {num_head_kv}, 1, {nk}]"
+                )
+            else:
+                # With a workspace the flags / cnt / idx buffers come from it; otherwise they
+                # are allocated here.
+                buffers = (
+                    workspace.swapab_block_list_views(
+                        batch_size, startend_row_indices.shape[1], num_head_kv, seqlen_k
+                    )
+                    if workspace is not None
+                    else None
+                )
+                blk_cnt, blk_idx = _decode_block_list(
+                    startend_row_indices, mask_tensor, num_head_kv, mask_is_causal,
+                    current_stream, be, mask_row=0, seqused_k=seqused_k, buffers=buffers,
+                )
             blk_cnt_tensor = from_dlpack(blk_cnt.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=2
             )
@@ -851,6 +895,15 @@ def _flash_attn_fwd(
         page_table_tensor = (
             from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
             if page_table is not None
+            else None
+        )
+        # Per-batch split counts (#45): the grid keeps num_splits and each batch reads its
+        # count from the device; empty splits write O = 0 / LSE = -inf.
+        num_splits_dynamic_tensor = (
+            from_dlpack(num_splits_dynamic.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=0
+            )
+            if num_splits_dynamic is not None
             else None
         )
         occupancy = swapab_occupancy(
@@ -879,6 +932,9 @@ def _flash_attn_fwd(
             use_block_list,
             occupancy,
             seqused_k is not None,
+            # per-batch split counts add a kernel argument, so they must select their own
+            # artifact
+            num_splits_dynamic is not None,
             page_table is not None,
         )
         decode_args = (
@@ -892,6 +948,7 @@ def _flash_attn_fwd(
             blk_idx_tensor,
             seqused_tensor,
             page_table_tensor,
+            num_splits_dynamic_tensor,
             cutlass.Float32(softmax_scale),
             cutlass.Int32(0),  # the query's mask row
             current_stream,
