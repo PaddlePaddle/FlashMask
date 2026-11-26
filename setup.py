@@ -538,4 +538,9 @@ setup(
     install_requires=install_requires,
     extras_require=extras_require,
     python_requires='>=3.10',
+    entry_points={
+        'sglang.srt.plugins': [
+            'flashmask = flashmask.frontend.torch.sglang_plugin:register_plugin',
+        ],
+    },
 )
