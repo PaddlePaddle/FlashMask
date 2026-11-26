@@ -15,7 +15,7 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.base_dsl.typing import JitArgument
+from cutlass.base_dsl.typing import JitArgument, get_mlir_types
 from cutlass.cutlass_dsl import NumericMeta
 from typing import Optional
 
@@ -29,6 +29,25 @@ cute_compile_og = cute.compile
 @lru_cache
 def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+
+
+def new_namedtuple_from_mlir_values(obj, values):
+    """Rebuild NamedTuple `obj` from the flat MLIR values extracted from it.
+
+    Which fields are present (None vs. a tensor) is fixed at trace time, so it is
+    read off the template `obj` field by field: each field takes exactly as many
+    values as it contributed, and None / Python-constant fields take none. This
+    replaces inferring the layout from len(values), where two different presence
+    patterns can produce the same count and silently bind the wrong tensors.
+    """
+    values = list(values)
+    res = []
+    for field in obj:
+        n_items = len(get_mlir_types(field))
+        res.append(cutlass.new_from_mlir_values(field, values[:n_items]))
+        values = values[n_items:]
+    assert not values, f"{type(obj).__name__}: {len(values)} MLIR values left over"
+    return obj._make(res)
 
 
 @dataclass

@@ -275,7 +275,6 @@ class FlashAttentionBackwardPostprocess:
             seqlen_k=0,
             headdim=mdQ.shape[2],
             headdim_v=0,
-            total_q=mdQ.shape[0],
             tile_shape_mn=(self.tile_m, 1),
         )
 

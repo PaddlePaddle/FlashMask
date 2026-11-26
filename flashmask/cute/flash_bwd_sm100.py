@@ -1144,7 +1144,6 @@ class FlashAttentionBackwardSm100:
             cute.size(mQ.shape[0]),  # pass seqlen_q for seqlen_k
             mQ.shape[1],
             mV.shape[1],
-            total_q=cute.size(mQ.shape[0]),
             tile_shape_mn=self.cta_tiler[:2],
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             qhead_per_kvhead_packgqa=1,

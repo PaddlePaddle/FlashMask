@@ -133,13 +133,46 @@ def _check_cutedsl_supported(query, key, value, be):
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
+    """Number of KV splits for the forward, always >= 1."""
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
         return 1
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
-    return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+    # Clamp to >= 1: once total_mblocks > num_SMs (batched decode: large bs with
+    # num_m_blocks == 1) the floor division is 0, which is not a split count.
+    # total_mblocks == 0 (empty batch or seqlen_q) must not divide by zero.
+    return max(1, min(num_SMs // max(total_mblocks, 1), max_splits, num_n_blocks))
+
+
+# Opt-in shared memory per CTA on SM100.
+_SM100_SMEM_PER_CTA = 232448
+
+
+def sm100_split_kv_supported(head_dim, head_dim_v, elem_bytes):
+    """Whether the dense SM100 forward launches with num_splits > 1 at this head dim.
+
+    Large head_dim_v is rejected by the kernel and head_dim above the big-d threshold has
+    no split. Below that the limit is SMEM: split writes fp32 O partials, so the sO
+    epilogue buffer doubles. It shares sQ's space under overlap_sO_sQ (see
+    FlashAttentionForwardSm100), else it adds to sQ. The estimate mirrors the kernel's
+    Q / KV / O buffers plus a fixed allowance for barriers and scratch, so it follows
+    the kernel's own stage and tile choices.
+    """
+    d = -(-head_dim // 16) * 16
+    dv = -(-head_dim_v // 16) * 16
+    if dv >= 192 or d > 256:
+        return False
+    q_bytes = 2 * 128 * d * elem_bytes
+    o_bytes = 2 * 128 * dv * 4
+    if d == 192 and dv == 128:
+        kv_bytes = 128 * (2 * d + dv) * elem_bytes  # uneven_kv_smem: [large, small, large]
+    else:
+        kv_bytes = 3 * 128 * max(d, dv) * elem_bytes
+    overlap_o_q = dv >= 128 or (d == 192 and dv >= 64)
+    qo_bytes = max(q_bytes, o_bytes) if overlap_o_q else q_bytes + o_bytes
+    return qo_bytes + kv_bytes + 3072 <= _SM100_SMEM_PER_CTA
 
 @dataclass(frozen=True)
 class BwdConfig:

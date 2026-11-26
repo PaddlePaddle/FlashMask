@@ -445,7 +445,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[1],
-            total_q=cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype.width // 8,
