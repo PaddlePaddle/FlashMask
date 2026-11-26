@@ -11,7 +11,9 @@ attention-backend contract:
 * TARGET_VERIFY (topk == 1) is treated as a fixed-width extend: the draft
   tokens are appended to the KV cache and causal attention is bottom-right
   aligned against ``seq_lens + n_q``.
-* EXTEND / MIXED run one fixed-rectangle call per request.
+* EXTEND / MIXED pack the whole batch into one column-mask launch when the page
+  size is 128 and the batch is large enough to amortise the mask build, and
+  otherwise run one fixed-rectangle call per request.
 * CUDA-graph capture is supported for DECODE and TARGET_VERIFY. Metadata
   buffers and the workspace are allocated in ``init_cuda_graph_state`` and
   refreshed outside the captured region on every replay.
@@ -59,10 +61,23 @@ __all__ = ["FlashMaskAttnBackend"]
 
 _BIDIRECTIONAL_ATTN_TYPES = ("encoder_only", "decoder_bidirectional")
 _MAX_SPLITS = 8
+# Upper bound on the packed column mask (int32, 4 vectors). The mask spans
+# batch x max_seqlen_k columns, so a large batch at a long context would allocate
+# gigabytes; past this budget EXTEND falls back to one call per request. 0 keeps
+# the fallback, which is how the packed path is A/B'd.
+_MAX_PACKED_MASK_BYTES = int(os.environ.get("FLASHMASK_PACKED_MASK_BYTES", 512 << 20))
+# Below this batch the packed launch's own preprocessing costs more than the
+# per-request launches it replaces (measured on B300: 0.8x at bs 4, 1.5x at bs 8,
+# 2.9x at bs 16 for 512-token prefills).
+_MIN_PACKED_BATCH = 8
 
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _next_pow2(n: int) -> int:
+    return 1 << max(0, int(n) - 1).bit_length()
 
 
 def _attn_type_value(layer) -> str:
@@ -146,10 +161,26 @@ class FlashMaskAttnBackend(AttentionBackend):
                 f"{self.kv_cache_dtype}"
             )
 
-        max_context_len = getattr(model_config, "context_len", None)
-        if max_context_len is None:
-            max_context_len = getattr(model_runner, "max_context_len", 8192)
-        self.max_context_len = int(max_context_len)
+        # Pool / table references captured at construction, like the FA backend.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token = self.req_to_token_pool.req_to_token
+        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
+
+        # A request's KV length is bounded by its req_to_token row, which
+        # SGLang sizes to context_len plus headroom for speculative draft
+        # tokens. Bounding by context_len alone would clamp seqused_k of a
+        # TARGET_VERIFY batch near the context limit and drop draft keys.
+        context_len = getattr(model_config, "context_len", None)
+        if context_len is None:
+            context_len = getattr(model_runner, "max_context_len", 8192)
+        row_capacity = int(self.req_to_token.shape[1])
+        if row_capacity < int(context_len):
+            raise ValueError(
+                f"req_to_token rows hold {row_capacity} tokens, fewer than the "
+                f"model context length {int(context_len)}"
+            )
+        self.max_context_len = row_capacity
         self.max_num_pages = -(-self.max_context_len // self.page_size)
         self.max_seqlen_k = self.max_num_pages * self.page_size
 
@@ -172,12 +203,6 @@ class FlashMaskAttnBackend(AttentionBackend):
             )
             else 1
         )
-
-        # Pool / table references captured at construction, like the FA backend.
-        self.req_to_token_pool = model_runner.req_to_token_pool
-        self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self.req_to_token = self.req_to_token_pool.req_to_token
-        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
 
         self._ref: Optional[torch.Tensor] = None
 
@@ -202,6 +227,16 @@ class FlashMaskAttnBackend(AttentionBackend):
         self._active_n_q = 1
         self._active_is_verify = False
         self._active_extend = False
+
+        # Packed EXTEND state, rebuilt once per step on the first layer that
+        # needs it and shared by every layer of that step.
+        self._packed_key: Optional[tuple] = None
+        self._packed_starts: Optional[torch.Tensor] = None
+        self._packed_lens: Optional[torch.Tensor] = None
+        self._packed_page_table: Optional[torch.Tensor] = None
+        self._packed_workspace: Optional[FwdWorkspace] = None
+        self._packed_mask_buf: Optional[torch.Tensor] = None
+        self._packed_mask_cols = 0
 
     # -- workspace / metadata buffers -----------------------------------------
 
@@ -258,10 +293,7 @@ class FlashMaskAttnBackend(AttentionBackend):
             and batch_size <= self._eager_seqused_k.shape[0]
         ):
             return
-        new_bs = max(
-            batch_size,
-            self._eager_seqused_k.shape[0] if self._eager_seqused_k is not None else 1,
-        )
+        new_bs = _next_pow2(batch_size)
         self._eager_seqused_k = torch.zeros(
             new_bs, dtype=torch.int32, device=self.device
         )
@@ -284,7 +316,9 @@ class FlashMaskAttnBackend(AttentionBackend):
             and (max_splits is None or max_splits == ws.max_splits)
         ):
             return ws
-        new_batch = max(max_batch, ws.max_batch if ws is not None else 1)
+        # Grow to the next power of two so a slowly growing eager batch (e.g.
+        # decode batches above cuda_graph_max_bs) reallocates O(log bs) times.
+        new_batch = _next_pow2(max(max_batch, ws.max_batch if ws is not None else 1))
         new_q = max(max_seqlen_q, ws.max_seqlen_q if ws is not None else 1)
         ws = self._make_workspace(new_batch, new_q, max_splits=max_splits)
         self._eager_workspaces[mode_key] = ws
@@ -330,11 +364,15 @@ class FlashMaskAttnBackend(AttentionBackend):
             and bs <= self._graph_max_bs
             and n_q <= self._graph_max_q
         )
-        if self._graph_workspace is not None and (is_decode or is_verify) and not use_graph:
+        # SGLang runs DECODE / TARGET_VERIFY batches larger than the biggest
+        # captured graph eagerly; those use the eager buffers below. Only a
+        # capture itself must fit the graph workspace.
+        if in_capture and not use_graph:
             raise RuntimeError(
-                f"A {mode.name} batch of {bs} x {n_q} exceeds the flashmask "
-                f"CUDA-graph workspace bounds "
-                f"({self._graph_max_bs} x {self._graph_max_q})."
+                f"Capturing a {mode.name} batch of {bs} x {n_q} that exceeds "
+                f"the flashmask CUDA-graph workspace bounds "
+                f"({self._graph_max_bs} x {self._graph_max_q}); call "
+                "init_cuda_graph_state with larger bounds first."
             )
 
         if use_graph:
@@ -364,7 +402,8 @@ class FlashMaskAttnBackend(AttentionBackend):
             # seq_lens + n_q.
             seq_vals = seq_vals + n_q
         # Out of place: never mutate the caller's seq_lens (it is an int32 view
-        # when the caller already uses int32).
+        # when the caller already uses int32). max_seqlen_k covers a whole
+        # req_to_token row, so the clamp only guards the page-table reads.
         seq_vals = seq_vals.clamp(max=self.max_seqlen_k)
         seqused = seqused_buf[:bs]
         seqused.copy_(seq_vals)
@@ -392,6 +431,9 @@ class FlashMaskAttnBackend(AttentionBackend):
         self._active_n_q = n_q
         self._active_is_verify = is_verify
         self._active_extend = is_extend
+        # The packed EXTEND mask depends on this step's lengths; drop it so the
+        # first EXTEND layer rebuilds it once.
+        self._packed_key = None
         if in_capture:
             self._graph_captured = True
 
@@ -475,6 +517,99 @@ class FlashMaskAttnBackend(AttentionBackend):
             value_cache, self.page_size, layer.tp_v_head_num, layer.v_head_dim
         )
         return key_cache, value_cache
+
+    # -- packed EXTEND --------------------------------------------------------
+
+    def _packed_state(self, lens, num_tokens, seqused_cpu=None):
+        """Column mask, page table and workspace to run a whole EXTEND batch at once.
+
+        The requests keep their own KV pages; only the view of them changes. Each
+        request gets a fixed ``seg`` columns (the batch's longest KV, page aligned),
+        so request i owns the KV range [i * seg, (i + 1) * seg) and the query rows
+        [a_i, a_i + L_i). Bottom-right causal makes column j of that range visible to
+        rows [x, y) with x = a_i + max(0, j_local + L_i - K_i) and y = a_i + L_i, so
+        the masked set is [0, x) U [y, S_q): two ranges, hence num_vecs = 4 and
+        causal = False. Columns at or past a request's seqused_k are masked whole.
+
+        Returns None when the batch cannot be packed; the caller then falls back to
+        one call per request.
+        """
+        bs = len(lens)
+        # A column mask cannot share the main kernel with cp.async small pages.
+        if bs < _MIN_PACKED_BATCH or self.page_size != 128:
+            return None
+        if seqused_cpu is not None and len(seqused_cpu) >= bs:
+            used_max = max(int(x) for x in seqused_cpu[:bs])
+        else:
+            # No CPU copy of the lengths: one scalar sync, still far cheaper than
+            # running every request over the whole context length.
+            used_max = int(self._active_seqused_k[:bs].max())
+        seg = -(-used_max // self.page_size) * self.page_size
+        if seg == 0:
+            return None
+        cols = bs * seg
+        if cols * 16 > _MAX_PACKED_MASK_BYTES:
+            return None
+        dev = self.device
+        key = (bs, cols, num_tokens)
+        if self._packed_key != key:
+            self._packed_key = key
+            # Dropping the unused tail pages of each request leaves a strided view;
+            # the kernel wants the last dim contiguous, so this copies (bs * seg_pages
+            # int32s, no sync).
+            self._packed_page_table = (
+                self._active_page_table[:bs, : seg // self.page_size]
+                .contiguous()
+                .view(1, cols // self.page_size)
+            )
+            if self._packed_mask_buf is None or self._packed_mask_cols < cols:
+                self._packed_mask_cols = max(cols, self._packed_mask_cols)
+                self._packed_mask_buf = torch.empty(
+                    self._packed_mask_cols * 4, dtype=torch.int32, device=dev
+                )
+            starts = [0] * bs
+            for i in range(1, bs):
+                starts[i] = starts[i - 1] + lens[i - 1]
+            self._packed_starts = torch.tensor(starts, dtype=torch.int32, device=dev)
+            self._packed_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
+            if self._ref is None:
+                self._ref = torch.empty(1, device=dev, dtype=self.dtype)
+            self._packed_workspace = FwdWorkspace(
+                self._ref,
+                max_batch=1,
+                max_seqlen_q=max(1, num_tokens),
+                max_seqlen_k=cols,
+                num_heads=self.num_heads,
+                num_heads_kv=self.num_heads_kv,
+                head_dim=self.head_dim,
+                head_dim_v=self.head_dim_v,
+                max_splits=1,
+                num_vecs=4,
+                mask_heads=1,
+            )
+        buf = self._packed_mask_buf
+        j = torch.arange(cols, device=dev, dtype=torch.int32)
+        seg_i = torch.div(j, seg, rounding_mode="floor")
+        local = j - seg_i * seg
+        starts = self._packed_starts.index_select(0, seg_i)
+        lens_col = self._packed_lens.index_select(0, seg_i)
+        used = self._active_seqused_k[:bs].index_select(0, seg_i)
+        # x = a_i + max(0, j_local + L_i - K_i), y = a_i + L_i.
+        x = starts + (local + lens_col - used).clamp(min=0)
+        y = starts + lens_col
+        keep = local < used
+        zero = torch.zeros_like(y)
+        buf[: cols * 4] = torch.stack(
+            (
+                torch.where(keep, y, zero),
+                torch.full_like(y, num_tokens),
+                zero,
+                torch.where(keep, x, zero),
+            ),
+            dim=-1,
+        ).reshape(-1)
+        mask = buf[: cols * 4].view(1, 1, cols, 4)
+        return mask, self._packed_page_table, self._packed_workspace
 
     # -- forward --------------------------------------------------------------
 
@@ -567,9 +702,45 @@ class FlashMaskAttnBackend(AttentionBackend):
                 return out, lse
             return out
 
-        # EXTEND / MIXED: one fixed-rectangle call per request.
+        # EXTEND / MIXED: the whole batch in one launch when the column mask can
+        # express it, otherwise one fixed-rectangle call per request.
         lens = self._query_lens(forward_batch, q, bs)
         total = int(q.shape[0])
+        packed = (
+            causal
+            and all(int(x) > 0 for x in lens)
+            and sum(int(x) for x in lens) == total
+            and (
+                state := self._packed_state(
+                    lens,
+                    total,
+                    getattr(forward_batch, "seq_lens_cpu", None),
+                )
+            )
+            is not None
+        )
+        if packed:
+            mask, page_table, workspace = state
+            q1 = q.contiguous().view(
+                1, total, layer.tp_q_head_num, layer.qk_head_dim
+            )
+            out, lse = _flash_attn_fwd(
+                q1,
+                key_cache,
+                value_cache,
+                softmax_scale=layer.scaling,
+                causal=False,
+                startend_row_indices=mask,
+                seqlen_meta=SeqlenMeta(page_table=page_table),
+                workspace=workspace,
+                return_lse=return_lse,
+            )
+            out = out.reshape(total, layer.tp_q_head_num * layer.v_head_dim)
+            if return_lse:
+                # kernel [1, H, N] -> [N, H]
+                return out, lse[0].transpose(0, 1)
+            return out
+
         out = torch.empty(
             (total, layer.tp_q_head_num, layer.v_head_dim),
             dtype=q.dtype,
