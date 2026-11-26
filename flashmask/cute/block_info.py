@@ -55,7 +55,29 @@ class BlockInfo:
             )
             n_block_min = n_block_min + split_idx * num_n_blocks_per_split
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
+            # The ceil-divided ranges can start past the end for the last splits (e.g. 10
+            # blocks over 8 splits: split 6 would be [12, 10)). Clamp to an empty range so
+            # the block count is never negative.
+            n_block_min = cutlass.min(n_block_min, n_block_max)
         return n_block_min, n_block_max
+
+    @cute.jit
+    def has_kv_work(self, n_block_min: Int32, n_block_max: Int32, split_idx: Int32):
+        """Whether a (tile, split) is processed.
+
+        Every warp role must skip an empty split with this same predicate, otherwise the
+        producers and consumers of a pipeline disagree on the trip count and the kernel
+        hangs. Without SplitKV this is always True: callers handle an empty range
+        themselves (e.g. with one fully masked iteration).
+
+        Split 0 is always processed too. It is empty only when the whole tile has no KV
+        block, and then it takes the same fully masked iteration as the unsplit kernel,
+        so it writes O = 0 and LSE = -inf, or LSE = learnable_sink. Skipping it would
+        leave the sink out of the combined LSE.
+        """
+        if const_expr(not self.is_split_kv):
+            return True
+        return n_block_min < n_block_max or split_idx == 0
 
     @cute.jit
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:

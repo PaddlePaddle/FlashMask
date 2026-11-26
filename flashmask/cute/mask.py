@@ -502,6 +502,11 @@ class AttentionMask:
                 # (any head dim, q_stage, 2-CTA, folded). Each element keeps its own row
                 # coordinate; where a thread owns one full S row (M=128 non-folded) those
                 # are all equal and the add folds to one per thread.
+                #
+                # Under pack_gqa the M axis packs qhead_per_kvhead query heads per
+                # query row, so the global packed row maps to query row row // qhpk.
+                # Divide the summed row, not the pieces: exact for any qhpk.
+                qhpk = const_expr(self.qhead_per_kvhead_packgqa)
                 row_offset = m_block * self.tile_m
                 s_base = load_startend_row_indices_consumer_state.index * 4 * self.tile_n
 
@@ -534,6 +539,8 @@ class AttentionMask:
                         )
                     else:
                         row_g = tScS_t2r[0][0] + row_offset
+                        if const_expr(qhpk != 1):
+                            row_g = row_g // qhpk
                         a = flashmask_count_le(s, s_base, tn, row_g)
                         if const_expr(has_ut_start):
                             b = flashmask_count_le(s, s_base + tn, tn, row_g)
@@ -572,9 +579,12 @@ class AttentionMask:
         has_ut_end: cutlass.Constexpr[bool],
     ) -> None:
         nelem = const_expr(cute.size(tScS_t2r.shape))
+        qhpk = const_expr(self.qhead_per_kvhead_packgqa)
         if const_expr(has_ut_start):
             for i in cutlass.range_constexpr(nelem):
                 row_g = tScS_t2r[i][0] + row_offset
+                if const_expr(qhpk != 1):
+                    row_g = row_g // qhpk
                 col = tScS_t2r[i][1]
                 lts = s_startend_row_indices[s_base + col]
                 lte = s_startend_row_indices[s_base + col + self.tile_n]
@@ -585,6 +595,8 @@ class AttentionMask:
         elif const_expr(has_lt_end):
             for i in cutlass.range_constexpr(nelem):
                 row_g = tScS_t2r[i][0] + row_offset
+                if const_expr(qhpk != 1):
+                    row_g = row_g // qhpk
                 col = tScS_t2r[i][1]
                 lts = s_startend_row_indices[s_base + col]
                 lte = s_startend_row_indices[s_base + col + self.tile_n]
@@ -593,6 +605,8 @@ class AttentionMask:
         elif const_expr(has_ut_end):
             for i in cutlass.range_constexpr(nelem):
                 row_g = tScS_t2r[i][0] + row_offset
+                if const_expr(qhpk != 1):
+                    row_g = row_g // qhpk
                 col = tScS_t2r[i][1]
                 lts = s_startend_row_indices[s_base + col]
                 ute = s_startend_row_indices[s_base + col + self.tile_n * 3]
@@ -601,6 +615,8 @@ class AttentionMask:
         else:
             for i in cutlass.range_constexpr(nelem):
                 row_g = tScS_t2r[i][0] + row_offset
+                if const_expr(qhpk != 1):
+                    row_g = row_g // qhpk
                 lts = s_startend_row_indices[s_base + tScS_t2r[i][1]]
                 if row_g >= lts:
                     acc_S[i] = -cutlass.Float32.inf

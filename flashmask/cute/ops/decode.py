@@ -111,19 +111,38 @@ def _is_contiguous(t: Tensor, be) -> bool:
     return True
 
 
-def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
+def swapab_decode_supported(
+    q, k, v, startend_row_indices, causal, be, seqused_k=None, page_table=None
+) -> bool:
     """Whether the SwapAB kernel supports this forward call (no autograd checks).
 
     ``_flash_attn_fwd`` sends single-token calls that pass to the SwapAB kernel. Besides the
     kernel's own asserts this requires the TMA alignment (16-byte base addresses and strides)
     that would otherwise only fail at launch.
+
+    ``seqused_k`` (int32 (B,), device) optionally gives each sequence's KV length; ``page_table``
+    (int32 (B, max_pages), device) switches K / V to paged pools with page_size ==
+    SWAPAB_SKIP_UNIT.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         return False
     batch_size, seqlen_q, num_heads, head_dim = q.shape
-    _, seqlen_k, num_heads_kv, _ = k.shape
+    _, page_size, num_heads_kv, _ = k.shape
     head_dim_v = v.shape[-1]
-    if seqlen_q != 1 or seqlen_k < 1 or (head_dim, head_dim_v) not in SWAPAB_HEAD_DIMS:
+    if page_table is not None:
+        # One page per 128-token block: a page is exactly one TMA tile.
+        if page_size != SWAPAB_SKIP_UNIT:
+            return False
+        max_seqlen_k = page_table.shape[1] * page_size
+        if page_table.dtype != be.int32 or page_table.ndim != 2:
+            return False
+        if page_table.shape[0] != batch_size or page_table.shape[1] < 1:
+            return False
+        if not _is_contiguous(page_table, be) or be.data_ptr(page_table) % 4 != 0:
+            return False
+    else:
+        max_seqlen_k = k.shape[1]
+    if seqlen_q != 1 or max_seqlen_k < 1 or (head_dim, head_dim_v) not in SWAPAB_HEAD_DIMS:
         return False
     if q.dtype not in (be.float16, be.bfloat16) or not (q.dtype == k.dtype == v.dtype):
         return False
@@ -145,12 +164,19 @@ def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
             return False
         if any(st % 8 != 0 for st, n in zip(strides[:-1], t.shape[:-1]) if n > 1):
             return False
+    if seqused_k is not None:
+        if seqused_k.dtype != be.int32 or seqused_k.ndim != 1:
+            return False
+        if seqused_k.shape[0] != batch_size or not _is_contiguous(seqused_k, be):
+            return False
+        if be.data_ptr(seqused_k) % 4 != 0:
+            return False
     if startend_row_indices is not None:
         mask = startend_row_indices
         if mask.ndim != 4 or mask.dtype != be.int32 or not _is_contiguous(mask, be):
             return False
         mask_batch, mask_heads, mask_seqlen, num_vecs = mask.shape
-        if mask_batch != batch_size or mask_seqlen != seqlen_k or num_vecs not in (1, 2, 4):
+        if mask_batch != batch_size or mask_seqlen != max_seqlen_k or num_vecs not in (1, 2, 4):
             return False
         if (causal and num_vecs == 4) or mask_heads < 1 or num_heads % mask_heads != 0:
             return False
@@ -158,27 +184,31 @@ def swapab_decode_supported(q, k, v, startend_row_indices, causal, be) -> bool:
 
 
 def _decode_block_list(
-    startend_row_indices, mask_tensor, num_heads_kv, is_causal, stream, be, mask_row
+    startend_row_indices, mask_tensor, num_heads_kv, is_causal, stream, be, mask_row,
+    seqused_k=None,
 ):
     """(cnt (B, H_kv, 1), idx (B, H_kv, 1, nk)) int32 for the block-skipping SwapAB kernel.
 
     The list holds the KV units (SWAPAB_SKIP_UNIT tokens each) visible from query row
     ``mask_row``. Entries past cnt are left uninitialized; the kernel never reads them.
+    ``seqused_k`` (int32 (B,), optional) truncates each sequence: units past its length are
+    never listed.
     """
     batch_size, mask_heads, seqlen_k, num_vecs = startend_row_indices.shape
     nk = -(-seqlen_k // SWAPAB_SKIP_UNIT)
     flags = be.empty([batch_size, mask_heads, nk], dtype=be.int32)
     cnt = be.empty([batch_size, num_heads_kv, 1], dtype=be.int32)
     idx = be.empty([batch_size, num_heads_kv, 1, nk], dtype=be.int32)
+    seqused_tensor = _to_cute(seqused_k, 4) if seqused_k is not None else None
     tensors = [_to_cute(t, 4) for t in (flags, cnt, idx)]
     cache = _decode_block_list.compile_cache
-    key = (num_vecs, is_causal)
+    key = (num_vecs, is_causal, seqused_k is not None)
     if key not in cache:
         cache[key] = cute.compile(
-            build_decode_block_list, mask_tensor, *tensors, cutlass.Int32(mask_row), num_vecs,
-            is_causal, stream,
+            build_decode_block_list, mask_tensor, seqused_tensor, *tensors,
+            cutlass.Int32(mask_row), num_vecs, is_causal, stream,
         )
-    cache[key](mask_tensor, *tensors, cutlass.Int32(mask_row), stream)
+    cache[key](mask_tensor, seqused_tensor, *tensors, cutlass.Int32(mask_row), stream)
     return cnt, idx
 
 

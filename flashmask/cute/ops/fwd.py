@@ -32,6 +32,7 @@ from ..flash_fwd_decode_sm100 import (
 )
 from ..flash_fwd_sm90 import FlashAttentionForwardSm90
 from ..flash_fwd_sm100 import FlashAttentionForwardSm100
+from ..seqlen_info import SeqlenMeta
 from ..flashmask_utils import (
     FlashMaskInfoPaddle,
     build_flashmask_block_lists,
@@ -48,6 +49,7 @@ from ._common import (
     _same_storage,
     maybe_contiguous,
     num_splits_heuristic,
+    sm100_split_kv_supported,
 )
 from .combine import _flash_attn_fwd_combine
 from .decode import (
@@ -89,6 +91,7 @@ def _flash_attn_fwd(
     block_size: int = 64,
     block_bos: Optional[Tensor] = None,
     group=None,
+    seqlen_meta: Optional[SeqlenMeta] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Forward pass for FlashAttention.
 
@@ -118,14 +121,54 @@ def _flash_attn_fwd(
             the kernel's n_block_size. Ignored when block_logit is None.
         group: CP group enabling FM-4 overlap. If size > 1, k/v are the local S_local shard and
             the mask key axis has length S_local * group_size (chunk r = rank r); pass it unshifted.
+        seqlen_meta: Paged-KV metadata (SM100 only), framework int32 tensors on the device:
+            seqused_k (B,): KV length per sequence (<= the stored length).
+            page_table (B, max_pages): paged KV. k / v are page pools (num_pages,
+                page_size, H_kv, D) and sequence b reads its logical page p from pool page
+                page_table[b, p]; the KV length is seqused_k[b], or max_pages * page_size
+                without seqused_k. page_size == n_block_size loads a page per TMA; any
+                other page_size gathers rows with cp.async. Rows past seqused_k in a
+                sequence's last used page must be finite (P = 0 times NaN is NaN); pages a
+                sequence does not reach may hold anything.
+            Lengths stay on the device: nothing here is read on the host. Not supported
+                with block sparsity, block_logit / block_bos, or overlap. A column mask
+                keeps its (B, H_m, max seqlen_k, num_vecs) shape; with seqused_k only its
+                first seqused_k[b] columns count, and causal is bottom-right aligned to
+                seqused_k[b].
     """
     be = get_backend(q, k, v)
 
     q, k, v = [maybe_contiguous(t, be) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
+    seqused_k = seqlen_meta.seqused_k if seqlen_meta is not None else None
+    page_table = seqlen_meta.page_table if seqlen_meta is not None else None
+    if seqlen_meta is not None:
+        if seqlen_meta.num_splits_dynamic is not None:
+            raise NotImplementedError("seqlen_meta.num_splits_dynamic is not wired yet")
+        unsupported = {
+            "block_sparse_tensors": block_sparse_tensors,
+            "block_logit": block_logit,
+            "block_bos": block_bos,
+            "group (FM-4 overlap)": group,
+        }
+        for name, value in unsupported.items():
+            if value is not None:
+                raise NotImplementedError(f"seqlen_meta is not supported with {name}")
+        for name, t in (("seqused_k", seqused_k),):
+            if t is not None:
+                assert t.dtype == be.int32 and t.ndim == 1 and be.is_gpu(t), f"{name} must be int32 1-D on GPU"
+        if page_table is not None:
+            assert page_table.dtype == be.int32 and page_table.ndim == 2 and be.is_gpu(page_table), (
+                "page_table must be int32 (batch, max_pages) on GPU"
+            )
+            assert be.strides(page_table)[-1] == 1, "page_table must be contiguous in the last dim"
     batch_size, seqlen_q = q.shape[:2]
-    total_q = batch_size * seqlen_q
+    if seqused_k is not None:
+        assert seqused_k.shape[0] == batch_size, "seqused_k must have batch entries"
+    if page_table is not None:
+        assert page_table.shape[0] == batch_size, "page_table must have batch rows"
+        assert k.ndim == 4, "with page_table, k / v must be (num_pages, page_size, H_kv, D)"
 
     compute_capability = (
         be.device_capability()[0]
@@ -133,6 +176,8 @@ def _flash_attn_fwd(
         else _compute_capability
     )
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    if seqlen_meta is not None and compute_capability != 10:
+        raise NotImplementedError("paged seqlen metadata is only wired on SM100")
 
     # SM100 single-token forward without autograd runs the SwapAB decode kernel (the branch
     # before the main kernel's compile below). It applies the main kernel's mask semantics:
@@ -147,7 +192,10 @@ def _flash_attn_fwd(
         and block_logit is None
         and not any(be.requires_grad(t) for t in (q, k, v))
         and (group is None or _dist_world_size(be, group) == 1)
-        and swapab_decode_supported(q, k, v, startend_row_indices, causal, be)
+        and (seqlen_meta is None or seqused_k is not None or page_table is not None)
+        and swapab_decode_supported(
+            q, k, v, startend_row_indices, causal, be, seqused_k=seqused_k, page_table=page_table
+        )
     )
     if num_splits is None:
         num_splits = 0 if use_swapab_decode else 1
@@ -172,7 +220,7 @@ def _flash_attn_fwd(
             f"head_dim={head_dim}/{head_dim_v}: the folded accumulator supports "
             "head_dim_v <= 512 (O takes head_dim_v / 2 TMEM columns)"
         )
-        assert num_splits == 1, (
+        assert num_splits <= 1, (
             "head_dim_v > 256 does not support split-KV: the folded accumulator shares "
             "each query row between two threads, which the split-KV row map cannot express"
         )
@@ -286,11 +334,17 @@ def _flash_attn_fwd(
     # d == dv == 256 without flashmask: CTA pair with 128 x 128 tiles per CTA (pair tile
     # 256 x 128), q_stage 1, S ping-pong, P over S in TMEM. Flashmask stays on the 1-CTA
     # kernel: a 256-row pair tile covers 6 KV blocks of a 512-key window, a 128-row tile 5.
+    # block_logit also stays 1-CTA: it maps a thread to the query row
+    # `m_block * m_block_size + tidx`, which assumes one CTA per work tile (a pair would
+    # write only the first half of its 256 rows and skip the second CTA's half).
+    # Paged KV also stays 1-CTA: the paged K/V loads are not implemented for the CTA pair.
     use_hd256_2cta = (
         compute_capability == 10
         and head_dim == 256
         and head_dim_v == 256
         and startend_row_indices is None
+        and block_logit is None
+        and page_table is None
     )
     if use_hd256_2cta:
         use_2cta_instrs = True
@@ -353,33 +407,30 @@ def _flash_attn_fwd(
     cute_flashmask_info = None
     # The SwapAB decode kernel reads the mask itself (block list below).
     if startend_row_indices is not None and not use_swapab_decode:
-        fm_batch_size = startend_row_indices.shape[0]
-        fm_heads = startend_row_indices.shape[1]
-        num_m_blocks = (seqlen_q + fwd_m_tile_rows - 1) // fwd_m_tile_rows
         flashmask_info = FlashMaskInfoPaddle(
             is_causal=causal,
             startend_row_indices=startend_row_indices,
         )
-        # valid_block_count (produced by reduce_block_count) feeds only the SM100
-        # path and the bwd 2CTA density heuristic. The SM90 fwd kernel iterates the
-        # block-sparse lists built below (build_flashmask_block_lists) and never
-        # reads valid_block_count, so skip both the extra [b,h,num_m_blocks] alloc
-        # and the reduce_block_count kernel launch there. Per-call fixed overhead
-        # dominates the high-sparsity / short-seq configs, so this is pure win.
-        if compute_capability != 9:
-            flashmask_info.valid_block_count = be.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=be.int32)
         prepare_block_maxmin(flashmask_info, kBlockN=n_block_size)
-        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
-        if compute_capability != 9:
-            reduce_block_count(
-                cute_flashmask_info, causal, fwd_m_tile_rows, n_block_size, seqlen_q, be
-            )
+        # valid_block_count (produced by reduce_block_count) feeds only the SM100
+        # path. The SM90 fwd kernel iterates the block-sparse lists built below
+        # (build_flashmask_block_lists) and never reads valid_block_count, so skip
+        # both the extra [b,h,num_m_blocks] alloc and the reduce_block_count kernel
+        # launch there. Per-call fixed overhead dominates the high-sparsity /
+        # short-seq configs, so this is pure win. On SM100 its M granularity depends
+        # on the final pack_gqa, so it is built after pack_gqa is settled (below).
+        if compute_capability == 9:
+            cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
 
     if enable_overlap:
         # K/V are still the LOCAL framework tensors here (used only for update_kv +
         # dtype); the kernel reads the gathered SRBuffer, so seqlen_k is the full
         # gathered length S_total = S_local * nranks from the SRBuffer view.
         seqlen_k = overlap_view_args.shape[1]
+    elif page_table is not None:
+        # The logical KV extent of a sequence: its page_table row.
+        page_size = k.shape[1]
+        seqlen_k = page_table.shape[1] * page_size
     else:
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
@@ -390,10 +441,14 @@ def _flash_attn_fwd(
         assert num_head_kv == overlap_view_args.shape[2]
         assert head_dim == overlap_view_args.shape[3]
     else:
-        assert list(k.shape) == [batch_size, seqlen_k, num_head_kv, head_dim], (
-            f"expect k with shape {[batch_size, seqlen_k, num_head_kv, head_dim]}, received {k.shape=}"
+        if page_table is not None:
+            k_lead = [k.shape[0], page_size]
+        else:
+            k_lead = [batch_size, seqlen_k]
+        assert list(k.shape) == [*k_lead, num_head_kv, head_dim], (
+            f"expect k with shape {[*k_lead, num_head_kv, head_dim]}, received {k.shape=}"
         )
-        assert list(v.shape) == [batch_size, seqlen_k, num_head_kv, head_dim_v]
+        assert list(v.shape) == [*k_lead, num_head_kv, head_dim_v]
 
     assert q.dtype in [be.float16, be.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
@@ -442,23 +497,27 @@ def _flash_attn_fwd(
     requires_grad = any(be.requires_grad(t) for t in (q, k, v))
 
     if out is None:
-        # then stored, so fully-masked rows/blocks (incl. generate_empty_mask) come
-        # out as 0. So on SM90 use an uninitialized buffer to skip the O
-        # zero-fill that dominates short-seq / high-sparsity calls (measured fwd speedup).
-        # On SM100 a query block without any KV block skips its O store, so O keeps the
-        # zero-fill, except at d == dv == 256: with flashmask the kernel writes those tiles'
-        # zeros itself (zero_empty_o_tiles), and without flashmask every query block has a
-        # KV block unless causal leaves rows past seqlen_k empty or a local window is set.
-        # window_size_* is only normalized into causal/local further below, so derive both here.
+        # Both forward kernels write every O element themselves for the fork's own paths:
+        # a flashmask tile with valid_block_count == 0 is zero-filled by the SM100
+        # correction warps (by the epilogue warp under fm_persistent) and stored after
+        # SM90's (empty) block-list walk, and paged tiles store O through the same
+        # epilogue. On SM100 without flashmask a query block with no KV block skips its O
+        # store, so those keep the host fill except where every block has KV work:
+        # d == dv == 256 (the kernel writes those tiles' zeros itself, zero_empty_o_tiles),
+        # dense non-causal, or causal with seqlen_q <= seqlen_k, and no local window.
         fwd_causal = causal or (window_size_left is None and window_size_right == 0)
         fwd_local = not fwd_causal and (window_size_left is not None or window_size_right is not None)
         # The SwapAB decode kernel writes every O and LSE entry.
-        o_fully_written = use_swapab_decode or compute_capability == 9 or (
-            head_dim == 256
-            and head_dim_v == 256
-            and (
-                startend_row_indices is not None
-                or (not fwd_local and (not fwd_causal or seqlen_q <= seqlen_k))
+        o_fully_written = (
+            use_swapab_decode
+            or compute_capability == 9
+            or startend_row_indices is not None
+            or page_table is not None
+            or (
+                head_dim == 256
+                and head_dim_v == 256
+                and not fwd_local
+                and (not fwd_causal or seqlen_q <= seqlen_k)
             )
         )
         out = (be.empty if o_fully_written else be.zeros)(
@@ -480,6 +539,10 @@ def _flash_attn_fwd(
         if not (requires_grad or return_lse):
             lse = None
         elif use_swapab_decode:
+            lse = be.empty(shape=lse_shape, dtype=be.float32)
+        elif compute_capability == 10:
+            # The SM100 kernel writes LSE for every row of every tile it is launched on,
+            # -inf for rows with no visible key (also on skipped flashmask tiles).
             lse = be.empty(shape=lse_shape, dtype=be.float32)
         else:
             lse = be.full(shape=lse_shape, fill_value=float('-inf'), dtype=be.float32)
@@ -575,9 +638,6 @@ def _flash_attn_fwd(
     if compute_capability == 10:
         if pack_gqa and (128 % qhead_per_kvhead != 0):
             pack_gqa = False
-        # TODO: fix GQA + SplitKV
-        if pack_gqa and num_splits != 1:
-            pack_gqa = False
         # The big-d fwd configs cannot pack q heads into the M dim. PackGQA derives each
         # row's q_head (and its O destination) straight from tidx, which neither single_q_stage's
         # q_stage=1 row map nor the folded (m_block_size=64) accumulator provides -- in the
@@ -605,7 +665,43 @@ def _flash_attn_fwd(
         # More splits than KV blocks would only add empty CTAs.
         num_splits = max(1, min(num_splits, -(-seqlen_k // SWAPAB_TILE_N), 256))
         assert num_head_kv * num_splits <= CUDA_MAX_GRID_DIM_YZ
-    elif num_splits < 1:
+    elif compute_capability == 10:
+        # Head dims whose split build fails to launch (SMEM) or asserts: the heuristic must
+        # not pick split there, and an explicit split gets a clear error.
+        if not sm100_split_kv_supported(head_dim, head_dim_v, q.element_size()):
+            if num_splits > 1:
+                raise NotImplementedError(
+                    f"SplitKV is not supported for head_dim={head_dim}, head_dim_v={head_dim_v} "
+                    "on SM100 (needs head_dim_v < 192, head_dim <= 256, and the fp32 O "
+                    "partials must fit in shared memory)"
+                )
+            num_splits = 1
+
+    # Paged KV: one TMA per page when a page is exactly one KV tile, else cp.async rows.
+    paged_kv_non_tma = page_table is not None and page_size != n_block_size
+    if page_table is not None:
+        if use_2cta_instrs:
+            raise NotImplementedError(f"page_table is not supported for head_dim={head_dim} (2-CTA config)")
+        if enable_overlap:
+            raise NotImplementedError("page_table is not supported with FM-4 overlap")
+    if paged_kv_non_tma:
+        if startend_row_indices is not None:
+            # The column mask's generate_block warp takes the slot of the second load warp.
+            raise NotImplementedError(
+                f"startend_row_indices with page_size={page_size} is not supported: column "
+                f"masks need page_size == {n_block_size} (one TMA per page)"
+            )
+        if head_dim % 16 != 0 or head_dim_v % 16 != 0:
+            raise NotImplementedError(
+                f"page_size={page_size} (cp.async paged KV) needs head dims that are multiples of 16"
+            )
+
+    # Split-KV with a column mask is rejected below on the main-kernel path, so the
+    # heuristic must not pick it there. SwapAB decode supports mask + split and has
+    # already fixed num_splits >= 1 above. seqused_k also needs a single split.
+    if num_splits < 1 and (startend_row_indices is not None or seqlen_meta is not None):
+        num_splits = 1
+    if num_splits < 1:
         max_seqlen_k = seqlen_k
         max_seqlen_q = seqlen_q
         seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
@@ -625,11 +721,29 @@ def _flash_attn_fwd(
         )
 
     is_split_kv = num_splits > 1
+    if is_split_kv and startend_row_indices is not None and not use_swapab_decode:
+        # The main kernel would hang: the correction warp counts a tile's blocks from
+        # valid_block_count, which has no split axis, while the other warps only walk
+        # this split's KV range. SwapAB decode deals its splits over the mask's
+        # surviving blocks and is handled in its own branch below.
+        raise NotImplementedError("FlashMask (startend_row_indices) is not supported with SplitKV.")
     if is_split_kv:
-        out_partial = be.empty(
-            shape=[num_splits, *q_batch_seqlen_shape, num_head, head_dim_v], dtype=be.float32
-        )
-        lse_partial = be.empty(shape=[num_splits, *lse_shape], dtype=be.float32)
+        if use_swapab_decode:
+            # The SwapAB kernel keeps the split axis separate: O is (ns, b, 1, h, dv)
+            # and LSE is (ns, b, h, 1).
+            out_partial = be.empty(
+                shape=[num_splits, *q_batch_seqlen_shape, num_head, head_dim_v], dtype=be.float32
+            )
+            lse_partial = be.empty(shape=[num_splits, *lse_shape], dtype=be.float32)
+        else:
+            # The split axis is folded into batch (split outermost), so O / LSE partials keep
+            # the rank of O / LSE; see FlashAttentionForwardSm100.__call__.
+            out_partial = be.empty(
+                shape=[num_splits * batch_size, seqlen_q, num_head, head_dim_v], dtype=be.float32
+            )
+            lse_partial = be.empty(
+                shape=[num_splits * batch_size, num_head, seqlen_q], dtype=be.float32
+            )
 
     q_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -676,7 +790,7 @@ def _flash_attn_fwd(
         if use_block_list:
             blk_cnt, blk_idx = _decode_block_list(
                 startend_row_indices, mask_tensor, num_head_kv, mask_is_causal, current_stream,
-                be, mask_row=0,
+                be, mask_row=0, seqused_k=seqused_k,
             )
             blk_cnt_tensor = from_dlpack(blk_cnt.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=2
@@ -684,6 +798,16 @@ def _flash_attn_fwd(
             blk_idx_tensor = from_dlpack(blk_idx.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=3
             )
+        seqused_tensor = (
+            from_dlpack(seqused_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if seqused_k is not None
+            else None
+        )
+        page_table_tensor = (
+            from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+            if page_table is not None
+            else None
+        )
         occupancy = swapab_occupancy(
             batch_size * num_head_kv * num_splits,
             be.multi_processor_count(),
@@ -709,6 +833,8 @@ def _flash_attn_fwd(
             mask_per_head,
             use_block_list,
             occupancy,
+            seqused_k is not None,
+            page_table is not None,
         )
         decode_args = (
             q_tensor,
@@ -719,6 +845,8 @@ def _flash_attn_fwd(
             mask_tensor,
             blk_cnt_tensor,
             blk_idx_tensor,
+            seqused_tensor,
+            page_table_tensor,
             cutlass.Float32(softmax_scale),
             cutlass.Int32(0),  # the query's mask row
             current_stream,
@@ -744,6 +872,38 @@ def _flash_attn_fwd(
                 lse.transpose(-1, -2) if lse is not None else None,
             )
         return out, lse
+
+    cute_seqlen_meta = None
+    if seqlen_meta is not None:
+        to_cute_i32 = lambda t: (
+            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            if t is not None
+            else None
+        )
+        cute_seqlen_meta = SeqlenMeta(
+            seqused_k=to_cute_i32(seqused_k),
+            page_table=(
+                from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+                if page_table is not None
+                else None
+            ),
+        )
+
+    # With seqused_k and V loaded by TMA, the kernel rewrites a per-CTA copy of the V
+    # descriptor so rows past the sequence end arrive zero-filled (NaN there must not
+    # reach the PV MMA). One 128-byte slot per CTA; the grid is bounded by the fixed
+    # batch and query shape.
+    tensormap_workspace_tensor = None
+    if page_table is None and seqused_k is not None:
+        q_mult = qhead_per_kvhead if pack_gqa else 1
+        n_q_rows = batch_size * seqlen_q * q_mult
+        m_blocks_bound = n_q_rows // m_block_size + 2 * batch_size + 1
+        n_heads_sched = num_head_kv if pack_gqa else num_head
+        n_ctas = max(m_blocks_bound * n_heads_sched * num_splits, 2 * be.multi_processor_count()) + 8
+        tensormap_workspace = be.empty(shape=[n_ctas, 16], dtype=be.int64)
+        tensormap_workspace_tensor = from_dlpack(
+            tensormap_workspace.detach(), assumed_align=128
+        ).mark_layout_dynamic(leading_dim=1)
 
     if block_logit is not None:
         assert compute_capability == 10, (
@@ -809,6 +969,26 @@ def _flash_attn_fwd(
             raise NotImplementedError(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
+
+    if startend_row_indices is not None and compute_capability != 9:
+        fm_batch_size, fm_heads = startend_row_indices.shape[:2]
+        # A pack_gqa tile holds the qhead_per_kvhead query heads of one KV head and stages
+        # one mask head per tile, so those query heads must share a mask head.
+        if pack_gqa and num_head_kv % fm_heads != 0:
+            pack_gqa = False
+        # The kernel indexes valid_block_count with its m_block, which under pack_gqa
+        # counts tiles of the packed (qhead_per_kvhead, seqlen_q) axis.
+        fm_qhpk = qhead_per_kvhead if pack_gqa else 1
+        num_m_blocks = (seqlen_q * fm_qhpk + fwd_m_tile_rows - 1) // fwd_m_tile_rows
+        flashmask_info.valid_block_count = be.empty([fm_batch_size, fm_heads, num_m_blocks], dtype=be.int32)
+        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
+        # With seqused_k the count stops at each batch's KV length, the same block range
+        # the main kernel walks.
+        reduce_block_count(
+            cute_flashmask_info, flashmask_info.is_causal, fwd_m_tile_rows, n_block_size, seqlen_q, be,
+            qhead_per_kvhead_packgqa=fm_qhpk,
+            seqused_k=cute_seqlen_meta.seqused_k if cute_seqlen_meta is not None else None,
+        )
 
 
     # Build SRBuffer views inside the MLIR context. Dimensions stay runtime Int32;
@@ -884,6 +1064,11 @@ def _flash_attn_fwd(
         block_size,
         block_bos is None,
         kv_shared_fwd,
+        # seqused_k adds a kernel argument, so it must select its own artifact.
+        seqused_k is not None,
+        # paged KV: TMA per page vs cp.async rows
+        page_table is not None,
+        paged_kv_non_tma,
     ) + (
         # SRBuffer K/V require a distinct artifact only when overlap is active.
         (overlap_bhsd_layout,) if enable_overlap else ()
@@ -930,6 +1115,8 @@ def _flash_attn_fwd(
                 block_size=block_size,
                 has_block_bos=block_bos is not None,
                 use_2cta_instrs=use_2cta_instrs,
+                has_flashmask=cute_flashmask_info is not None,
+                paged_kv_non_tma=paged_kv_non_tma,
             )
         else:
             raise ValueError(
@@ -973,6 +1160,12 @@ def _flash_attn_fwd(
                 if enable_overlap
                 else {}
             ),
+            **({"seqlen_meta": cute_seqlen_meta} if cute_seqlen_meta is not None else {}),
+            **(
+                {"tensormap_workspace": tensormap_workspace_tensor}
+                if tensormap_workspace_tensor is not None
+                else {}
+            ),
             stream=current_stream,
         )
     # Runtime address and shape scalars are re-supplied below.
@@ -1013,12 +1206,20 @@ def _flash_attn_fwd(
             if enable_overlap
             else {}
         ),
+        **({"seqlen_meta": cute_seqlen_meta} if cute_seqlen_meta is not None else {}),
+        **(
+            {"tensormap_workspace": tensormap_workspace_tensor}
+            if tensormap_workspace_tensor is not None
+            else {}
+        ),
         stream=current_stream,
     )
     if is_split_kv:
+        # Unfold the split axis back out of batch for combine. Split is outermost, so this
+        # is a free view of the same memory.
         _flash_attn_fwd_combine(
-            out_partial,
-            lse_partial.transpose(-1, -2),
+            out_partial.view([num_splits, batch_size, seqlen_q, num_head, head_dim_v]),
+            lse_partial.view([num_splits, batch_size, num_head, seqlen_q]).transpose(-1, -2),
             out,
             lse.transpose(-1, -2) if lse is not None else None,
         )
