@@ -118,7 +118,9 @@ packages = find_packages(exclude=exclude_packages)
 install_requires = [
     'typing_extensions',
     'nvidia-cutlass==4.2.0.0',
-    'nvidia-cutlass-dsl[cu13]==4.8.1',
+    # 4.8.0 and 4.8.1 pass the same SM100 forward/decode suites; the range lets
+    # FlashMask install next to SGLang, which pins 4.8.0.
+    'nvidia-cutlass-dsl[cu13]>=4.8.0,<4.9',
     "apache-tvm-ffi>=0.1.5,<0.2.0",
 ]
 

@@ -276,7 +276,7 @@ At sequence lengths from 4K to 128K, the shared KV version of FlashMask-4 improv
 - **GPU**: Hopper (SM90) or Blackwell (SM100).
 - **Deep learning framework**: a CUDA-enabled PaddlePaddle or PyTorch (neither is installed automatically).
 - **Build tools**: `setuptools>=64`.
-- **Automatically installed dependencies**: `nvidia-cutlass==4.2.0.0`, `nvidia-cutlass-dsl[cu13]==4.8.1`, and `apache-tvm-ffi>=0.1.5,<0.2.0`. They are installed by `setup.py` at build time, so the install command needs `--no-build-isolation`.
+- **Automatically installed dependencies**: `nvidia-cutlass==4.2.0.0`, `nvidia-cutlass-dsl[cu13]>=4.8.0,<4.9` (4.8.0 and 4.8.1 are both tested, so FlashMask installs next to SGLang, which pins 4.8.0), and `apache-tvm-ffi>=0.1.5,<0.2.0`. They are installed by `setup.py` at build time, so the install command needs `--no-build-isolation`.
 - **Extra requirements for Overlap (`ovl`)**:
   - NCCL >= 2.30.5 (e.g. `nvidia-nccl-cu13`, or point `NCCL_HOME` at an installation) and the cutlass C++ headers (`nvidia-cutlass`, or `FM4_OVERLAP_CUTLASS_INC`).
   - If `FLASHMASK_BUILD` names `ovl` explicitly (e.g. `ovl`, `utils+ovl`), a missing or too-old NCCL or missing cutlass headers fail the build with the reason. Under `all`, the bridge is skipped with a warning and the core kernels are unaffected.
