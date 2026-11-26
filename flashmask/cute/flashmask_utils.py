@@ -14,6 +14,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass.cute.runtime import from_dlpack
 from . import utils
+from .cute_dsl_utils import new_namedtuple_from_mlir_values
 from ..backend import Tensor, get_backend
 import operator
 
@@ -41,23 +42,7 @@ class FlashMaskInfo(NamedTuple):
     valid_block_count: Optional[cute.Tensor]
 
     def __new_from_mlir_values__(self, values):
-        if len(values) == 3:
-            values = (self.is_causal, *values, None, None, None, None, None, None, None)
-        elif len(values) == 4:
-            values = (self.is_causal, *values[:3], None, None, None, None, None, None, *values[3:])
-        elif self.is_causal and len(values) == 5:
-            values = (self.is_causal, *values, None, None, None, None, None)
-        elif self.is_causal and len(values) == 6:
-            values = (self.is_causal, *values[:5], None, None, None, None, *values[5:])
-        elif not self.is_causal and len(values) == 5:
-            values = (self.is_causal, *values[:3], None, None, None, None, *values[3:], None)
-        elif not self.is_causal and len(values) == 6:
-            values = (self.is_causal, *values[:3], None, None, None, None, *values[3:5], *values[5:])
-        elif len(values) == 9:
-            values = (self.is_causal, *values, None)
-        else:
-            values = (self.is_causal, *values)
-        return FlashMaskInfo(*values)
+        return new_namedtuple_from_mlir_values(self, values)
 
 
 class OverlapInfo(NamedTuple):
@@ -165,8 +150,15 @@ def scan_max_min_kernel(
             dest_idx = bid_row * nblock_seqlen + nblock_idx
 
             # store to output tensors
-            mMaxO[dest_idx] = warp_max
-            mMinO[dest_idx] = warp_min
+            if nblock_idx < nblock:
+                mMaxO[dest_idx] = warp_max
+                mMinO[dest_idx] = warp_min
+            else:
+                # Tail blocks exist only to round the row length up to a multiple of 4
+                # (int4 loads); no reader looks at them. Write them anyway so the caller
+                # may allocate the buffer uninitialized instead of zero-filling it.
+                mMaxO[dest_idx] = cutlass.Int32(0)
+                mMinO[dest_idx] = cutlass.Int32(0)
 
 @cute.jit
 def scan_max_min_cute(
@@ -178,13 +170,17 @@ def scan_max_min_cute(
     mMaxO: cute.Tensor,
     mMinO: cute.Tensor,
 ):
+    # One thread block per block of kBlockN columns, including the tail blocks that round
+    # the row length up to a multiple of 4, so the whole buffer is written.
+    nblock = (n + kBlockN - 1) // kBlockN
+    nblock_padded = ((nblock + 3) // 4) * 4
     scan_max_min_kernel(
         mInput,
         b, n, kBlockN,
         mMaxO,
         mMinO,
     ).launch(
-        grid=[(n + kBlockN - 1) // kBlockN, (b + 3) // 4, cutlass.Int32(1)],
+        grid=[nblock_padded, (b + 3) // 4, cutlass.Int32(1)],
         block=[cutlass.Int32(32), cutlass.Int32(4), cutlass.Int32(1)],
         stream=stream,
     )
@@ -224,41 +220,57 @@ def _scan_max_min(
 
 _scan_max_min.compile_cache = {}
 
-def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128):
+def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128, alloc=None, column_scratch=None):
     """Prepare block-sparse max/min tensors for flashmask.
 
     The function will compute derived pointers/offsets and call scanMaxMinGpu
     for each existing input pointer.
+
+    alloc(shape) -> int32 tensor and column_scratch(shape) -> int32 tensor let a
+    preallocated FwdWorkspace (#26) supply the nblock buffers and the contiguous copy of a
+    strided mask column, so the call allocates nothing.
     """
     be = get_backend(flashmask_info.startend_row_indices)
 
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
+    # nblocks is rounded up to a multiple of 4; scan_max_min_kernel writes the tail too,
+    # so the buffers can be allocated uninitialized (no zero-fill launch per tensor).
     nblocks = _compute_nblock_seqlen(seqlen_k, kBlockN)
+    if alloc is None:
+        alloc = lambda shape: be.empty(shape, dtype=be.int32)
+
+    def column(i):
+        col = flashmask_info.startend_row_indices[..., i]
+        if column_scratch is None or col.is_contiguous():
+            return col
+        buf = column_scratch(list(col.shape))
+        buf.copy_(col, False)
+        return buf
 
     if num_vecs == 1 and flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None:
-        flashmask_info.LTS_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
     elif num_vecs == 2 and flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.LTE_nblock_max is None and flashmask_info.LTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
     elif num_vecs == 2 and not flashmask_info.is_causal and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
     ):
-        flashmask_info.LTS_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
     elif num_vecs == 4 and (
             flashmask_info.LTS_nblock_max is None and flashmask_info.LTS_nblock_min is None and
             flashmask_info.LTE_nblock_max is None and flashmask_info.LTE_nblock_min is None and
@@ -266,18 +278,18 @@ def prepare_block_maxmin(flashmask_info: FlashMaskInfoPaddle, kBlockN: int = 128
             flashmask_info.UTE_nblock_max is None and flashmask_info.UTE_nblock_min is None
             
     ):
-        flashmask_info.LTS_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTS_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.LTE_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTS_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTS_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_max = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        flashmask_info.UTE_nblock_min = be.zeros([batch, heads, nblocks], dtype=be.int32)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 0], batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 1], batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 2], batch * heads, seqlen_k, flashmask_info.UTS_nblock_max, flashmask_info.UTS_nblock_min, kBlockN)
-        _scan_max_min(flashmask_info.startend_row_indices[..., 3], batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
+        flashmask_info.LTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.LTE_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTS_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTS_nblock_min = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_max = alloc([batch, heads, nblocks])
+        flashmask_info.UTE_nblock_min = alloc([batch, heads, nblocks])
+        _scan_max_min(column(0), batch * heads, seqlen_k, flashmask_info.LTS_nblock_max, flashmask_info.LTS_nblock_min, kBlockN)
+        _scan_max_min(column(1), batch * heads, seqlen_k, flashmask_info.LTE_nblock_max, flashmask_info.LTE_nblock_min, kBlockN)
+        _scan_max_min(column(2), batch * heads, seqlen_k, flashmask_info.UTS_nblock_max, flashmask_info.UTS_nblock_min, kBlockN)
+        _scan_max_min(column(3), batch * heads, seqlen_k, flashmask_info.UTE_nblock_max, flashmask_info.UTE_nblock_min, kBlockN)
     else:
         raise ValueError(f"Unsupported num_vecs={num_vecs} in flashmask_info")
     
@@ -299,59 +311,27 @@ def to_cute_flashmask_info(flashmask_info: FlashMaskInfoPaddle) -> Optional[Flas
         return None
 
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
-
-    startend_row_indices_tensor = from_dlpack(flashmask_info.startend_row_indices, assumed_align=4).mark_layout_dynamic(leading_dim=3)
-    LTS_nblock_max_tensor = None
-    LTS_nblock_min_tensor = None
-    LTE_nblock_max_tensor = None
-    LTE_nblock_min_tensor = None
-    UTS_nblock_max_tensor = None
-    UTS_nblock_min_tensor = None
-    UTE_nblock_max_tensor = None
-    UTE_nblock_min_tensor = None
-
-    if num_vecs == 1:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    elif num_vecs == 2 and flashmask_info.is_causal:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_max_tensor = from_dlpack(flashmask_info.LTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_min_tensor = from_dlpack(flashmask_info.LTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    elif num_vecs == 2 and not flashmask_info.is_causal:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_max_tensor = from_dlpack(flashmask_info.UTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_min_tensor = from_dlpack(flashmask_info.UTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    elif num_vecs == 4:
-        LTS_nblock_max_tensor = from_dlpack(flashmask_info.LTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTS_nblock_min_tensor = from_dlpack(flashmask_info.LTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_max_tensor = from_dlpack(flashmask_info.LTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        LTE_nblock_min_tensor = from_dlpack(flashmask_info.LTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTS_nblock_max_tensor = from_dlpack(flashmask_info.UTS_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTS_nblock_min_tensor = from_dlpack(flashmask_info.UTS_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_max_tensor = from_dlpack(flashmask_info.UTE_nblock_max, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        UTE_nblock_min_tensor = from_dlpack(flashmask_info.UTE_nblock_min, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    else:
+    if num_vecs not in (1, 2, 4):
         raise ValueError(f"Unsupported num_vecs={num_vecs} in flashmask_info")
+    # Which nblock pairs exist is fixed by (num_vecs, is_causal), both of which are
+    # in the compile key; the kernels branch on the same presence via `is not None`.
+    has_lte, has_uts, has_ute = _flashmask_config_flags(num_vecs, flashmask_info.is_causal)
 
-    if flashmask_info.valid_block_count is not None:
-        valid_block_count = from_dlpack(flashmask_info.valid_block_count, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    else:
-        valid_block_count = None
+    def _nblock(t, present):
+        return from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=2) if present else None
 
     return FlashMaskInfo(
         flashmask_info.is_causal,
-        startend_row_indices_tensor,
-        LTS_nblock_max_tensor,
-        LTS_nblock_min_tensor,
-        LTE_nblock_max_tensor,
-        LTE_nblock_min_tensor,
-        UTS_nblock_max_tensor,
-        UTS_nblock_min_tensor,
-        UTE_nblock_max_tensor,
-        UTE_nblock_min_tensor,
-        valid_block_count
+        from_dlpack(flashmask_info.startend_row_indices, assumed_align=4).mark_layout_dynamic(leading_dim=3),
+        _nblock(flashmask_info.LTS_nblock_max, True),
+        _nblock(flashmask_info.LTS_nblock_min, True),
+        _nblock(flashmask_info.LTE_nblock_max, has_lte),
+        _nblock(flashmask_info.LTE_nblock_min, has_lte),
+        _nblock(flashmask_info.UTS_nblock_max, has_uts),
+        _nblock(flashmask_info.UTS_nblock_min, has_uts),
+        _nblock(flashmask_info.UTE_nblock_max, has_ute),
+        _nblock(flashmask_info.UTE_nblock_min, has_ute),
+        _nblock(flashmask_info.valid_block_count, flashmask_info.valid_block_count is not None),
     )
 
 @cute.kernel
@@ -360,7 +340,7 @@ def reduce_block_count_kernel(
     LTE_nblock_min: cute.Tensor,
     UTS_nblock_max: cute.Tensor,
     UTE_nblock_min: cute.Tensor,
-    valid_block_count: cute.Tensor, # [b, h, sQ/kBlockM] valid_block_count means how many block are not fully masked in each row
+    valid_block_count: cute.Tensor, # [b, h, ceil(sQ*qhpk/kBlockM)] valid_block_count means how many block are not fully masked in each row
     num_blocks_row: cutlass.Int32,
     num_blocks_col: cutlass.Int32, # num_blocks means how many blocks in a row, note that the padding region of the max/min tensor is not count
     is_causal: cutlass.Constexpr[bool],
@@ -373,6 +353,8 @@ def reduce_block_count_kernel(
     kBlockN: cutlass.Int32,
     seqlen_q: cutlass.Int32,
     seqlen_k: cutlass.Int32,
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
+    seqused_k: Optional[cute.Tensor] = None, # [b] int32, KV length per batch (<= seqlen_k)
 ):
     # one warp per block row
     tidx = cute.arch.thread_idx()[0]
@@ -396,10 +378,26 @@ def reduce_block_count_kernel(
     if global_block_row_idx < total_num_blocks_row:
         row_idx_start = block_row_idx * kBlockM
         row_idx_end = min(row_idx_start + kBlockM, seqlen_q)
+        if cutlass.const_expr(qhead_per_kvhead_packgqa != 1):
+            # pack_gqa: block rows are packed (qhpk, seqlen_q) rows, the bounds are query
+            # rows. Same [s, e) as update_block_buffer in flash_fwd_sm100.py.
+            packed_start = block_row_idx * kBlockM
+            row_idx_start = packed_start // qhead_per_kvhead_packgqa
+            row_idx_end = min(
+                (packed_start + kBlockM + qhead_per_kvhead_packgqa - 1) // qhead_per_kvhead_packgqa,
+                seqlen_q,
+            )
         n_block_max = num_blocks_col
+        seqlen_k_batch = seqlen_k
+        if cutlass.const_expr(seqused_k is not None):
+            # The main kernel walks only the blocks below seqused_k[b] (block_info), and its
+            # causal diagonal is seqused_k[b] - seqlen_q. Count the same blocks, otherwise the
+            # correction warp waits for blocks generate_block never produces.
+            seqlen_k_batch = seqused_k[batch_idx]
+            n_block_max = min(n_block_max, (seqlen_k_batch + kBlockN - 1) // kBlockN)
         if is_causal:
             # make sure window_size_right is 0
-            n_idx_right = row_idx_end + seqlen_k - seqlen_q
+            n_idx_right = row_idx_end + seqlen_k_batch - seqlen_q
             n_block_max = min(n_block_max, (n_idx_right + kBlockN - 1) // kBlockN)
         loop_num = (n_block_max + 31) >> 5
         local_sum = 0
@@ -429,7 +427,7 @@ def reduce_block_count_cute(
     LTE_nblock_min: cute.Tensor,
     UTS_nblock_max: cute.Tensor,
     UTE_nblock_min: cute.Tensor,
-    valid_block_count: cute.Tensor, # [b,h_fm, sQ/kBlockM] valid_block_count means how many block are not fully masked in each row
+    valid_block_count: cute.Tensor, # [b,h_fm, ceil(sQ*qhpk/kBlockM)] valid_block_count means how many block are not fully masked in each row
     num_blocks_row: cutlass.Int32,
     num_blocks_col: cutlass.Int32, # num_blocks means how many blocks in a row, note that the padding region of the max/min tensor is not count
     is_causal: cutlass.Constexpr[bool],
@@ -443,6 +441,8 @@ def reduce_block_count_cute(
     seqlen_q: cutlass.Int32,
     seqlen_k: cutlass.Int32,
     stream: cuda.CUstream,
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
+    seqused_k: Optional[cute.Tensor] = None,
 ):
     reduce_block_count_kernel(
         LTS_nblock_max if LTS_nblock_max is not None else None,
@@ -461,7 +461,9 @@ def reduce_block_count_cute(
         kBlockM,
         kBlockN,
         seqlen_q,
-        seqlen_k
+        seqlen_k,
+        qhead_per_kvhead_packgqa,
+        seqused_k,
     ).launch(
         grid=[(num_blocks_row * batch_size * h_flashmask + 3) >> 2, 1, 1],
         block=[32 * 4, 1, 1],
@@ -476,12 +478,23 @@ def reduce_block_count(
     kBlockN: int,
     seqlen_q: int,
     be,
+    qhead_per_kvhead_packgqa: int = 1,
+    seqused_k: Optional[cute.Tensor] = None,
 ):
     # Unlike the other entry points here, `flashmask_info` is the *cute*
     # FlashMaskInfo -- its fields are cute.Tensor, so the backend cannot be
     # derived from them and has to come from the caller.
+    #
+    # valid_block_count is indexed by the kernel's m_block, so its M axis has the
+    # kernel's granularity: kBlockM rows of the packed (qhead_per_kvhead, seqlen_q) axis
+    # under pack_gqa (qhead_per_kvhead_packgqa > 1), plain query rows otherwise.
+    #
+    # seqused_k (int32 [batch] cute tensor, optional): per-batch KV length. Each batch
+    # then counts only the column blocks below ceil(seqused_k[b] / kBlockN), and the
+    # causal diagonal uses seqused_k[b], as the main kernel's block range does. The
+    # nblock max/min still cover the whole mask.
     batch, heads, seqlen_k, num_vecs = flashmask_info.startend_row_indices.shape
-    num_blocks_row = (seqlen_q + kBlockM - 1) // kBlockM
+    num_blocks_row = (seqlen_q * qhead_per_kvhead_packgqa + kBlockM - 1) // kBlockM
     num_blocks_col = (seqlen_k + kBlockN - 1) // kBlockN
     if num_vecs == 4:
         has_lte = True
@@ -504,7 +517,10 @@ def reduce_block_count(
     current_stream = cuda.CUstream(be.cuda_stream())
 
     # TODO: are all of these compile keys necessary?
-    compile_key = (is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute)
+    compile_key = (
+        is_causal, kBlockM, kBlockN, has_lte, has_uts, has_ute, qhead_per_kvhead_packgqa,
+        seqused_k is not None,
+    )
     if compile_key not in reduce_block_count.compile_cache:
         reduce_block_count.compile_cache[compile_key] = cute.compile(
             reduce_block_count_cute,
@@ -525,7 +541,9 @@ def reduce_block_count(
             kBlockN,
             seqlen_q,
             seqlen_k,
-            current_stream
+            current_stream,
+            qhead_per_kvhead_packgqa,
+            seqused_k,
         )
     reduce_block_count.compile_cache[compile_key](
         flashmask_info.LTS_nblock_max,
@@ -544,7 +562,8 @@ def reduce_block_count(
         kBlockN,
         seqlen_q,
         seqlen_k,
-        current_stream
+        current_stream,
+        seqused_k=seqused_k,
     )
 
 reduce_block_count.compile_cache = {}

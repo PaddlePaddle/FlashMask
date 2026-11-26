@@ -8,7 +8,12 @@
 # query heads of one KV head fill the small N dimension.
 #
 # First FlashMask version: dense KV, no score_mod / local window, (head_dim, head_dim_v) in
-# SWAPAB_HEAD_DIMS, no seqused_k, no paged KV, no varlen Q. Static split count only.
+# SWAPAB_HEAD_DIMS, no varlen Q. Static split count only.
+#
+# Optional seqused_k (B,) gives each sequence's KV length; tokens past it are masked out and
+# its block-list entries are dropped. Optional paged KV with page_size == SWAPAB_SKIP_UNIT:
+# K / V are (num_pages, page_size, H_kv, D) pools and page_table (B, max_pages) picks the
+# pool page of each 128-token unit (out-of-range units read page -1 and are TMA zero-filled).
 #
 # Optional FlashMask column mask startend_row_indices (B, H_m, S_k, num_vecs), applied element
 # by element. With a block list (build_decode_block_list), fully masked KV units are skipped.
@@ -24,7 +29,7 @@
 
 import math
 from functools import partial
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -189,6 +194,7 @@ def decode_kv_unit(
 @cute.kernel
 def _block_flags_kernel(
     mStartEnd: cute.Tensor,  # (B, H_m, S, num_vecs)
+    mSeqUsedK: Optional[cute.Tensor],  # (B,) int32: only the first seqused_k columns count
     mFlags: cute.Tensor,  # (B, H_m, nk)
     row: Int32,
     num_vecs: cutlass.Constexpr[int],
@@ -200,9 +206,12 @@ def _block_flags_kernel(
     cute.arch.griddepcontrol_launch_dependents()
     lane = tidx % WARP_SIZE
     blk0 = (bidx * BLOCK_LIST_WARPS + tidx // WARP_SIZE) * BLOCK_FLAGS_UNITS
-    num_mask_heads, seqlen_k = mStartEnd.shape[1], mStartEnd.shape[2]
+    num_mask_heads, max_seqlen_k = mStartEnd.shape[1], mStartEnd.shape[2]
     batch_idx = bidy // num_mask_heads
     mask_head_idx = bidy % num_mask_heads
+    seq_len = max_seqlen_k
+    if const_expr(mSeqUsedK is not None):
+        seq_len = mSeqUsedK[batch_idx]
     tokens_per_lane = SWAPAB_SKIP_UNIT // WARP_SIZE
     # Issue the loads of all the warp's units before testing any: one memory round trip.
     vals = []
@@ -210,7 +219,7 @@ def _block_flags_kernel(
         token = blk0 * SWAPAB_SKIP_UNIT + t * WARP_SIZE + lane
         for v in cutlass.range_constexpr(num_vecs):
             x = Int32(0)
-            if token < seqlen_k:
+            if token < seq_len:
                 x = mStartEnd[batch_idx, mask_head_idx, token, v]
             vals.append(x)
     for u in cutlass.range_constexpr(BLOCK_FLAGS_UNITS):
@@ -221,7 +230,7 @@ def _block_flags_kernel(
                 t = u * tokens_per_lane + i
                 token = blk0 * SWAPAB_SKIP_UNIT + t * WARP_SIZE + lane
                 vecs = vals[t * num_vecs:(t + 1) * num_vecs]
-                if token < seqlen_k:
+                if token < seq_len:
                     if not col_masked_by(vecs, row, num_vecs, is_causal):
                         any_visible = Int32(1)
             visible = cute.arch.vote_any_sync(any_visible != 0)
@@ -279,6 +288,7 @@ def _block_compact_kernel(
 @cute.jit
 def build_decode_block_list(
     mStartEnd: cute.Tensor,
+    mSeqUsedK: Optional[cute.Tensor],
     mFlags: cute.Tensor,
     mBlockCnt: cute.Tensor,
     mBlockIdx: cute.Tensor,
@@ -294,7 +304,7 @@ def build_decode_block_list(
     """
     batch_size, num_mask_heads, nk = mFlags.shape
     units_per_cta = BLOCK_LIST_WARPS * BLOCK_FLAGS_UNITS
-    _block_flags_kernel(mStartEnd, mFlags, mask_row, num_vecs, is_causal).launch(
+    _block_flags_kernel(mStartEnd, mSeqUsedK, mFlags, mask_row, num_vecs, is_causal).launch(
         grid=[cute.ceil_div(nk, units_per_cta), batch_size * num_mask_heads, 1],
         block=[BLOCK_LIST_WARPS * WARP_SIZE, 1, 1],
         stream=stream,
@@ -434,6 +444,9 @@ class _SwapABCore:
         mStartEnd: cute.Tensor | None,  # (batch, H_m, seqlen_k, num_vecs) int32 column mask
         mBlockCnt: cute.Tensor | None,  # (batch, num_heads_kv, 1) int32 visible-unit count
         mBlockIdx: cute.Tensor | None,  # (batch, num_heads_kv, 1, n_units) int32 unit list
+        mSeqUsedK: cute.Tensor | None,  # (batch,) int32: KV length of each sequence
+        mPageTable: cute.Tensor | None,  # (batch, max_pages) int32 paged-KV table
+        mNumSplitsDynamic: cute.Tensor | None,  # (batch,) int32: per-batch split count
         softmax_scale: Float32,
         mask_row: Int32,  # the query's row in the column mask
         stream: cuda.CUstream,
@@ -450,8 +463,15 @@ class _SwapABCore:
         # bh_idx = batch_idx * num_heads_kv + kv_head_idx.
         # QK: K is operand A (M = tokens, K = head_dim), Q is operand B (N = query heads of this
         # KV head). PV: V^T is operand A (M = head_dim_v, K = tokens).
-        mK_qk = gemm_view(mK, [1, 3, 2, 0])  # (seqlen_k, d, (h_kv, b))
-        mVt_pv = gemm_view(mV, [3, 1, 2, 0])  # (d_v, seqlen_k, (h_kv, b))
+        # Paged KV: mK / mV are (num_pages, page_size, H_kv, D) pools. page_size == 128 (one
+        # SWAPAB_SKIP_UNIT) so a unit is exactly one page; the page is an extra free mode next to
+        # the KV head rather than part of the (h_kv, b) group.
+        if const_expr(mPageTable is None):
+            mK_qk = gemm_view(mK, [1, 3, 2, 0])  # (seqlen_k, d, (h_kv, b))
+            mVt_pv = gemm_view(mV, [3, 1, 2, 0])  # (d_v, seqlen_k, (h_kv, b))
+        else:
+            mK_qk = select_modes(mK, [1, 3, 2, 0])  # (page_size, d, h_kv, num_pages)
+            mVt_pv = select_modes(mV, [3, 1, 2, 0])  # (d_v, page_size, h_kv, num_pages)
         gqa = (qhead_per_kvhead, num_heads_kv)
         mQ_qk = gemm_view(mQ, [0, 3, 2, 1], 1, *gqa)  # (qpk, d, (h_kv, b))
         # (d_v, qpk, (h_kv, b), ns)
@@ -584,6 +604,9 @@ class _SwapABCore:
             mStartEnd,
             mBlockCnt,
             mBlockIdx,
+            mSeqUsedK,
+            mPageTable,
+            mNumSplitsDynamic,
             softmax_scale_log2,
             mask_row,
             tiled_mma_qk,
@@ -621,6 +644,9 @@ class _SwapABCore:
         mStartEnd: cute.Tensor | None,
         mBlockCnt: cute.Tensor | None,
         mBlockIdx: cute.Tensor | None,
+        mSeqUsedK: cute.Tensor | None,
+        mPageTable: cute.Tensor | None,
+        mNumSplitsDynamic: cute.Tensor | None,
         softmax_scale_log2: Float32,
         mask_row: Int32,
         tiled_mma_qk: cute.TiledMma,
@@ -654,6 +680,13 @@ class _SwapABCore:
         hdim_v = self.head_dim_v
         _b, num_heads, num_heads_kv, seqlen_k = problem_size
         bh_idx = batch_idx * num_heads_kv + kv_head_idx
+        # Per-batch KV length: the static problem length, or seqused_k[b] when the caller
+        # provides one (dense or paged). Tokens at or past it are masked and, on the paged
+        # path, their pages are never loaded.
+        seq_len_b = seqlen_k
+        if const_expr(mSeqUsedK is not None):
+            seq_len_b = mSeqUsedK[batch_idx]
+        num_units = cute.ceil_div(seq_len_b, SWAPAB_SKIP_UNIT)
         tile_n = self.tile_n
         tile_hq = self.tile_hq
         qhead_per_kvhead = num_heads // num_heads_kv
@@ -668,12 +701,17 @@ class _SwapABCore:
         # equal contiguous runs, as in upstream BlockInfo.get_n_block_min_max. With a block
         # list, block j holds the units at list positions j * units_per_block + i.
         # The block-list count is read only after the on-chip prologue (see the PDL wait below).
+        # Per-batch split count (#45): the grid keeps num_splits (the maximum) and batch b
+        # uses num_splits_dynamic[b] of them; splits at or past it get an empty range.
         units_per_block = tile_n // SWAPAB_SKIP_UNIT
         num_listed = Int32(0)
-        oob_unit = (seqlen_k + SWAPAB_SKIP_UNIT - 1) // SWAPAB_SKIP_UNIT
+        oob_unit = num_units
+        num_splits_b = num_splits
         if const_expr(mBlockIdx is None):
+            if const_expr(mNumSplitsDynamic is not None):
+                num_splits_b = mNumSplitsDynamic[batch_idx]
             n_block_min, n_block_max, num_n_blocks = _split_block_range(
-                cute.ceil_div(seqlen_k, tile_n), split_id, num_splits
+                cute.ceil_div(seq_len_b, tile_n), split_id, num_splits_b
             )
             is_empty_split = num_n_blocks == 0
         # Q, O and LSE rows are the sequence index.
@@ -878,8 +916,10 @@ class _SwapABCore:
             # global read, the list count, and before loading Q.
             cute.arch.griddepcontrol_wait()
             num_listed = mBlockCnt[batch_idx, kv_head_idx, 0]
+            if const_expr(mNumSplitsDynamic is not None):
+                num_splits_b = mNumSplitsDynamic[batch_idx]
             n_block_min, n_block_max, num_n_blocks = _split_block_range(
-                (num_listed + units_per_block - 1) // units_per_block, split_id, num_splits
+                (num_listed + units_per_block - 1) // units_per_block, split_id, num_splits_b
             )
             is_empty_split = num_n_blocks == 0
             if warp_idx == load_q_store_o_warp_id:
@@ -928,8 +968,9 @@ class _SwapABCore:
             # Producer for the shared ring. Loop iteration s pushes K(s) and V(s - lookahead), so
             # the stream is K0 K1 K2 | V0 K3 V1 ... and finally the trailing V tiles. The
             # unit of block j, sub-tile i, is j * num_s_subtiles + i, looked up in the
-            # block list if there is one. Rows past seqlen_k fall outside the TMA extent and are
-            # zero-filled.
+            # block list if there is one. Paged KV: unit u is page page_table[b, u] (tile 0 of
+            # it); units past the sequence length map to page -1, out of the pool, so TMA
+            # zero-fills them instead of reading a page the sequence does not own.
             kv_tiler = (tile_m, tile_k)
             kv_state = pipeline.make_pipeline_state(Producer, self.num_stages_kv)
             kv_token = cutlass.Boolean(True)
@@ -942,7 +983,18 @@ class _SwapABCore:
                             k_unit = decode_kv_unit(
                                 mBlockIdx, batch_idx, kv_head_idx, k_unit, num_listed, oob_unit
                             )
-                        gK = cute.local_tile(mK, (tile_m, hdim), (k_unit, 0, bh_idx))
+                        if const_expr(mPageTable is None):
+                            gK = cute.local_tile(mK, (tile_m, hdim), (k_unit, 0, bh_idx))
+                        else:
+                            k_page = Int32(-1)
+                            if k_unit < num_units:
+                                k_page = mPageTable[batch_idx, k_unit]
+                            # (page_size, d, H_kv, num_pages) -> tile 0 of this KV head's page.
+                            gK = cute.local_tile(
+                                mK[None, None, kv_head_idx, None],
+                                (tile_m, hdim),
+                                (0, 0, k_page),
+                            )
                         gK_sub = cute.zipped_divide(gK, kv_tiler)[(None, None), (0, None)]
                         tKsK, tKgK = cpasync.tma_partition(
                             tma_atom_K,
@@ -966,10 +1018,24 @@ class _SwapABCore:
                                 v_unit = decode_kv_unit(
                                     mBlockIdx, batch_idx, kv_head_idx, v_unit, num_listed, oob_unit
                                 )
-                            gVt_blk = cute.zipped_divide(
-                                cute.local_tile(mV, (hdim_v, tile_m), (0, v_unit, bh_idx)),
-                                kv_tiler,
-                            )
+                            if const_expr(mPageTable is None):
+                                gVt_blk = cute.zipped_divide(
+                                    cute.local_tile(mV, (hdim_v, tile_m), (0, v_unit, bh_idx)),
+                                    kv_tiler,
+                                )
+                            else:
+                                v_page = Int32(-1)
+                                if v_unit < num_units:
+                                    v_page = mPageTable[batch_idx, v_unit]
+                                # (d_v, page_size, H_kv, num_pages) -> tile 0 of this page.
+                                gVt_blk = cute.zipped_divide(
+                                    cute.local_tile(
+                                        mV[None, None, kv_head_idx, None],
+                                        (hdim_v, tile_m),
+                                        (0, 0, v_page),
+                                    ),
+                                    kv_tiler,
+                                )
                         gVt_sub = gVt_blk[(None, None), (None, sk % (tile_m // tile_k))]
                         tVsV, tVgV = cpasync.tma_partition(
                             tma_atom_V,
@@ -1165,7 +1231,7 @@ class _SwapABCore:
                 p_token = pipeline_p.producer_try_acquire(p_state)
 
                 # Column mask, shared mask head: read this thread's token bounds while S(j) is
-                # still in flight. Rows past seqlen_k read the last token; the tail mask below
+                # still in flight. Rows past seq_len_b read the last token; the tail mask below
                 # hides them anyway.
                 # Token of this thread's row in each unit of block s.
                 kv_block = s + n_block_min
@@ -1180,7 +1246,7 @@ class _SwapABCore:
                 row_masked = []
                 if const_expr(mStartEnd is not None and not self.mask_per_head):
                     for sm in cutlass.range_constexpr(num_s_subtiles):
-                        token = cutlass.min(unit_token[sm], seqlen_k - 1)
+                        token = cutlass.min(unit_token[sm], seq_len_b - 1)
                         row_masked.append(
                             flashmask_col_masked(
                                 mStartEnd,
@@ -1201,9 +1267,9 @@ class _SwapABCore:
                 pipeline_s.consumer_release(s_state)
                 s_state.advance()
 
-                # Mask the token rows past seqlen_k (the last unit, and the padding unit).
+                # Mask the token rows past seq_len_b (the last unit, and the padding unit).
                 for sm in cutlass.range_constexpr(num_s_subtiles):
-                    if unit_token[sm] >= seqlen_k:
+                    if unit_token[sm] >= seq_len_b:
                         scores_r[None, sm].fill(-Float32.inf)
 
                 if const_expr(mStartEnd is not None):
@@ -1215,7 +1281,7 @@ class _SwapABCore:
                         # Query head h uses mask head h // (num_heads / H_m). Padding columns past
                         # qhead_per_kvhead are never stored; clamping keeps their reads in bounds.
                         for sm in cutlass.range_constexpr(num_s_subtiles):
-                            token = cutlass.min(unit_token[sm], seqlen_k - 1)
+                            token = cutlass.min(unit_token[sm], seq_len_b - 1)
                             for jj in cutlass.range_constexpr(tile_hq):
                                 q_head = cutlass.min(
                                     kv_head_idx * qhead_per_kvhead + jj, num_heads - 1
@@ -1594,6 +1660,9 @@ class FlashMaskDecodeSm100SwapAB:
         mStartEnd: cute.Tensor | None,  # (b, h_m, s_k, num_vecs) int32 | None
         mBlockCnt: cute.Tensor | None,  # (b, h_k, 1) int32 | None
         mBlockIdx: cute.Tensor | None,  # (b, h_k, 1, n_units) int32 | None
+        mSeqUsedK: cute.Tensor | None,  # (b,) int32 | None
+        mPageTable: cute.Tensor | None,  # (b, max_pages) int32 | None
+        mNumSplitsDynamic: cute.Tensor | None,  # (b,) int32 | None
         softmax_scale: Float32,
         mask_row: Int32,  # the query's mask row: s_k - 1 bottom-right, 0 as the main kernel
         stream: cuda.CUstream,
@@ -1615,10 +1684,24 @@ class FlashMaskDecodeSm100SwapAB:
             assert mStartEnd is not None and not self.mask_args[2]
             assert len(mBlockIdx.shape) == 4 and mBlockIdx.element_type == Int32
             assert len(mBlockCnt.shape) == 3 and mBlockCnt.element_type == Int32
+        if const_expr(mSeqUsedK is not None):
+            assert len(mSeqUsedK.shape) == 1 and mSeqUsedK.element_type == Int32
+        if const_expr(mPageTable is not None):
+            assert len(mPageTable.shape) == 2 and mPageTable.element_type == Int32
+        if const_expr(mNumSplitsDynamic is not None):
+            assert len(mNumSplitsDynamic.shape) == 1 and mNumSplitsDynamic.element_type == Int32
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         batch, num_heads = mQ.shape[0], mQ.shape[2]
-        num_heads_kv, seqlen_k = mK.shape[2], mK.shape[1]
+        # Paged KV: mK / mV are (num_pages, page_size, H_kv, D) pools. page_size must be one
+        # 128-token unit so a unit is exactly one page; the maximum sequence length is the
+        # page table width. Dense KV keeps (batch, seqlen_k, H_kv, D). page_size is dynamic
+        # here, so the dispatch check (swapab_decode_supported) enforces it on the host.
+        if const_expr(mPageTable is not None):
+            num_heads_kv = mK.shape[2]
+            seqlen_k = mPageTable.shape[1] * SWAPAB_SKIP_UNIT
+        else:
+            num_heads_kv, seqlen_k = mK.shape[2], mK.shape[1]
         # The core takes Q as (b, h, d), O as (ns, b, h, d) and LSE as (ns, b, h). Without
         # splits the seqlen_q mode of extent 1 becomes the split mode.
         mLSE_core = None
@@ -1650,6 +1733,9 @@ class FlashMaskDecodeSm100SwapAB:
             mStartEnd,
             mBlockCnt,
             mBlockIdx,
+            mSeqUsedK,
+            mPageTable,
+            mNumSplitsDynamic,
             softmax_scale,
             mask_row,
             stream,
